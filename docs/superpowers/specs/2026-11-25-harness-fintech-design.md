@@ -12,6 +12,13 @@ owner to overrule. The facts about the outside world come from a search
 on 2026-11-25; each has its source at the end, and what could not be
 confirmed is marked "not confirmed".
 
+Revised the same night, after the owner asked what today's tools get
+wrong and what harness could do better ("find online what's the
+shortcomings of current solutions, failures and complaints"). What that
+research changed is in the next section and marked "(revised)" where it
+changed a part. The research report itself is kept out of this public
+repository: it repeats single, unverified user reviews of named vendors.
+
 ## Intent
 
 A company that takes payments or opens accounts runs harness on its own
@@ -29,11 +36,39 @@ and the log shows who. That is what harness already is for one owner: it
 asks before acting, keeps a log that shows tampering, keeps secrets from
 the model, caps spending, and runs unattended commands in a sandbox.
 
+## What the research changed (2026-11-25, late)
+
+Read: public reviews and forums, vendors' own documentation and prices,
+regulators' notices and surveys. Not read: Reddit and the full text of
+the large review sites, which refused. No buyer was asked.
+
+- **What is worth selling is narrower than this file first said.** In all
+  three jobs today's tools automate what is easy to reach and act on it
+  with confidence, while the evidence that decides the outcome sits
+  somewhere they do not look. The difference worth selling is this: a
+  named person is shown the evidence and what could not be found, and
+  nothing happens until that person answers.
+- **Self-hosting and the verifiable log support that; they do not carry
+  it.** Demand for self-hosted agents among fintechs is moderate and
+  unmeasured (traditional institutions keep AI in-house more often than
+  fintechs do). No regulator asks for a log that shows tampering by name;
+  supervisors ask who saw what, and how their challenge was recorded.
+- **Every number in these markets is the seller's own.** No dispute
+  vendor's win rate is audited, no recovery tool has published a test
+  against a control group, and no onboarding agent publishes what it
+  missed. harness has no number at all. A scored run on one company's
+  past cases is worth more than any feature here.
+- **By job:** the fit is closest in onboarding (the law requires the named
+  decision), cheapest to test in disputes, and weakest in overdue.
+- **Approval wears out.** Where people approve many items they come to
+  approve by reflex. Part B now says what an approval must record, and
+  the packs propose fewer, weightier decisions.
+
 ## What the company gets, and how it is measured
 
 | Job | What it earns the company | Measured by |
 |---|---|---|
-| Disputes | money won back | amount won ÷ amount disputed, against the months before |
+| Disputes | money won back | amount won less fees ÷ amount disputed, over every dispute received (not only those answered), by months whose disputes are all decided (revised) |
 | Overdue | money collected sooner, customers kept | amount collected, days to payment, against a group left as before |
 | Onboarding | customers who start paying sooner, fewer who give up | days from application to decision, share of applications finished |
 
@@ -183,6 +218,16 @@ know which of them answered.
   draft does not count when `not_the_preparer` is on.
 - **The log names the person** on every answer and edit (`by:
   staff:NAME`), and `harness log search` finds by person.
+- **What an approval records (revised).** Supervisors do not accept "a
+  person was in the loop" as such (the FCA's 2026 papers; "meaningful
+  human intervention" in the EU's AML regulation). So each decision keeps:
+  the SHA-256 of the file as the person was shown it, which parts they
+  opened, their note where the pack requires one (a refusal, a risk
+  rating, a dispute given up), and what they changed in the draft.
+- **Against approving by reflex (revised).** No "approve all". A pack may
+  ask for a second person on a sample of approved cases, and the outcomes
+  file counts drafts approved unchanged, so that a company can see it
+  happening.
 - **Telegram stays the single owner's.** Staff are told of urgent cases by
   mail to their work address through the company's mail server, a line
   and a link, never the case's content.
@@ -277,6 +322,21 @@ Stripe first, then Adyen. Tools the gate can tell apart:
 - **No tool retries a payment or refunds one.** If that is wanted later it
   is a money tool, with caps, asked every time.
 
+### `ledgermcp`: accounting software (revised: added)
+
+The complaints about invoice reminders that could be found are from users
+of Xero and QuickBooks, and that is where a small business's unpaid
+invoices are. The payment provider's own invoices (above) cover
+subscriptions only.
+
+- Tools: `invoice_list`, `invoice_get`, `contact_get`, `payment_list`
+  (what the bank feed has matched), `credit_note_list`. Reads only.
+- Xero first, then QuickBooks; both by OAuth, which harness has for MCP
+  servers at a URL.
+- **An invoice the bank feed may already have paid is held,** not chased:
+  a reminder for a paid invoice is the commonest complaint about the
+  tools that chase.
+
 ### `regmcp`: company registers
 
 | Source | Access | Gives | Note |
@@ -300,7 +360,13 @@ Stripe first, then Adyen. Tools the gate can tell apart:
   public in most states since the Court's judgment of 2022-11-22. The
   company's own access is used, country by country, under its own name.
 - Countries beyond these come through an aggregator the company has a
-  contract with (Kyckr and others), one backend each.
+  contract with, one backend each.
+- **What a register did not give is shown as missing (revised).** Few
+  registers return shareholders as data (one aggregator puts it at 13%;
+  the rest return documents), and tools in this market have been reported
+  to mark a lookup as done when it returned no owner. Every `regmcp`
+  answer says what was asked, what came back and what did not, and the
+  file carries "not retrieved" forward to the person.
 
 ### Screening: sanctions, politically exposed persons, adverse media
 
@@ -312,14 +378,23 @@ Stripe first, then Adyen. Tools the gate can tell apart:
   for, or OpenSanctions, which has an official MCP server and a matching
   server that can run on the company's own machine (`yente`). Its data is
   free for non-commercial use only; a company needs a licence.
-- **Adverse media** is a web search by harness, kept to what the
-  regulation allows to be processed: reports tied to money laundering,
-  its predicate offences or terrorist financing, each marked as an
-  allegation, an investigation, proceedings or a conviction (AMLR Article
-  76(3)).
+- **Adverse media** comes from the company's screening source where it
+  has one. A web search by harness is the fallback and is said to be one
+  (revised): a search is built to find something, not to prove nothing
+  was missed, so its result reads "these sources were searched with these
+  words; nothing was found", never "clear". Either way it is kept to what
+  the regulation allows to be processed: reports tied to money
+  laundering, its predicate offences or terrorist financing, each marked
+  as an allegation, an investigation, proceedings or a conviction (AMLR
+  Article 76(3)).
 - **A possible match is never cleared by the model.** harness lays out what
   matches and what differs (date of birth, nationality, identifiers) and a
-  person marks it.
+  person marks it. (Revised: this leaves the commonest complaint about
+  screening, the number of false alerts, where it is; harness makes each
+  one quicker to judge and does not make them fewer. Others in this
+  market say their agents close alerts themselves. If the EU's technical
+  standards come to allow that for some alerts, this rule is the one to
+  look at again.)
 
 ### The company's own systems
 
@@ -366,6 +441,8 @@ about, one by one, and none goes out unattended.
 
 ## Part H: measuring
 
+(Revised: this is the first thing to show a company, not a later part.)
+
 - **`harness eval PACK`:** runs a folder of recorded cases. Each has what
   the connectors answered (played back by a stand-in, no network) and what
   a good result holds (the owners found, the fields filled, the decision a
@@ -411,8 +488,12 @@ about, one by one, and none goes out unattended.
    disputed one on IP address or device, or on one of those and one of
    shipping address, email or account.
 5. **Propose:** answer, give up, or needs a person, with the reason and
-   the fee that answering costs (on Stripe a fee equal to the dispute fee
-   is charged for answering and returned on a win).
+   the money either way (revised). On Stripe since June 2025 answering by
+   hand costs a second fee equal to the dispute fee (US $15, EUR 20),
+   returned only on a full win; on a small payment the fees are more than
+   the payment, and the proposal is to give up. Disputes are put before
+   the person in that order: the ones worth fighting first, the rest as
+   one list to give up together.
 6. **Draft** the provider's fields and one PDF per kind of evidence, cut
    to the provider's limits (Stripe: PDF, JPEG or PNG, 4.5 MB together,
    under 50 pages, 19 for Mastercard). Staged at the provider without
@@ -422,16 +503,48 @@ about, one by one, and none goes out unattended.
 8. **Wait** for the outcome (`charge.dispute.closed`), which can take 60
    to 75 days, and record it.
 
-- **Where a provider already answers by itself** (Stripe's Smart Disputes
-  sends its own packet near the deadline when the merchant has done
-  nothing), the pack says so at setup, and the company chooses which of
-  the two answers.
+- **Where a provider already answers by itself (revised).** Stripe's
+  Smart Disputes builds a packet from what Stripe holds and sends it near
+  the deadline when the merchant has done nothing, for 30% of the amount
+  on a win and no second fee. It is not either-or: with Stripe's
+  `prefer_smart_disputes` setting, evidence the merchant has put on the
+  dispute is merged into Stripe's packet. So there are three ways, and the
+  pack proposes one per dispute with the money worked out:
+  - harness stages the company's own evidence and Stripe sends (no second
+    fee, 30% of a win);
+  - a person approves and harness sends (the second fee at risk, nothing
+    taken from a win);
+  - give up.
 - **What harness adds over the provider's own tool:** the evidence in the
-  company's own systems, which the provider does not hold.
-- **Left out:** alerts before a dispute (Verifi, Ethoca), which the
-  company switches on at its provider.
+  company's own systems, which the provider does not hold (Stripe's
+  documentation lists no connection to a helpdesk, usage records or
+  contracts). This is also the costly part: those connectors differ per
+  company.
+- **What it cannot add:** the customer's device and address history from
+  a year ago, if the company never kept it. Visa's rule for fraud
+  disputes rests on exactly that. At setup the pack says what the company
+  records at checkout and what it would need to start keeping.
+- **Before a dispute (revised: was left out).** Under Visa's monitoring
+  programme a merchant is "excessive" from 150 disputes and fraud reports
+  per 10,000 payments (from 2026-04-01, with 1,500 a month or more), and
+  preventing a dispute counts for more there than winning one. The pack
+  reads the company's ratio and says where it stands. Answering the
+  alerts that come before a dispute (Verifi, Ethoca) is a later addition,
+  no longer out of scope; the company switches them on at its provider.
+- **Who this is for is not known.** The complaints found are from small
+  shops, which do not run servers. A company with its own systems, its
+  own evidence and a person for disputes is the likelier user:
+  subscriptions and software, digital goods, platforms.
 
 ### Overdue
+
+(Revised: the weakest fit of the three. Most failed payments that come
+back do so within days through the provider's own retries and first
+emails, and the tools that chase invoices for mid-sized companies are
+liked by their users. What is left for harness: control over who is
+reminded, when and how often, which the accounting programs' own
+reminders lack; holding a reminder when something is open; and an honest
+count against a group left as before. It stays last in the build order.)
 
 Two kinds of case, with different rules.
 
@@ -439,9 +552,11 @@ Two kinds of case, with different rules.
 the Late Payment Directive gives interest and a fixed EUR 40 without a
 reminder being needed.
 
-1. **Start:** an invoice passes its due date.
-2. **Gather:** the invoice, earlier ones and how they were paid, open
-   tickets and disputes with that customer, who the contact is.
+1. **Start:** an invoice passes its due date, in the company's accounting
+   software (`ledgermcp`; revised).
+2. **Gather:** the invoice, earlier ones and how they were paid, whether
+   the bank feed has a payment not yet matched, open tickets and disputes
+   with that customer, who the contact is.
 3. **Hold back** when something is open: a complaint, a credit note asked
    for, a delivery in question. The case goes to a person with what was
    found.
@@ -464,11 +579,17 @@ own customer.
 4. **Stop** when it is paid, when the plan ends, or when the customer
    answers with something for a person.
 
-- **At setup the pack reads the company's retry settings** and says what
-  they are against the card networks' limits (Visa: at most 15 tries in
-  30 days by the stricter of the two figures published, and never after a
-  "do not retry" answer; Mastercard: at most 10 in 24 hours and 35 in 30
-  days). It changes nothing there.
+- **At setup the pack looks for two things in the company's retries
+  (revised),** and changes nothing there: two systems retrying the same
+  payment (the provider's and a second tool's), which is how customers
+  get charged twice; and retries of payments the bank has said never to
+  try again. The networks' caps on the number of tries (Visa 15 or 20 in
+  30 days by the figure one believes, Mastercard 10 in 24 hours and 35 in
+  30 days) are far above any provider's defaults and are only noted.
+- **Direct debit is where the providers do least** (two retries, for
+  insufficient funds only), and European companies on SEPA Direct Debit
+  with Mollie or GoCardless are the ones today's tools serve worst. No
+  connector for them is planned yet.
 - **Consumer credit is out of the first version:** lenders' arrears fall
   under forbearance rules (Directive (EU) 2023/2225 from 2026-11-20; the
   UK's CONC 7) that need the lender's own process around every message.
@@ -504,7 +625,8 @@ then; the UK's Regulations 2017, regulation 28).
    approves.
 8. **Risk points** by the company's own table, added up in code from the
    facts found. harness shows the sum and each line's reason; it gives no
-   opinion of its own.
+   opinion of its own. A fact that could not be retrieved counts as the
+   table says a missing fact counts, and is shown as missing (revised).
 9. **The compliance officer decides:** take, ask for more, refuse. The
    file goes to the company's system as a PDF and as data. harness's copy
    is deleted after `keep_days`; the five years the law asks for are kept
@@ -517,6 +639,17 @@ then; the UK's Regulations 2017, regulation 28).
   built so that none of these can happen without a named person.
 - **Later:** watching a taken customer's register entry for changes, and
   screening again on a schedule.
+- **What holds this pack back (revised)** is data more than workflow:
+  registers that answer with documents, not data; owner registers that
+  take days or months to answer; a screening source the company must
+  already pay for. It also needs every part harness lacks: documents
+  read, a second person, sign-in. And a regulated buyer's checks of a
+  supplier begin with attestations (SOC 2, ISO 27001) that this project
+  does not have. Supervisors have fined firms for automation nobody in
+  the firm had tested or understood; a server, a model and connectors run
+  by a compliance team of three is more to understand, not less. The
+  pack's scored run on the firm's own past files (Part H) is the answer
+  to that, and has to come first.
 
 ## Constraints
 
@@ -541,15 +674,20 @@ Each step ends in something a company can use.
 1. **Disputes for one person.** `paymcp` for Stripe, the PDF, cases
    (Part A), limits a company sets, polling. It runs with today's single
    owner, who is the company's person for disputes. This is the shortest
-   way to a result counted in money.
-2. **Measuring** (Part H), on that company's past disputes.
+   way to a result counted in money. (Revised: it is also the job where
+   others can copy the idea soonest, and where the provider and the card
+   networks are making the written answer ordinary. It is first because
+   it is the cheapest proof, not because it is the best position.)
+2. **Measuring** (Part H), on that company's past disputes: the first
+   number this project would have, and the thing to show the next
+   company.
 3. **People and the staff page** (Parts B and C), and the server install
    (Part I).
 4. **Webhooks** (Part D).
 5. **Documents read** (Part E), `regmcp` for the UK, Poland and GLEIF,
    screening through OpenSanctions: **Onboarding**.
-6. **Messages under a plan** (Part G): **Overdue**, business invoices
-   first.
+6. **Messages under a plan** (Part G) and `ledgermcp`: **Overdue**,
+   business invoices first.
 7. Adyen in `paymcp`; more registers.
 
 ## What is not known
@@ -562,9 +700,17 @@ Each step ends in something a company can use.
 - **Others sell these jobs already:** Stripe's own Smart Disputes and
   Chargeflow for disputes; Churnkey, Chaser and Upflow for overdue;
   Parcha, Bretton AI, Duna, Spektr and Arva for onboarding, several with
-  tens of millions raised in 2026. What is different here is that it runs
-  on the company's own server with its own model and a log it can verify.
-  Whether that is enough to be chosen is not known.
+  tens of millions raised in 2026. (Revised.) What is different here is
+  that a named person is shown the evidence and its gaps before anything
+  happens, with the keys and the data kept in the company. Asking before
+  sending is a decision any of them can copy. Whether a company would
+  choose this, and run a server for it, is not known: nobody was asked,
+  and no survey found measures it.
+- **What the research could not read or find:** Reddit and the full
+  reviews on the large review sites; first-hand accounts of Stripe's
+  Smart Disputes; any audited figure for any vendor; any incident naming
+  an AI agent in these three jobs (which is not evidence that there are
+  none); costs and team sizes at small European payment firms.
 - **Legal reading,** to be checked by a lawyer before a sale:
   - whether a company that runs this software itself must tell its
     supervisor as it would for outsourcing (AMLR Article 18);
@@ -582,10 +728,13 @@ Each step ends in something a company can use.
 
 1. **Which job first?** Proposed: disputes, because step 1 needs the
    least new and its result is money won. Onboarding earns more per
-   customer and needs steps 3 and 5 first.
+   customer and needs steps 3 and 5 first. (Revised: the research keeps
+   this order for cost, and says onboarding is where harness fits best
+   and disputes where it is easiest to copy.)
 2. **Companies run it themselves, and we host nothing,** as decided on
-   2026-11-24? Proposed: yes. For this market it is also the reason to
-   choose it.
+   2026-11-24? Proposed: yes. (Revised: it is a reason for some buyers,
+   mostly older institutions, and a burden for small teams; it is no
+   longer put forward as the reason to choose it.)
 3. **Is there a company to build step 1 with?** Proposed: none of it is
    built before one says yes to trying it on its own test account.
 4. **Who pays for data** (screening, registers that charge)? Proposed:
@@ -616,6 +765,15 @@ Each step ends in something a company can use.
 - **A case's runs see only that case,** and write no memory.
 - **Disputes first** in the build order.
 - **Nothing is built until a company agrees to try it.**
+- (Revised) **The first thing shown to anyone is a scored run on real past
+  cases,** counted over every case and net of fees.
+- (Revised) **What could not be found is shown as missing,** in every pack.
+- (Revised) **An approval records what the person was shown and did,** and
+  no pack has "approve all".
+- (Revised) **A ledger connector** for overdue invoices; **Stripe may send
+  what harness staged;** the dispute ratio is read before any dispute.
+- (Revised) **Self-hosting and the verifiable log are described as what
+  supports the product,** not as why to buy it.
 
 ## Sources (read 2026-11-25)
 
@@ -640,6 +798,30 @@ Payments:
   https://www.checkout.com/merchant-communications/changes-to-visa-system-integrity-fees ,
   https://developer.paypal.com/braintree/articles/risk-and-security/compliance/network-updates/2023/mastercard-f23
 - Chargeflow's prices: https://www.chargeflow.io/pricing
+
+What today's tools do and are said to get wrong (read 2026-11-25, late):
+
+- Stripe Smart Disputes and its setting:
+  https://docs.stripe.com/disputes/smart-disputes ,
+  https://docs.stripe.com/disputes/set-up-smart-disputes ; Stripe's
+  restricted keys: https://docs.stripe.com/keys/restricted-api-keys
+- Visa's monitoring programme (fact sheet, 2025):
+  https://corporate.visa.com/content/dam/VCOM/corporate/visa-perspectives/security-and-trust/documents/visa-acquirer-monitoring-program-fact-sheet-2025.pdf
+- Recovery benchmarks from one vendor's own data (recoveries before any
+  email, within days): https://baremetrics.com/blog/subscription-payment-recovery-benchmarks
+- How late businesses pay in Europe: https://www.intrum.com/insights/publications/epr-2026/
+- Feature requests on accounting programs' reminders:
+  https://productideas.xero.com/forums/967115-invoices-quotes/suggestions/51854865-turn-on-invoice-reminders-for-one-customer
+- The EBA on compliance failures from misused tools (2025):
+  https://www.eba.europa.eu/publications-and-media/press-releases/careless-use-innovative-compliance-products-can-lead-money-laundering-and-terrorism-financing-risks
+- The FCA's fine for a screening system nobody tested (2024):
+  https://www.fca.org.uk/news/press-releases/fca-fines-starling-bank-failings-financial-crime-systems-and-controls
+- Registers that return documents, not data (an aggregator's own figure):
+  https://www.kyckr.com/blog/ubo-identification-challenges ; a test of
+  owner registers' answer times:
+  https://transparency.org/en/news/countdown-to-new-eu-beneficial-ownership-rules
+- How UK financial firms use agents (Bank of England and FCA, 2026):
+  https://www.bankofengland.co.uk/report/2026/artificial-intelligence-in-uk-financial-services-2026
 
 Contact rules:
 

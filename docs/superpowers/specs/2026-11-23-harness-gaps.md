@@ -180,7 +180,12 @@ against real providers; a payment connector and PDFs; scored runs on past
 cases; more than one person with roles and sign-in, and a page for staff;
 webhooks; PDFs and images read; register and screening connectors;
 messages to customers under a plan approved once. Six questions for the
-owner are at its end; none is answered.
+owner are at its end; none is answered. Revised the same night after a
+search of what today's tools are said to get wrong: what is worth selling
+is that a named person is shown the evidence and its gaps before anything
+happens; self-hosting and the log support that; a scored run on real past
+cases comes before any feature; a ledger connector is added for overdue
+invoices.
 
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
