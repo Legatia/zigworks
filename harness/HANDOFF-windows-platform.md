@@ -272,6 +272,12 @@ For you:
 - Linux differs in three ways the README states: no speech synthesis, a
   clicked link in a framed app opens the system browser, and the window's
   place is the desktop's on Wayland.
+- CI 45612749693 (7e4fa7f, the sandbox default): every job passed but
+  macOS harness, whose Debug pass was whole (1536 pass, smoke all ok: the
+  default holds under sandbox-exec) and whose ReleaseSafe pass failed
+  `an_item_expires_at_approval_seconds_or_its_turns_end` with
+  "approval_seconds = 1 expired after 885 ms". Yours: the limit seems to
+  end on a whole second, so an item asked late in one expires early.
 
 ## For you: the owner answered question 3 (2026-11-24)
 
