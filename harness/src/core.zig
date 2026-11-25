@@ -14832,12 +14832,17 @@ pub const Core = struct {
         return deskErr(a, .not_found, "the desk has state, history, events, send, answer, seen, settings, voice, upload and speech");
     }
 
-    /// `POST settings {"avatar":NAME}` or `{"speak":VALUE}`: `[desk]` in
-    /// config.ini, written and applied (as /persona does).
+    /// `POST settings {"avatar":NAME}`, `{"speak":VALUE}`,
+    /// `{"speak_model":M}` or `{"speak_voice":V}` ("": the kind's
+    /// default): `[desk]` in config.ini, written and applied (as /persona
+    /// does). Choosing a provider of another kind than the one before
+    /// clears the model and the voice, which were the other kind's.
     fn deskSettings(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
-        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, "{\"avatar\":NAME} or {\"speak\":VALUE}");
+        const shape = "{\"avatar\":NAME}, {\"speak\":VALUE}, {\"speak_model\":M} or {\"speak_voice\":V}";
+        const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, shape);
         var key: []const u8 = "";
         var value: []const u8 = "";
+        var text = c.readOr(a, c.paths.config);
         if (jv.str(jv.get(v, "avatar"))) |name| {
             if (!config.avatarName(name)) return deskErr(a, .bad_request, "no such avatar");
             const there = for (try c.deskAvatars(a)) |x| {
@@ -14853,12 +14858,31 @@ pub const Core = struct {
             if (!offered) return deskErr(a, .bad_request, "speak is off, browser, or a provider that can speak (api = openai or gemini)");
             key = "speak";
             value = sp;
-        } else return deskErr(a, .bad_request, "{\"avatar\":NAME} or {\"speak\":VALUE}");
-        const text = try mail_mod.setKey(a, c.readOr(a, c.paths.config), "desk", key, value);
+            if (config.speakApi(c.cfg, sp)) |kind| {
+                const was = config.speakApi(c.cfg, c.cfg.desk.speak);
+                if (was == null or was.? != kind) {
+                    text = try mail_mod.unsetKey(a, text, "desk", "speak_model");
+                    text = try mail_mod.unsetKey(a, text, "desk", "speak_voice");
+                }
+            }
+        } else if (jv.str(jv.get(v, "speak_model")) orelse jv.str(jv.get(v, "speak_voice"))) |given| {
+            key = if (jv.get(v, "speak_model") != null) "speak_model" else "speak_voice";
+            value = given;
+            if (given.len > 0 and !speakName(given)) return deskErr(a, .bad_request, "Model and voice use letters, digits and . _ - : / @ +, up to 100.");
+        } else return deskErr(a, .bad_request, shape);
+        text = if (value.len == 0) try mail_mod.unsetKey(a, text, "desk", key) else try mail_mod.setKey(a, text, "desk", key, value);
         c.writeSetting(c.paths.config, text) catch |e| return deskErr(a, .internal_server_error, try std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)}));
         c.log.write(.config, false, .{ .event = "desk setting", .key = key, .value = value }) catch {};
         if (c.applySetup()) |why| return deskErr(a, .conflict, why);
         return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// A speech model's or voice's name as the desk takes it: 1 to 100 of
+    /// A-Z a-z 0-9 . _ - : / @ +, nothing config.ini would read otherwise.
+    fn speakName(s: []const u8) bool {
+        if (s.len == 0 or s.len > 100) return false;
+        for (s) |ch| if (!(std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "._-:/@+", ch) != null)) return false;
+        return true;
     }
 
     /// `POST voice?conv=NAME`: the owner's recorded words, transcribed
@@ -15208,6 +15232,25 @@ pub const Core = struct {
         for (c.deskSpeakers(a)) |p| {
             try out.append(a, ',');
             try util.jsonString(out, a, p);
+        }
+        try out.appendSlice(a, "],\"speak_model\":");
+        try util.jsonString(out, a, d.speak_model);
+        try out.appendSlice(a, ",\"speak_voice\":");
+        try util.jsonString(out, a, d.speak_voice);
+        // each voice's kind, its defaults, and whether its key is there
+        try out.appendSlice(a, ",\"speakers\":[");
+        for (c.deskSpeakers(a), 0..) |name, i| {
+            const kind = config.speakApi(c.cfg, name) orelse continue;
+            const def = voice_mod.speakDefaults(kind) orelse continue;
+            const key = if (c.providers.find(name)) |p| p.hasKey() else false;
+            if (i > 0) try out.append(a, ',');
+            try out.appendSlice(a, "{\"name\":");
+            try util.jsonString(out, a, name);
+            try out.print(a, ",\"api\":\"{s}\",\"model\":", .{@tagName(kind)});
+            try util.jsonString(out, a, def.model);
+            try out.appendSlice(a, ",\"voice\":");
+            try util.jsonString(out, a, def.voice);
+            try out.print(a, ",\"key\":{s}}}", .{if (key) "true" else "false"});
         }
         try out.print(a, "],\"echo\":{s},\"voice\":{s}}}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
     }
@@ -36625,6 +36668,74 @@ test "desk_speech_fetches_the_providers_audio" {
     // speak = off or browser: harness fetches nothing
     _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
     try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id})).status);
+}
+
+test "desk_model_and_voice_are_checked_then_written" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak_model\":\"gemini-3.8-flash-tts\"}").body);
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak_voice\":\"Charon\"}").body);
+    try expectHas(f.core.readOr(a, p.config), "speak_model = gemini-3.8-flash-tts");
+    try t.expectEqualStrings("gemini-3.8-flash-tts", f.core.cfg.desk.speak_model);
+    try t.expectEqualStrings("Charon", f.core.cfg.desk.speak_voice);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"speak_model\":\"gemini-3.8-flash-tts\",\"speak_voice\":\"Charon\"");
+    // empty: back to the kind's default, the line gone
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak_voice\":\"\"}").body);
+    try t.expectEqualStrings("", f.core.cfg.desk.speak_voice);
+    try t.expect(std.mem.indexOf(u8, f.core.readOr(a, p.config), "speak_voice") == null);
+    // what could break config.ini, or isn't a name: refused, nothing written
+    const before = f.core.readOr(a, p.config);
+    const long = try a.alloc(u8, 101);
+    @memset(long, 'a');
+    for ([_][]const u8{ "a b", "x;y", "x#y", "x\\ny", "[desk]", "a=b", "x\\u0000y", long }) |bad| {
+        const got = deskCall(&f, .POST, "settings", "", try std.fmt.allocPrint(a, "{{\"speak_model\":\"{s}\"}}", .{bad}));
+        if (got.status != .bad_request) std.debug.print("{s}: {d}\n", .{ bad, @backingInt(got.status) });
+        try t.expectEqual(std.http.Status.bad_request, got.status);
+        try expectHas(got.body, "Model and voice use letters, digits and . _ - : / @ +, up to 100.");
+    }
+    try t.expectEqualStrings(before, f.core.readOr(a, p.config));
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"speak_voice\":5}").status);
+}
+
+test "choosing_another_kind_clears_model_and_voice" {
+    var f: Fix = undefined;
+    // an old init's lines, and a second OpenAI-format voice
+    try f.init("[provider tts]\napi = openai\nurl = http://127.0.0.1:9/v1\n[desk]\nspeak = openai\nspeak_model = tts-1\nspeak_voice = alloy\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    // Gemini never gets OpenAI's model
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak\":\"gemini\"}").body);
+    try t.expectEqualStrings("", f.core.cfg.desk.speak_model);
+    try t.expectEqualStrings("", f.core.cfg.desk.speak_voice);
+    try t.expect(std.mem.indexOf(u8, f.core.readOr(a, p.config), "speak_model") == null);
+    // the same provider again: kept
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak_voice\":\"Charon\"}");
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"gemini\"}");
+    try t.expectEqualStrings("Charon", f.core.cfg.desk.speak_voice);
+    // between two of one kind: kept
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"tts\"}");
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak_voice\":\"onyx\"}");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak\":\"openai\"}").body);
+    try t.expectEqualStrings("onyx", f.core.cfg.desk.speak_voice);
+    // off keeps them; a provider after off starts from its defaults
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
+    try t.expectEqualStrings("onyx", f.core.cfg.desk.speak_voice);
+    _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"openai\"}");
+    try t.expectEqualStrings("", f.core.cfg.desk.speak_voice);
+}
+
+test "desk_settings_list_every_speaker_with_its_defaults" {
+    var f: Fix = undefined;
+    try f.init("[provider kokoro]\napi = openai\nurl = http://127.0.0.1:9/v1\nauth = none\n", "", "");
+    defer f.deinit();
+    const st = deskCall(&f, .GET, "state", "", "").body;
+    try expectHas(st, "\"speakers\":[{\"name\":\"openai\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":false},{\"name\":\"gemini\",\"api\":\"gemini\",\"model\":\"gemini-3.8-flash-lite-tts\",\"voice\":\"Schedar\",\"key\":false},{\"name\":\"kokoro\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":true}]");
+    try expectHas(st, "\"speak_model\":\"\",\"speak_voice\":\"\"");
+    try expectHas(st, "\"openai\",\"gemini\",\"kokoro\"]");
 }
 
 /// The fixture opened again with `extra` added to config.ini and the

@@ -356,6 +356,27 @@ pub fn setKey(a: Allocator, text: []const u8, section: []const u8, key: []const 
     return join(a, lines.items, nl);
 }
 
+/// `text` without section `section`'s `key = …` lines (each time the
+/// section appears); comments, other keys and other sections as they were.
+pub fn unsetKey(a: Allocator, text: []const u8, section: []const u8, key: []const u8) ![]const u8 {
+    const nl: []const u8 = if (std.mem.indexOf(u8, text, "\r\n") != null) "\r\n" else "\n";
+    var kept: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    var in = false;
+    while (it.next()) |raw| {
+        const l = std.mem.trimEnd(u8, raw, "\r");
+        const tl = std.mem.trim(u8, l, " \t");
+        if (tl.len > 0 and tl[0] == '[') {
+            in = std.mem.eql(u8, std.mem.trim(u8, tl[1 .. std.mem.indexOfScalar(u8, tl, ']') orelse tl.len], " \t"), section);
+        } else if (in and tl.len > 0 and tl[0] != ';' and tl[0] != '#') {
+            if (std.mem.indexOfScalar(u8, tl, '=')) |eq| if (std.mem.eql(u8, std.mem.trim(u8, tl[0..eq], " \t"), key)) continue;
+        }
+        try kept.append(a, l);
+    }
+    if (kept.items.len > 0 and kept.items[kept.items.len - 1].len == 0) _ = kept.pop();
+    return join(a, kept.items, nl);
+}
+
 fn join(a: Allocator, lines: []const []const u8, nl: []const u8) ![]const u8 {
     var o: std.ArrayList(u8) = .empty;
     for (lines) |l| {
@@ -561,4 +582,16 @@ test "a_setting_is_set_in_its_section_and_the_rest_stays" {
     try t.expectEqualStrings("a\nb\nc\n", try seen.text(a));
     const items = try parseItems(a, try itemsJson(a, &.{.{ .id = "x/1", .uid = 1, .from = "Ann <a@x>", .subject = "Hi" }}));
     try t.expectEqualStrings("Ann <a@x>", items[0].from);
+}
+
+test "unset_key_removes_only_that_key" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // that section's line goes; a comment and another section's stay
+    try t.expectEqualStrings("[desk]\nspeak = gemini\n; speak_model = x\n[other]\nspeak_model = y\n", try unsetKey(a, "[desk]\nspeak = gemini\nspeak_model = tts-1 ; a note\n; speak_model = x\n[other]\nspeak_model = y\n", "desk", "speak_model"));
+    // not there: the text as it was
+    try t.expectEqualStrings("[desk]\nspeak = off\n", try unsetKey(a, "[desk]\nspeak = off\n", "desk", "speak_voice"));
+    // the section twice: from both; CRLF kept
+    try t.expectEqualStrings("[desk]\r\nspeak = off\r\n[desk]\r\necho = on\r\n", try unsetKey(a, "[desk]\r\nspeak = off\r\nspeak_voice = alloy\r\n[desk]\r\necho = on\r\nspeak_voice = onyx\r\n", "desk", "speak_voice"));
 }
