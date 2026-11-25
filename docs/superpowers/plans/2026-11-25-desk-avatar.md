@@ -200,6 +200,7 @@
 34. speak also takes onWord(i0, i1) for a caption — cost if wrong: an unused option.
 35. The per-frame step is capped at 0.1 s (the prototype's 0.05), so slow frames keep real time — cost if wrong: a 100 ms hitch moves the face a bigger step.
 36. The 30 fps cap is checked as frames at least 29 ms apart while resting — cost if wrong: none.
+37. (The coordinator, matching the finished desk page; replaces Ruling 27's shape) fit() resolves `{ head, eyes, eyemask, face: { width }, warnings, closed, report }` and rejects with an Error whose message is the line to show (`code`, `warnings` on it), built by the pure `refusal(verdict)` over judgePhoto/judgeClosed; the states are `resting`, `quiet`, `working`, `needs`, `urgent`, `speaking` (`needs you` still taken); avatar.ini's keys sit in an `[avatar]` section, read by avatar.js and `avatar check` (keys before any section still count; another section is a problem in `avatar check`, skipped by avatar.js) — cost if wrong: none (the page's own calls).
 
 ## Done
 

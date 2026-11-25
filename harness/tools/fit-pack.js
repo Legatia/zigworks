@@ -21,24 +21,29 @@ try {
     closed = files.closed ? '/desk/avatars/' + pack + '/' + files.closed : null;
   }
   log('fitting ' + still + (closed ? ' with ' + closed : ''));
-  const out = await fit(still, closed);
-  for (const w of out.warnings) log('warning: ' + w);
-  log('face ' + out.faceWidth + ' px wide; eyes-closed version ' + (out.closedUsed ? 'used' : 'not used'));
-  if (!out.ok) {
-    log('NOT FITTED: ' + out.code + ': ' + out.message);
-  } else {
-    log(JSON.stringify(out.report, null, 1));
-    show(out.files.eyes); show(out.files.eyemask);
-    if (pack) {
-      await save('avatars/' + pack + '/head.bin', out.files.head);
-      await save('avatars/' + pack + '/eyes.png', out.files.eyes);
-      await save('avatars/' + pack + '/eyemask.png', out.files.eyemask);
-      const ini = { ...files, head: 'head.bin', eyes: 'eyes.png', eyemask: 'eyemask.png' };
-      if (!out.closedUsed) delete ini.closed;
-      await save('avatars/' + pack + '/avatar.ini', packIni(ini));
-    }
+  let out;
+  try {
+    out = await fit(still, closed);
+  } catch (e) {
+    log('NOT FITTED: ' + e.code + ': ' + e.message);
+    for (const w of e.warnings || []) log('warning: ' + w);
+    window.__result = { ok: false, code: e.code, message: e.message, warnings: e.warnings || [] };
+    window.__ready = true;
+    throw e;
   }
-  window.__result = { ok: out.ok, code: out.code, message: out.message, warnings: out.warnings, faceWidth: out.faceWidth, closedUsed: out.closedUsed, report: out.report };
+  for (const w of out.warnings) log('warning: ' + w);
+  log('face ' + out.face.width + ' px wide; eyes-closed version ' + (out.closed ? 'used' : 'not used'));
+  log(JSON.stringify(out.report, null, 1));
+  show(out.eyes); show(out.eyemask);
+  if (pack) {
+    await save('avatars/' + pack + '/head.bin', out.head);
+    await save('avatars/' + pack + '/eyes.png', out.eyes);
+    await save('avatars/' + pack + '/eyemask.png', out.eyemask);
+    const ini = { ...files, head: 'head.bin', eyes: 'eyes.png', eyemask: 'eyemask.png' };
+    if (!out.closed) delete ini.closed;
+    await save('avatars/' + pack + '/avatar.ini', packIni(ini));
+  }
+  window.__result = { ok: true, warnings: out.warnings, faceWidth: out.face.width, closedUsed: out.closed, report: out.report };
 } catch (e) {
   log('ERROR: ' + e.message);
   window.__result = { ok: false, error: e.message };

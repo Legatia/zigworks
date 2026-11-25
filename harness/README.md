@@ -3482,6 +3482,7 @@ naming its files:
 
 ```ini
 # avatars/butler/avatar.ini
+[avatar]
 still = still.jpg
 closed = closed.jpg
 head = head.bin
@@ -3489,6 +3490,8 @@ eyes = eyes.png
 eyemask = eyemask.png
 ```
 
+The keys sit in an `[avatar]` section (as the desk's upload writes it);
+other sections are refused by `avatar check` and skipped by the desk.
 Values are file names in the pack's own folder. `head`, `eyes` and
 `eyemask` come together: a pack with only a still hasn't been fitted yet,
 and the desk shows the still, breathing, and offers to fit it. The desk

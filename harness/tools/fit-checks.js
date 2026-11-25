@@ -7,12 +7,16 @@ const still = await loadImage('/desk/avatars/butler/still.jpg');
 const closed = await loadImage('/desk/avatars/butler/closed.jpg');
 const canvas = (w, h, draw) => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d'); g.fillStyle = '#000'; g.fillRect(0, 0, w, h); draw(g); return c; };
 const W = still.width, H = still.height;
-const attempt = async (photo, closedPhoto) => { const r = await fit(photo, closedPhoto); return r.ok ? { ok: true, r, warnings: r.warnings, faceWidth: r.faceWidth } : { ok: false, code: r.code, message: r.message, warnings: r.warnings }; };
+// fit() resolves the pack's files, or rejects with the line to show
+const attempt = async (photo, closedPhoto) => {
+  try { const r = await fit(photo, closedPhoto); return { ok: true, r: { ...r, files: r }, warnings: r.warnings, faceWidth: r.face.width, closedUsed: r.closed }; }
+  catch (e) { return { ok: false, code: e.code, message: e.message, warnings: e.warnings }; }
+};
 const results = {};
 
 const upright = await attempt(still);
 const meta = readHead(upright.r.files.head).meta;
-results.upright = { ok: upright.ok, turned: upright.r.report.turned, faceWidth: upright.r.faceWidth, warnings: upright.r.warnings, lipGap: null };
+results.upright = { ok: upright.ok, turned: upright.r.report.turned, faceWidth: upright.faceWidth, warnings: upright.warnings };
 
 // the reflections are out of the eye texture: nothing bright left round
 // each one, and each found where the photo's bright dot is (the butler's
@@ -64,7 +68,7 @@ results.closedSize = await attempt(still, canvas(W / 2, H / 2, (g) => g.drawImag
 results.closedOpen = await attempt(still, still);
 // the real pair
 const pair = await attempt(still, closed);
-results.pair = { ok: pair.ok, closedUsed: pair.ok && pair.r.closedUsed, closedShift: pair.ok ? +pair.r.report.closedShift.toFixed(2) : pair };
+results.pair = { ok: pair.ok, closedUsed: pair.ok && pair.closedUsed, closedShift: pair.ok ? +pair.r.report.closedShift.toFixed(2) : pair };
 
 for (const [k, v] of Object.entries(results)) log(k + ': ' + JSON.stringify(v));
 window.__r = results;

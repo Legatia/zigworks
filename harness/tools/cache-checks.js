@@ -16,18 +16,18 @@ const big = await bytes('/desk/avatars/butler/still.jpg'), small = await bytes('
 await save('avatars/cachetest/big.jpg', big);
 await save('avatars/cachetest/small.jpg', small);
 await save('avatars/cachetest/x.jpg', big);
-await save('avatars/cachetest/avatar.ini', 'still = big.jpg\n');
+await save('avatars/cachetest/avatar.ini', '[avatar]\nstill = big.jpg\n');
 let a = await createAvatar(el, '/desk/avatars/cachetest/', {});
 const first = a.inspect().still;
 a.dispose();
 // avatar.ini changed on disk
-await save('avatars/cachetest/avatar.ini', 'still = small.jpg\n');
+await save('avatars/cachetest/avatar.ini', '[avatar]\nstill = small.jpg\n');
 a = await createAvatar(el, '/desk/avatars/cachetest/', {});
 const second = a.inspect().still;
 a.dispose();
 check('a_changed_avatar_ini_is_seen_at_once', first[0] === 2720 && second[0] === 1360, { first, second });
 // the still replaced under the same name
-await save('avatars/cachetest/avatar.ini', 'still = x.jpg\n');
+await save('avatars/cachetest/avatar.ini', '[avatar]\nstill = x.jpg\n');
 a = await createAvatar(el, '/desk/avatars/cachetest/', {});
 const third = a.inspect().still;
 a.dispose();
@@ -39,7 +39,7 @@ check('a_replaced_still_is_seen_at_once', third[0] === 2720 && fourth[0] === 136
 // a head fitted to the butler's still, over another photo of the same size
 await save('avatars/cachetest/still.jpg', await bytes('/desk/avatars/butler/closed.jpg'));
 for (const f of ['head.bin', 'eyes.png', 'eyemask.png']) await save('avatars/cachetest/' + f, await bytes('/desk/avatars/butler/' + f));
-await save('avatars/cachetest/avatar.ini', 'still = still.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n');
+await save('avatars/cachetest/avatar.ini', '[avatar]\nstill = still.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n');
 a = await createAvatar(el, '/desk/avatars/cachetest/', {});
 const other = { mode: a.mode, problem: a.problem };
 a.dispose();

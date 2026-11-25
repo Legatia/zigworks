@@ -82,9 +82,10 @@ export function readHead(buf) {
   return { version, meta, arr };
 }
 
-/** avatar.ini's text for a pack's files ({ still, closed?, head?, eyes?, eyemask? }). */
+/** avatar.ini's text for a pack's files ({ still, closed?, head?, eyes?,
+ *  eyemask? }): an [avatar] section, as the desk's upload writes it. */
 export function packIni(files) {
-  let s = '';
+  let s = '[avatar]\n';
   for (const k of ['still', 'closed', 'head', 'eyes', 'eyemask']) if (files[k]) s += k + ' = ' + files[k] + '\n';
   return s;
 }
@@ -407,6 +408,12 @@ export function closedShift(open, closed, W, H) {
   return n ? s / n : 0;
 }
 
+/** A refusal as the Error fit() rejects with: the table's line as its
+ *  message, the check as `code`, and the warnings that came with it. */
+export function refusal(verdict) {
+  return Object.assign(new Error(verdict.message), { code: verdict.code, warnings: verdict.warnings || [] });
+}
+
 /** The eyes-closed photo's checks: { sameSize, faces, shift (px, from
  *  closedShift), blinkLeft, blinkRight } in, { ok, code?, message? } out.
  *  Another size, no face or a shift over 12 px don't line up. */
@@ -668,23 +675,24 @@ const scores = (res) => Object.fromEntries((res.faceBlendshapes?.[0]?.categories
  * Fits a portrait: the pack's head (head.bin), eye texture (eyes.png) and
  * blink mask (eyemask.png). closedPhoto, the same portrait with the eyes
  * closed, is optional and checked against it. Resolves to
- *   { ok, message?, code?, warnings: [], faceWidth, closedUsed,
- *     files: { head: ArrayBuffer, eyes: Blob, eyemask: Blob } | null, report }
- * where message is the plain line for the owner when it's refused (the
- * spec's table) and warnings are lines to show either way.
+ *   { head: ArrayBuffer, eyes: Blob, eyemask: Blob, face: { width },
+ *     warnings: [lines], closed: bool, report }
+ * (closed: an eyes-closed version was used; report: numbers for checking).
+ * Rejects with an Error whose message is the plain line to show (the
+ * spec's table for a refused photo), with `code` naming the check and
+ * `warnings` the lines that came with it.
  * options.assets: where the fit files are (default /desk/assets/).
  */
 export async function fit(photo, closedPhoto, options = {}) {
   const assets = options.assets || ASSETS;
   const t0 = performance.now();
-  const result = { ok: false, warnings: [], faceWidth: null, closedUsed: false, files: null, report: null };
-  const refuse = (code, message, extra) => Object.assign(result, { ok: false, code, message }, extra);
+  const fail = (code, message, warnings = []) => refusal({ code, message, warnings });
   let still, closed, stillBytes;
   try {
     const [s0, c0] = await Promise.all([readImage(photo), closedPhoto ? readImage(closedPhoto) : null]);
     still = s0.canvas; stillBytes = s0.bytes; closed = c0 && c0.canvas;
   } catch (e) {
-    return refuse('image', "The photo didn't open. Use a JPEG or PNG.");
+    throw fail('image', "The photo didn't open. Use a JPEG or PNG.");
   }
   let lmk, baseBuf;
   try {
@@ -694,46 +702,55 @@ export async function fit(photo, closedPhoto, options = {}) {
     ]);
   } catch (e) {
     console.warn('fit: ' + (e && e.message));
-    return refuse('assets', NO_START);
+    throw fail('assets', NO_START);
+  }
+  let verdict, facts, res, base, closedShiftPx = null;
+  try {
+    base = readHead(baseBuf);
+    if (base.meta.kind !== 'base') throw new Error('base-head.bin is not a base head');
+  } catch (e) {
+    console.warn('fit: ' + (e && e.message));
+    throw fail('assets', NO_START);
+  }
+  const W = still.width, H = still.height;
+  try {
+    res = lmk.detect(still);
+    facts = photoFacts(res, W, H);
+    verdict = judgePhoto(facts);
+  } catch (e) {
+    console.error(e);
+    throw fail('failed', "The fit didn't work on this photo. Try another one.");
+  }
+  if (!verdict.ok) throw refusal(verdict);
+  if (closed) {
+    const sameSize = closed.width === W && closed.height === H;
+    const resC = sameSize ? lmk.detect(closed) : { faceLandmarks: [] };
+    const faces = resC.faceLandmarks?.length || 0;
+    closedShiftPx = faces ? closedShift(res.faceLandmarks[0], resC.faceLandmarks[0], W, H) : null;
+    const c = judgeClosed({ sameSize, faces, shift: closedShiftPx, blinkLeft: score(resC, 0, 'eyeBlinkLeft'), blinkRight: score(resC, 0, 'eyeBlinkRight') });
+    if (!c.ok) throw refusal({ ...c, warnings: verdict.warnings });
   }
   try {
-    const base = readHead(baseBuf);
-    if (base.meta.kind !== 'base') return refuse('assets', NO_START);
-    const W = still.width, H = still.height;
-    const res = lmk.detect(still);
-    const facts = photoFacts(res, W, H);
-    const verdict = judgePhoto(facts);
-    result.warnings = verdict.warnings;
-    result.faceWidth = facts.faces === 1 ? Math.round(facts.faceWidth) : null;
-    if (!verdict.ok) return refuse(verdict.code, verdict.message);
-    let closedShiftPx = null;
-    if (closed) {
-      const sameSize = closed.width === W && closed.height === H;
-      const resC = sameSize ? lmk.detect(closed) : { faceLandmarks: [] };
-      const faces = resC.faceLandmarks?.length || 0;
-      closedShiftPx = faces ? closedShift(res.faceLandmarks[0], resC.faceLandmarks[0], W, H) : null;
-      const c = judgeClosed({ sameSize, faces, shift: closedShiftPx, blinkLeft: score(resC, 0, 'eyeBlinkLeft'), blinkRight: score(resC, 0, 'eyeBlinkRight') });
-      if (!c.ok) return refuse(c.code, c.message);
-    }
+    const faceWidth = Math.round(facts.faceWidth);
     const L = res.faceLandmarks[0];
     const P = L.map((p) => [p.x * W, -p.y * H, -p.z * W]);
     const g = fitGeometry(base, P, W, H);
     const eyesCanvas = eyeTexture(still, g.meta);
     lidTones(still, g.meta);
     const maskCanvas = eyeMask(W, H, g.meta);
-    g.meta.photo = { expression: scores(res), turned: +facts.turned.toFixed(1), faceWidth: result.faceWidth };
+    g.meta.photo = { expression: scores(res), turned: +facts.turned.toFixed(1), faceWidth };
     // the still's fingerprint: the pack's still must be these very bytes
     if (stillBytes) g.meta.still = { bytes: stillBytes.byteLength, sha256: await sha256Hex(stillBytes) };
     const head = packHead(g.meta, g.arrays);
     const [eyes, eyemask] = await Promise.all([toBlob(eyesCanvas), toBlob(maskCanvas)]);
-    result.report = {
+    const report = {
       ...g.report, image: [W, H], turned: g.meta.photo.turned, expression: g.meta.photo.expression, closedShift: closedShiftPx,
       catchlights: g.meta.eyes.map((e) => e.catchlight), lids: g.meta.eyes.map((e) => e.lid), eyeCrop: g.meta.eyeCrop,
       bytes: head.byteLength, ms: Math.round(performance.now() - t0),
     };
-    return Object.assign(result, { ok: true, closedUsed: !!closed, files: { head, eyes, eyemask } });
+    return { head, eyes, eyemask, face: { width: faceWidth }, warnings: verdict.warnings, closed: !!closed, report };
   } catch (e) {
     console.error(e);
-    return refuse('failed', "The fit didn't work on this photo. Try another one.");
+    throw fail('failed', "The fit didn't work on this photo. Try another one.", verdict.warnings);
   }
 }

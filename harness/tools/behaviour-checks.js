@@ -13,7 +13,7 @@ const check = (name, ok, detail) => { results[name] = { ok: !!ok, detail }; log(
 const sample = (ms, f) => new Promise((ok) => { const out = [], t0 = performance.now(); const step = () => { out.push(f()); if (performance.now() - t0 < ms) requestAnimationFrame(step); else ok(out); }; step(); });
 
 const a = await createAvatar(document.getElementById('a'), pack, {});
-a.setState('needs you');
+a.setState('needs');
 await sleep(500);
 
 // 1. a provider's voice: the mouth moves only while it plays, the jaw with its loudness
@@ -93,7 +93,7 @@ await sleep(500);
   const r = await settle('resting');
   const qd = await settle('quiet'); const filter = a.inspect().filter;
   const w = await settle('working');
-  const n = await settle('needs you');
+  const n = await settle('needs');
   const u = await settle('urgent');
   check('the_states_show', r.eyeBlink_L > 0.9 && qd.eyeBlink_L > 0.9 && /brightness\(0\.6\)/.test(filter) && w.browDown_L > 0.25 && n.browInnerUp > 0.15 && n.eyeBlink_L < 0.9 && u.browOuterUp_L > 0.3 && u.eyeWide_L > 0.2,
     { resting: +r.eyeBlink_L.toFixed(2), quiet: [+qd.eyeBlink_L.toFixed(2), filter], working: +w.browDown_L.toFixed(2), needsYou: +n.browInnerUp.toFixed(2), urgent: [+u.browOuterUp_L.toFixed(2), +u.eyeWide_L.toFixed(2)] });
@@ -104,7 +104,7 @@ await sleep(500);
   await sleep(2500);
   check('arrive_opens_the_eyes_for_a_glance', Math.min(...open) < 0.3 && a.shapes().eyeBlink_L > 0.7, { minDuringGlance: +Math.min(...open).toFixed(2), after: +a.shapes().eyeBlink_L.toFixed(2) });
   // moments
-  a.setState('needs you'); await sleep(1500);
+  a.setState('needs'); await sleep(1500);
   a.moment('smile'); await sleep(900); const sm = a.shapes().mouthSmile_L; await sleep(2200); const smAfter = a.shapes().mouthSmile_L;
   a.moment('concern'); await sleep(900); const co = a.shapes().mouthFrown_L;
   check('moments_come_and_go', sm > 0.4 && smAfter < 0.15 && co > 0.2, { smile: +sm.toFixed(2), smileAfter2s: +smAfter.toFixed(2), concern: +co.toFixed(2) });

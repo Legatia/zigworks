@@ -165,10 +165,19 @@ fn parseIni(a: std.mem.Allocator, text_: []const u8, problems: *std.ArrayList([]
     var ini: Ini = .{};
     var it = std.mem.splitScalar(u8, text_, '\n');
     var no: usize = 0;
+    // the desk writes an [avatar] section; lines before any section count too
+    var in_avatar = true;
     while (it.next()) |raw| {
         no += 1;
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        if (line[0] == '[') {
+            const name = std.mem.trim(u8, std.mem.trimEnd(u8, line[1..], "]"), " \t");
+            in_avatar = std.mem.eql(u8, name, "avatar") and line[line.len - 1] == ']';
+            if (!in_avatar) try problems.append(a, try std.fmt.allocPrint(a, "avatar.ini line {d}: unknown section {s} (the section is [avatar])", .{ no, line }));
+            continue;
+        }
+        if (!in_avatar) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
             try problems.append(a, try std.fmt.allocPrint(a, "avatar.ini line {d}: not KEY = FILE", .{no}));
             continue;
@@ -706,7 +715,8 @@ const Pack = struct {
 
     /// A fitted pack: a JPEG still and closed photo of 64x32, PNG eyes and mask, a head.
     fn fitted(p: *Pack) !void {
-        try p.put("avatar.ini", "# a test pack\nstill = still.jpg\nclosed = closed.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n");
+        // as the desk page's upload writes it
+        try p.put("avatar.ini", "# a test pack\n[avatar]\nstill = still.jpg\nclosed = closed.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n");
         try p.put("still.jpg", try jpeg(p.a(), 64, 32, 0xc0, false));
         try p.put("closed.jpg", try jpeg(p.a(), 64, 32, 0xc0, true));
         try p.put("head.bin", try testHead(p.a(), .{}));
@@ -800,6 +810,8 @@ test "avatar_ini_problems_are_named" {
         .{ .ini = "still = gone.jpg\n", .says = "still: gone.jpg isn't in the pack" },
         .{ .ini = "still = still.jpg\nstill = still.jpg\n", .says = "avatar.ini line 2: still twice" },
         .{ .ini = "a line with no equals sign\nstill = still.jpg\n", .says = "avatar.ini line 1: not KEY = FILE" },
+        .{ .ini = "[avatar]\nstill = still.jpg\n[colours]\nhair = black\n", .says = "avatar.ini line 3: unknown section [colours]" },
+        .{ .ini = "[other]\nstill = still.jpg\n", .says = "avatar.ini names no still" },
     };
     for (cases) |c| {
         var p: Pack = undefined;
@@ -815,7 +827,7 @@ test "avatar_ini_problems_are_named" {
     try p.init();
     defer p.deinit();
     try p.put("still.jpg", try jpeg(p.a(), 64, 32, 0xc0, false));
-    try p.put("avatar.ini", "# me\r\n\r\n  still   =   still.jpg  \r\n; old style comment\r\n");
+    try p.put("avatar.ini", "# me\r\n[avatar]\r\n\r\n  still   =   still.jpg  \r\n; old style comment\r\n");
     try t.expectEqualStrings("", try problemsText(p.a(), try p.check()));
 }
 

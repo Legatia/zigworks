@@ -236,6 +236,13 @@ check('the_photo_is_judged_by_the_specs_table', () => {
   eq(refused({ turned: 20, jawOpen: 0.5, faceWidth: 100 }), MSG.turned);
 });
 
+check('a_refusal_is_an_error_with_the_tables_line', () => {
+  const r = fit.judgePhoto({ ...good, jawOpen: 0.5, width: 1000, height: 1300 });
+  const e = fit.refusal(r);
+  eq(e instanceof Error, true); eq(e.message, MSG.mouth); eq(e.code, 'mouth-open');
+  eq(JSON.stringify(e.warnings), JSON.stringify([MSG.bands]));
+});
+
 check('the_photo_warns_without_refusing', () => {
   const soft = fit.judgePhoto({ ...good, faceWidth: 499 });
   eq(soft.ok, true); eq(JSON.stringify(soft.warnings), JSON.stringify([MSG.soft]));
@@ -296,9 +303,13 @@ check('a_closed_photo_must_line_up_with_the_still', () => {
 });
 
 check('pack_ini_lists_the_files', () => {
+  // the desk page's upload writes an [avatar] section
   eq(fit.packIni({ still: 'still.jpg', head: 'head.bin', eyes: 'eyes.png', eyemask: 'eyemask.png' }),
-    'still = still.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n');
-  eq(av.parseIni('# x\r\nstill = a.jpg\n closed=b.jpg \n').closed, 'b.jpg');
+    '[avatar]\nstill = still.jpg\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n');
+  const ini = av.parseIni('# x\r\n[avatar]\r\nstill = a.jpg\n closed=b.jpg \n');
+  eq(ini.still, 'a.jpg'); eq(ini.closed, 'b.jpg');
+  eq(av.parseIni('[other]\nstill = x.jpg\n[avatar]\nstill = a.jpg\n').still, 'a.jpg', 'other sections are not the avatar');
+  eq(av.parseIni('still = a.jpg\n').still, 'a.jpg', 'a file with no section');
 });
 
 // ---------- speech ----------
@@ -339,7 +350,8 @@ check('the_voiced_span_skips_silence_at_both_ends', () => {
 });
 
 check('the_six_states_are_the_specs', () => {
-  eq(av.STATES.join('|'), 'resting|quiet|working|needs you|urgent|speaking');
+  // as the desk page calls them ("needs" is the spec's "needs you")
+  eq(av.STATES.join('|'), 'resting|quiet|working|needs|urgent|speaking');
 });
 
 check('framing_keeps_the_face_in_view', () => {

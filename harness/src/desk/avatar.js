@@ -4,12 +4,12 @@
 // as it runs; nothing loops.
 //
 //   const avatar = await createAvatar(element, '/desk/avatars/butler/', options);
-//   avatar.setState('working');          // resting, quiet, working, needs you, urgent, speaking
+//   avatar.setState('working');          // resting, quiet, working, needs, urgent, speaking
 //   avatar.moment('smile');              // or 'concern'
 //   avatar.arrive();                     // the glance for a new item
 //   await avatar.speak({ text, audioUrl });   // or { text, browser: true }
 //   avatar.stop(); avatar.dispose();
-//   const r = await avatar.fit(photo, closedPhoto);   // fit.js: { ok, message, warnings, faceWidth, closedUsed, files }
+//   const r = await avatar.fit(photo, closedPhoto);   // fit.js: { head, eyes, eyemask, face, warnings, closed }
 //
 // A pack is a folder with avatar.ini naming its files (README: Avatar
 // packs). A pack with only a still, a head that doesn't load, or no
@@ -19,18 +19,23 @@ import { readHead, readImage, loadImage, fit, sha256Hex } from './fit.js';
 
 export { readHead, fit };
 
-export const STATES = ['resting', 'quiet', 'working', 'needs you', 'urgent', 'speaking'];
+// as the desk page calls them; "needs" is the spec's "needs you" (also taken)
+export const STATES = ['resting', 'quiet', 'working', 'needs', 'urgent', 'speaking'];
 
 // ---------- the pack's files ----------
 
 const INI_KEYS = ['still', 'closed', 'head', 'eyes', 'eyemask'];
 
-/** avatar.ini's `key = file` lines; unknown keys and bad lines are skipped. */
+/** avatar.ini's `key = file` lines in its [avatar] section (or before any
+ *  section); other sections, unknown keys and bad lines are skipped. */
 export function parseIni(text) {
   const out = {};
+  let inAvatar = true;
   for (const raw of String(text).split('\n')) {
     const line = raw.trim();
     if (!line || line[0] === '#' || line[0] === ';') continue;
+    if (line[0] === '[') { inAvatar = line === '[avatar]'; continue; }
+    if (!inAvatar) continue;
     const eq = line.indexOf('=');
     if (eq < 0) continue;
     const key = line.slice(0, eq).trim(), val = line.slice(eq + 1).trim();
@@ -166,7 +171,7 @@ const PROFILES = {
   resting: { shapes: { mouthClose: 0.03, mouthRollLower: 0.06, ...both('mouthPress', 0.08) }, closed: 1, pitch: 2.6, yaw: 0.4, roll: 0.6, breathRate: 0.16, breathAmp: 1.5, micro: 0.35, gaze: 'closed', nod: null, slow: true },
   quiet: { shapes: { mouthClose: 0.03, mouthRollLower: 0.06, ...both('mouthPress', 0.08) }, closed: 1, pitch: 3, yaw: 0.4, roll: 0.6, breathRate: 0.13, breathAmp: 1.7, micro: 0.25, gaze: 'closed', nod: null, slow: true, dim: 0.6 },
   working: { shapes: { browDown_L: 0.32, browInnerUp: 0.18, ...both('mouthPress', 0.22), mouthRollLower: 0.12, mouthLeft: 0.1, eyeSquint_L: 0.22, eyeSquint_R: 0.14 }, closed: 0, pitch: -1.0, yaw: -2.2, roll: -1.8, breathRate: 0.22, breathAmp: 0.9, micro: 0.8, gaze: 'think', nod: [9, 16] },
-  'needs you': { shapes: { browInnerUp: 0.22, ...both('browOuterUp', 0.16), ...both('eyeWide', 0.1), ...both('mouthSmile', 0.08) }, closed: 0, pitch: -0.8, yaw: 0, roll: 0.4, breathRate: 0.25, breathAmp: 1, micro: 0.8, gaze: 'viewer', nod: [10, 18] },
+  needs: { shapes: { browInnerUp: 0.22, ...both('browOuterUp', 0.16), ...both('eyeWide', 0.1), ...both('mouthSmile', 0.08) }, closed: 0, pitch: -0.8, yaw: 0, roll: 0.4, breathRate: 0.25, breathAmp: 1, micro: 0.8, gaze: 'viewer', nod: [10, 18] },
   urgent: { shapes: { browInnerUp: 0.45, ...both('browOuterUp', 0.36), ...both('eyeWide', 0.28) }, closed: 0, pitch: -1.4, yaw: 0, roll: 0, breathRate: 0.3, breathAmp: 1, micro: 0.5, gaze: 'viewer', nod: null },
   speaking: { shapes: { browInnerUp: 0.06 }, closed: 0, pitch: -0.6, yaw: 0, roll: 0.3, breathRate: 0.24, breathAmp: 0.9, micro: 0.9, gaze: 'talk', nod: null },
 };
@@ -808,6 +813,7 @@ export async function createAvatar(element, packUrl, options = {}) {
 
   function setState(state) {
     if (disposed) return;
+    if (state === 'needs you') state = 'needs';
     if (!STATES.includes(state)) { console.warn('avatar: no state ' + state); return; }
     if (state === S.state) return;
     S.state = state;

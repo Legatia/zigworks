@@ -33,7 +33,7 @@ status(avatar);
 
 const stateBtns = STATES.map((s) => {
   const b = document.createElement('button');
-  b.type = 'button'; b.textContent = s[0].toUpperCase() + s.slice(1); b.dataset.state = s;
+  b.type = 'button'; b.textContent = s === 'needs' ? 'Needs you' : s[0].toUpperCase() + s.slice(1); b.dataset.state = s;
   b.addEventListener('click', () => { avatar.setState(s); stateBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b))); });
   $('states').appendChild(b);
   return b;
