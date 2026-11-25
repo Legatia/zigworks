@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avatar preview</title>
+<link rel="stylesheet" href="avatar-preview.css">
+<div id="stage"></div>
+<div class="top">
+  <span id="status">Loading</span>
+  <span class="info">
+    <button id="infoBtn" type="button" aria-expanded="false" aria-controls="bubble">i</button>
+    <span class="bubble" id="bubble" hidden>
+      Dev page for the desk's avatar module (src/desk/avatar.js). The query
+      freezes a pose for screenshots: pack, state, shapes=jawOpen:0.3,
+      pose=yaw,pitch,roll, gaze=x,y, breath, neutral=1, reduced=1, nogl=1,
+      lose=1, bare=1.
+    </span>
+  </span>
+</div>
+<form class="dock" id="dock">
+  <div class="group" id="states"><span class="lbl">State</span></div>
+  <div class="group">
+    <span class="lbl">Moment</span>
+    <button type="button" data-moment="smile">Smile</button>
+    <button type="button" data-moment="concern">Concern</button>
+    <button type="button" id="arrive">Arrive</button>
+  </div>
+  <div class="group say">
+    <input id="text" aria-label="Text" value="Your flight to Lisbon moved to 9:40. I've updated the calendar and told the driver.">
+    <input id="audio" aria-label="Audio URL" placeholder="Audio URL (blank: browser voice)">
+    <button type="submit">Speak</button>
+    <button type="button" id="stop">Stop</button>
+  </div>
+</form>
+<script type="module" src="avatar-preview.js"></script>

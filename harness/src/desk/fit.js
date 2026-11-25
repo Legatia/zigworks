@@ -314,46 +314,78 @@ export function fitGeometry(base, P, W, H) {
 
 // ---------- the checks ----------
 
-const MESSAGES = {
-  'no-face': 'No face found in this photo. Use a photo of one face, facing the camera.',
-  faces: 'This photo has more than one face. Use a photo of one face.',
-  'eyes-closed': 'Use a photo with the eyes open.',
-  'mouth-open': 'Use a photo facing the camera with the mouth closed.',
-  'closed-no-face': 'No face found in the eyes-closed photo.',
-  'closed-open': 'The eyes in the eyes-closed photo look open. Close the eyes and change nothing else.',
+// The fit's refusals and warnings, exactly as the spec's table ("Fitting a portrait").
+export const MESSAGES = {
+  'no-face': 'No face found. Use a clear photo of one face.',
+  faces: "There's more than one face. Use a photo of one person.",
+  turned: 'The face is turned. Use a photo facing the camera.',
+  'mouth-open': 'The mouth is open. Use a photo with the mouth closed.',
+  'eyes-closed': 'The eyes are closed. Use a photo with the eyes open; add an eyes-closed version after.',
+  small: 'The face is too small. Use a larger photo.',
+  soft: 'This will look soft. A larger photo looks sharper.',
+  bands: 'A photo wider than tall fills the window; this one leaves bands at the sides.',
   'closed-moved': "This eyes-closed photo doesn't line up with the portrait. Change only the eyes.",
+  'closed-open': 'The eyes in the eyes-closed photo are open. Close the eyes and change nothing else.',
 };
-const problem = (code, message) => ({ code, message: message || MESSAGES[code] });
 const score = (res, face, name) => {
   const c = res.faceBlendshapes?.[face]?.categories?.find((x) => x.categoryName === name);
   return c ? c.score : 0;
 };
 
-/** How far the face turns from the camera, in degrees: the angle between
- *  the face's forward axis and its line of sight to the camera, from the
- *  landmarker's transformation matrix (column-major 4×4). A face off the
- *  frame's centre that looks at the camera faces it. */
+// The landmarker reads a face looking into the lens as pitched about 11°
+// (its canonical face leans back): the butler, frontal, reads 10.3–12.5° in
+// every crop, while its yaw reads within 1.2° of 0.
+const FRONTAL_PITCH = 11;
+
+/** How far the face turns from looking into the lens, in degrees: the
+ *  angle of its forward axis from frontal (yaw as the landmarker reads it,
+ *  pitch less the landmarker's own 11°), from the landmarker's
+ *  transformation matrix (column-major 4×4). Where the face sits in the
+ *  frame doesn't count. */
 export function turnedBy(matrix) {
   const m = matrix?.data || matrix;
   if (!m || m.length < 16) return 0;
   const f = [m[8], m[9], m[10]];
-  let c = [-m[12], -m[13], -m[14]];
-  const cl = Math.hypot(...c), fl = Math.hypot(...f) || 1;
-  c = cl > 1e-6 ? c.map((v) => v / cl) : [0, 0, 1];
-  const dot = (f[0] * c[0] + f[1] * c[1] + f[2] * c[2]) / fl;
-  return (Math.acos(Math.min(1, Math.max(-1, dot))) * 180) / Math.PI;
+  const yaw = (Math.atan2(f[0], f[2]) * 180) / Math.PI;
+  const pitch = (Math.atan2(-f[1], f[2]) * 180) / Math.PI - FRONTAL_PITCH;
+  return Math.hypot(yaw, pitch);
 }
 
-/** The still's checks, on the landmarker's result: null when it's fine. */
-export function checkPhoto(res) {
-  const n = res.faceLandmarks?.length || 0;
-  if (n === 0) return problem('no-face');
-  if (n > 1) return problem('faces');
-  const deg = turnedBy(res.facialTransformationMatrixes?.[0]);
-  if (deg > 8) return problem('turned', `This face is turned about ${Math.round(deg)}° from the camera. Use a photo facing the camera.`);
-  if (score(res, 0, 'eyeBlinkLeft') >= 0.5 || score(res, 0, 'eyeBlinkRight') >= 0.5) return problem('eyes-closed');
-  if (score(res, 0, 'jawOpen') >= 0.2) return problem('mouth-open');
-  return null;
+/** What the checks look at, from the landmarker's result on a W×H photo:
+ *  { faces, turned (°), jawOpen, lipGap (px between the inner lips),
+ *  blinkLeft, blinkRight, faceWidth (px, cheek to cheek), width, height }. */
+export function photoFacts(res, W, H) {
+  const faces = res.faceLandmarks?.length || 0;
+  const facts = { faces, turned: 0, jawOpen: 0, lipGap: 0, blinkLeft: 0, blinkRight: 0, faceWidth: 0, width: W, height: H };
+  if (!faces) return facts;
+  const L = res.faceLandmarks[0];
+  const px = (i) => [L[i].x * W, L[i].y * H];
+  const d = (a, b) => Math.hypot(px(a)[0] - px(b)[0], px(a)[1] - px(b)[1]);
+  facts.turned = turnedBy(res.facialTransformationMatrixes?.[0]);
+  facts.jawOpen = score(res, 0, 'jawOpen');
+  facts.lipGap = d(13, 14);
+  facts.blinkLeft = score(res, 0, 'eyeBlinkLeft');
+  facts.blinkRight = score(res, 0, 'eyeBlinkRight');
+  facts.faceWidth = d(234, 454);
+  return facts;
+}
+
+/** The still's checks, the spec's table in its order: { ok, code?,
+ *  message?, warnings }. The first refusal is the one said; warnings are
+ *  given either way. */
+export function judgePhoto(f) {
+  const warnings = [];
+  if (f.faces === 1 && f.faceWidth >= 250 && f.faceWidth < 500) warnings.push(MESSAGES.soft);
+  if (f.height > f.width) warnings.push(MESSAGES.bands);
+  const refuse = (code) => ({ ok: false, code, message: MESSAGES[code], warnings });
+  if (!f.faces) return refuse('no-face');
+  if (f.faces > 1) return refuse('faces');
+  if (f.turned > 8) return refuse('turned');
+  // open: the landmarker's jaw score, or the inner lips apart (teeth showing)
+  if (f.jawOpen >= 0.2 || f.lipGap > 0.025 * f.faceWidth) return refuse('mouth-open');
+  if (f.blinkLeft >= 0.5 || f.blinkRight >= 0.5) return refuse('eyes-closed');
+  if (f.faceWidth < 250) return refuse('small');
+  return { ok: true, warnings };
 }
 
 /** How far the closed photo's landmarks outside the eyes are from the
@@ -375,13 +407,13 @@ export function closedShift(open, closed, W, H) {
   return n ? s / n : 0;
 }
 
-/** The eyes-closed photo's checks against the still's result. */
-export function checkClosed(openRes, closedRes, W, H, W2, H2) {
-  if (W2 !== W || H2 !== H) return problem('closed-size', `This eyes-closed photo is ${W2}×${H2}; the portrait is ${W}×${H}. Use the same picture with only the eyes changed.`);
-  if (!closedRes.faceLandmarks?.length) return problem('closed-no-face');
-  if (closedShift(openRes.faceLandmarks[0], closedRes.faceLandmarks[0], W, H) > 12) return problem('closed-moved');
-  if (score(closedRes, 0, 'eyeBlinkLeft') < 0.5 || score(closedRes, 0, 'eyeBlinkRight') < 0.5) return problem('closed-open');
-  return null;
+/** The eyes-closed photo's checks: { sameSize, faces, shift (px, from
+ *  closedShift), blinkLeft, blinkRight } in, { ok, code?, message? } out.
+ *  Another size, no face or a shift over 12 px don't line up. */
+export function judgeClosed(f) {
+  if (!f.sameSize || f.faces < 1 || !(f.shift <= 12)) return { ok: false, code: 'closed-moved', message: MESSAGES['closed-moved'] };
+  if (f.blinkLeft < 0.5 || f.blinkRight < 0.5) return { ok: false, code: 'closed-open', message: MESSAGES['closed-open'] };
+  return { ok: true };
 }
 
 // ---------- in the browser ----------
@@ -432,7 +464,6 @@ async function landmarker(assets) {
 
 // the fit files missing (desk-assets), or WebAssembly not allowed
 const NO_START = "Fitting couldn't start: its files (desk-assets) are missing or blocked.";
-const fitError = (p) => Object.assign(new Error(p.message), { code: p.code });
 
 const inPoly = (poly, x, y) => {
   let ins = false;
@@ -484,14 +515,37 @@ function eyeTexture(photo, meta) {
       if (into) for (let q = 0; q < 3; q++) into[q].push(src[o + q]);
     }
     const sclera = scl.map((v) => median(v, 0.6) ?? 120), irisCol = irs.map((v) => median(v) ?? 60);
-    // the reflection: bright pixels in the iris
-    let sx = 0, sy = 0, sn = 0;
+    // the reflection: the spot in the iris that stands out most from a small
+    // ring round it (a catchlight is an isolated dot, often touching the
+    // upper lid; the lids' wet edges are bright too, but as a band), grown
+    // to the pixels brighter than halfway to the iris
+    const lumaAt = (x, y) => { const o = at(x, y); return luma(src[o], src[o + 1], src[o + 2]); };
+    const inIris = (x, y) => inCrop(x, y) && Math.hypot(x - icx, y - icy) <= ir * 0.95;
+    const ringR = Math.max(3, ir * 0.22);
+    let best = -Infinity, bx = 0, by = 0, bl = 0;
     for (let y = Math.floor(icy - ir); y <= icy + ir; y++) for (let x = Math.floor(icx - ir); x <= icx + ir; x++) {
-      if (!inCrop(x, y) || Math.hypot(x - icx, y - icy) > ir * 1.05) continue;
-      const o = at(x, y);
-      if (luma(src[o], src[o + 1], src[o + 2]) > 175) { sx += x; sy += y; sn++; }
+      if (!inIris(x, y)) continue;
+      const l = lumaAt(x, y);
+      if (l < 120) continue;
+      let ring = 0, m = 0;
+      for (let q = 0; q < 12; q++) {
+        const rx = Math.round(x + ringR * Math.cos((q * Math.PI) / 6)), ry = Math.round(y + ringR * Math.sin((q * Math.PI) / 6));
+        if (inCrop(rx, ry)) { ring += lumaAt(rx, ry); m++; }
+      }
+      const score = l - ring / (m || 1);
+      if (score > best) { best = score; bx = x; by = y; bl = l; }
     }
-    const cl = sn ? [sx / sn, sy / sn, Math.max(2, Math.sqrt(sn / Math.PI))] : null;
+    const irisL = luma(...irisCol);
+    let cl = null;
+    if (best > 50) {
+      const th = (bl + irisL) / 2, reach = ringR;
+      let sx = 0, sy = 0, sn = 0;
+      for (let y = Math.floor(by - reach); y <= by + reach; y++) for (let x = Math.floor(bx - reach); x <= bx + reach; x++) {
+        if (!inCrop(x, y) || Math.hypot(x - bx, y - by) > reach || lumaAt(x, y) <= th) continue;
+        sx += x; sy += y; sn++;
+      }
+      cl = [sx / sn, sy / sn, Math.max(2, Math.sqrt(sn / Math.PI))];
+    }
     e.catchlight = cl;
     // the eye rebuilt
     const R2 = e.width * 1.2, band = 6 * k;
@@ -588,14 +642,24 @@ const scores = (res) => Object.fromEntries((res.faceBlendshapes?.[0]?.categories
 /**
  * Fits a portrait: the pack's head (head.bin), eye texture (eyes.png) and
  * blink mask (eyemask.png). closedPhoto, the same portrait with the eyes
- * closed, is checked against it. Rejects with an Error whose message is a
- * plain line for the owner and whose `code` names the check.
+ * closed, is optional and checked against it. Resolves to
+ *   { ok, message?, code?, warnings: [], faceWidth, closedUsed,
+ *     files: { head: ArrayBuffer, eyes: Blob, eyemask: Blob } | null, report }
+ * where message is the plain line for the owner when it's refused (the
+ * spec's table) and warnings are lines to show either way.
  * options.assets: where the fit files are (default /desk/assets/).
  */
 export async function fit(photo, closedPhoto, options = {}) {
   const assets = options.assets || ASSETS;
   const t0 = performance.now();
-  const [still, closed] = await Promise.all([loadImage(photo), closedPhoto ? loadImage(closedPhoto) : null]);
+  const result = { ok: false, warnings: [], faceWidth: null, closedUsed: false, files: null, report: null };
+  const refuse = (code, message, extra) => Object.assign(result, { ok: false, code, message }, extra);
+  let still, closed;
+  try {
+    [still, closed] = await Promise.all([loadImage(photo), closedPhoto ? loadImage(closedPhoto) : null]);
+  } catch (e) {
+    return refuse('image', "The photo didn't open. Use a JPEG or PNG.");
+  }
   let lmk, baseBuf;
   try {
     [lmk, baseBuf] = await Promise.all([
@@ -603,34 +667,45 @@ export async function fit(photo, closedPhoto, options = {}) {
       fetch(assets + 'base-head.bin').then((r) => { if (!r.ok) throw new Error('base-head.bin ' + r.status); return r.arrayBuffer(); }),
     ]);
   } catch (e) {
-    throw Object.assign(new Error(NO_START), { code: 'assets', cause: e });
+    console.warn('fit: ' + (e && e.message));
+    return refuse('assets', NO_START);
   }
-  const base = readHead(baseBuf);
-  if (base.meta.kind !== 'base') throw Object.assign(new Error(NO_START), { code: 'assets' });
-  const W = still.width, H = still.height;
-  const res = lmk.detect(still);
-  const bad = checkPhoto(res);
-  if (bad) throw fitError(bad);
-  let closedShiftPx = null;
-  if (closed) {
-    const resC = closed.width === W && closed.height === H ? lmk.detect(closed) : { faceLandmarks: [] };
-    const badC = checkClosed(res, resC, W, H, closed.width, closed.height);
-    if (badC) throw fitError(badC);
-    closedShiftPx = closedShift(res.faceLandmarks[0], resC.faceLandmarks[0], W, H);
+  try {
+    const base = readHead(baseBuf);
+    if (base.meta.kind !== 'base') return refuse('assets', NO_START);
+    const W = still.width, H = still.height;
+    const res = lmk.detect(still);
+    const facts = photoFacts(res, W, H);
+    const verdict = judgePhoto(facts);
+    result.warnings = verdict.warnings;
+    result.faceWidth = facts.faces === 1 ? Math.round(facts.faceWidth) : null;
+    if (!verdict.ok) return refuse(verdict.code, verdict.message);
+    let closedShiftPx = null;
+    if (closed) {
+      const sameSize = closed.width === W && closed.height === H;
+      const resC = sameSize ? lmk.detect(closed) : { faceLandmarks: [] };
+      const faces = resC.faceLandmarks?.length || 0;
+      closedShiftPx = faces ? closedShift(res.faceLandmarks[0], resC.faceLandmarks[0], W, H) : null;
+      const c = judgeClosed({ sameSize, faces, shift: closedShiftPx, blinkLeft: score(resC, 0, 'eyeBlinkLeft'), blinkRight: score(resC, 0, 'eyeBlinkRight') });
+      if (!c.ok) return refuse(c.code, c.message);
+    }
+    const L = res.faceLandmarks[0];
+    const P = L.map((p) => [p.x * W, -p.y * H, -p.z * W]);
+    const g = fitGeometry(base, P, W, H);
+    const eyesCanvas = eyeTexture(still, g.meta);
+    lidTones(still, g.meta);
+    const maskCanvas = eyeMask(W, H, g.meta);
+    g.meta.photo = { expression: scores(res), turned: +facts.turned.toFixed(1), faceWidth: result.faceWidth };
+    const head = packHead(g.meta, g.arrays);
+    const [eyes, eyemask] = await Promise.all([toBlob(eyesCanvas), toBlob(maskCanvas)]);
+    result.report = {
+      ...g.report, image: [W, H], turned: g.meta.photo.turned, expression: g.meta.photo.expression, closedShift: closedShiftPx,
+      catchlights: g.meta.eyes.map((e) => e.catchlight), lids: g.meta.eyes.map((e) => e.lid), eyeCrop: g.meta.eyeCrop,
+      bytes: head.byteLength, ms: Math.round(performance.now() - t0),
+    };
+    return Object.assign(result, { ok: true, closedUsed: !!closed, files: { head, eyes, eyemask } });
+  } catch (e) {
+    console.error(e);
+    return refuse('failed', "The fit didn't work on this photo. Try another one.");
   }
-  const L = res.faceLandmarks[0];
-  const P = L.map((p) => [p.x * W, -p.y * H, -p.z * W]);
-  const g = fitGeometry(base, P, W, H);
-  const eyesCanvas = eyeTexture(still, g.meta);
-  lidTones(still, g.meta);
-  const maskCanvas = eyeMask(W, H, g.meta);
-  g.meta.photo = { expression: scores(res), turned: +turnedBy(res.facialTransformationMatrixes?.[0]).toFixed(1) };
-  const head = packHead(g.meta, g.arrays);
-  const [eyes, eyemask] = await Promise.all([toBlob(eyesCanvas), toBlob(maskCanvas)]);
-  const report = {
-    ...g.report, image: [W, H], turned: g.meta.photo.turned, expression: g.meta.photo.expression, closedShift: closedShiftPx,
-    catchlights: g.meta.eyes.map((e) => e.catchlight), lids: g.meta.eyes.map((e) => e.lid), eyeCrop: g.meta.eyeCrop,
-    bytes: head.byteLength, ms: Math.round(performance.now() - t0),
-  };
-  return { head, eyes, eyemask, report };
 }

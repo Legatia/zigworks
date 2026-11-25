@@ -22,17 +22,25 @@ try {
   }
   log('fitting ' + still + (closed ? ' with ' + closed : ''));
   const out = await fit(still, closed);
-  log(JSON.stringify(out.report, null, 1));
-  show(out.eyes); show(out.eyemask);
-  if (pack) {
-    await save('avatars/' + pack + '/head.bin', out.head);
-    await save('avatars/' + pack + '/eyes.png', out.eyes);
-    await save('avatars/' + pack + '/eyemask.png', out.eyemask);
-    await save('avatars/' + pack + '/avatar.ini', packIni({ ...files, head: 'head.bin', eyes: 'eyes.png', eyemask: 'eyemask.png' }));
+  for (const w of out.warnings) log('warning: ' + w);
+  log('face ' + out.faceWidth + ' px wide; eyes-closed version ' + (out.closedUsed ? 'used' : 'not used'));
+  if (!out.ok) {
+    log('NOT FITTED: ' + out.code + ': ' + out.message);
+  } else {
+    log(JSON.stringify(out.report, null, 1));
+    show(out.files.eyes); show(out.files.eyemask);
+    if (pack) {
+      await save('avatars/' + pack + '/head.bin', out.files.head);
+      await save('avatars/' + pack + '/eyes.png', out.files.eyes);
+      await save('avatars/' + pack + '/eyemask.png', out.files.eyemask);
+      const ini = { ...files, head: 'head.bin', eyes: 'eyes.png', eyemask: 'eyemask.png' };
+      if (!out.closedUsed) delete ini.closed;
+      await save('avatars/' + pack + '/avatar.ini', packIni(ini));
+    }
   }
-  window.__result = { ok: true, report: out.report };
+  window.__result = { ok: out.ok, code: out.code, message: out.message, warnings: out.warnings, faceWidth: out.faceWidth, closedUsed: out.closedUsed, report: out.report };
 } catch (e) {
-  log('NOT FITTED: ' + (e.code ? e.code + ': ' : '') + e.message);
-  window.__result = { ok: false, code: e.code || null, message: e.message };
+  log('ERROR: ' + e.message);
+  window.__result = { ok: false, error: e.message };
 }
 window.__ready = true;
