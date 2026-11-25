@@ -37,8 +37,11 @@ pub fn build(b: *std.Build) void {
     const icns = icon_run.addOutputFileArg("harness.icns");
     b.step("icon", "Draw the icon into zig-out/harness.icns").dependOn(&b.addInstallFile(icns, "harness.icns").step);
 
-    // The Windows and Linux apps join here, from src/windows and src/linux.
-    if (target.result.os.tag != .macos) return;
+    switch (target.result.os.tag) {
+        .macos => {},
+        .windows => return addWindows(b, target, optimize, strip, version),
+        else => return,
+    }
 
     // With an explicit minimum version Zig treats this as a cross build and
     // doesn't look for the SDK itself, so give it Xcode's SDK paths (as
@@ -81,6 +84,63 @@ pub fn build(b: *std.Build) void {
     smoke.has_side_effects = true;
     smoke.step.dependOn(smoke_app);
     b.step("smoke", "Run the app against the stand-in harness (needs a window session)").dependOn(&smoke.step);
+}
+
+/// Windows: `harness-desk/harness-desk.exe` with `WebView2Loader.dll`
+/// beside it, and the same under `smoke/` with test hooks. The header and
+/// the loader come from Microsoft's NuGet package Microsoft.Web.WebView2,
+/// unpacked: `-Dwebview2=DIR` (CI pins its version and SHA-256).
+fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8) void {
+    const app = b.step("app", "Build zig-out/harness-desk/harness-desk.exe with its loader");
+    const smoke = b.step("smoke", "Run the app against the stand-in harness (needs a desktop)");
+    const sdk = b.option([]const u8, "webview2", "The unpacked Microsoft.Web.WebView2 package (WebView2.h and the loader)") orelse {
+        const need = b.addFail("the Windows app needs -Dwebview2=DIR: the unpacked Microsoft.Web.WebView2 NuGet package");
+        app.dependOn(&need.step);
+        smoke.dependOn(&need.step);
+        return;
+    };
+    const arch_dir = switch (target.result.cpu.arch) {
+        .x86_64 => "x64",
+        .aarch64 => "arm64",
+        .x86 => "x86",
+        else => @panic("WebView2 has no loader for this processor"),
+    };
+    const loader: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk, "build", "native", arch_dir, "WebView2Loader.dll" }) };
+    inline for (.{ .{ "harness-desk", false, app }, .{ "smoke", true, smoke } }) |v| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (v[1]) false else strip,
+            .link_libc = true,
+        });
+        // (as a system header: its warnings are Microsoft's)
+        mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "build", "native", "include" }) });
+        mod.addIncludePath(b.path("src/windows"));
+        mod.addCSourceFile(.{ .file = b.path("src/windows/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        for ([_][]const u8{ "user32", "gdi32", "shell32", "ole32" }) |lib| mod.linkSystemLibrary(lib, .{});
+        const options = b.addOptions();
+        options.addOption([]const u8, "version", version);
+        options.addOption(bool, "test_hooks", v[1]);
+        mod.addOptions("build_options", options);
+        const exe = b.addExecutable(.{ .name = "harness-desk", .root_module = mod });
+        // a window, no console
+        exe.subsystem = .windows;
+        const built = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = v[0] } } });
+        const dll = b.addInstallFile(loader, v[0] ++ "/WebView2Loader.dll");
+        if (v[1]) {
+            const run = b.addSystemCommand(&.{ "sh", "scripts/smoke-other.sh" });
+            run.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke/harness-desk.exe" } });
+            run.has_side_effects = true;
+            run.step.dependOn(&built.step);
+            run.step.dependOn(&dll.step);
+            v[2].dependOn(&run.step);
+        } else {
+            v[2].dependOn(&built.step);
+            v[2].dependOn(&dll.step);
+            b.getInstallStep().dependOn(v[2]);
+        }
+    }
 }
 
 const AppOptions = struct {

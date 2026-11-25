@@ -10,13 +10,16 @@ and getting in"), and nothing more:
       appears, deletes it and writes DIR/state/desk-code (0600, whole), a
       code used once and valid 60 s; GET /enter?code= sets a session cookie
       (HttpOnly, SameSite=Strict) and sends you to /desk; /desk and
-      /desk/next are a test page, 403 without the cookie; GET /report?k=v is
-      logged; DIR/state/stop-request makes it exit.
+      /desk/next are a test page, 403 without the cookie; /desk/framed is a
+      page for a frame in it; GET /report?k=v is logged;
+      DIR/state/stop-request makes it exit.
   fake_harness.py stop --home DIR        writes DIR/state/stop-request
   fake_harness.py autostart on|off --home DIR
   fake_harness.py autostart --home DIR   prints on or off
 
-Everything it does goes to DIR/fake.log, a line each.
+Everything it does goes to DIR/fake.log, a line each. FAKE_BINARY names
+the program desk.json says harness is (Windows: test/fake_harness.cmd, which
+runs this file with python).
 """
 import http.server
 import json
@@ -119,7 +122,17 @@ def page(path, port, other):
 <p><a id="blank" href="https://example.org/blank" target="_blank">Elsewhere, new window</a></p>
 <p><a id="file" href="file:///etc/hosts">A file</a></p>
 <script>
-function post(m) {{ window.webkit.messageHandlers.harness.postMessage(m); }}
+function post(m) {{
+  var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
+  if (w) w.postMessage(m);
+  else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(m);
+}}
+function frame() {{
+  var f = document.createElement("iframe");
+  f.sandbox = "allow-scripts";
+  f.src = "/desk/framed";
+  document.body.appendChild(f);
+}}
 function report(k, v) {{ fetch("/report?" + encodeURIComponent(k) + "=" + encodeURIComponent(v)); }}
 function click(id) {{ document.getElementById(id).click(); }}
 report("page", location.pathname + location.search);
@@ -140,6 +153,19 @@ try {{
 }} catch (e) {{ report("speech", "error " + e.name); }}
 </script>
 </body></html>
+"""
+
+
+FRAMED = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>framed</title></head>
+<body><script>
+var m = {badge: 77};
+var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
+try {
+  if (w) w.postMessage(m);
+  else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(m);
+} catch (e) {}
+</script></body></html>
 """
 
 
@@ -194,6 +220,8 @@ def handler(fake, other):
                     fake.log("page refused " + self.path)
                     return self.send(403, b"No session.")
                 return self.send(200, page(self.path, fake.port, other).encode(), "text/html; charset=utf-8")
+            if u.path == "/desk/framed":
+                return self.send(200, FRAMED.encode(), "text/html; charset=utf-8")
             if u.path == "/report":
                 for k, vs in q.items():
                     fake.log(f"report {k}={vs[0]}")
@@ -218,7 +246,7 @@ def run(home, argv):
     with open(os.path.join(home, "fake.pid"), "w") as f:
         f.write(str(os.getpid()))
     fake.write_whole(os.path.join(fake.state, "desk.json"), json.dumps({
-        "binary": os.path.abspath(sys.argv[0]),
+        "binary": os.environ.get("FAKE_BINARY") or os.path.abspath(sys.argv[0]),
         "port": fake.port,
         "home": home,
         "version": "0.0.0-fake",

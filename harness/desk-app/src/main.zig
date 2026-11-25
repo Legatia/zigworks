@@ -53,6 +53,8 @@ const App = struct {
     gpa: std.mem.Allocator,
     env: *const std.process.Environ.Map,
     home: []const u8,
+    /// The same, ending in 0: for the system's layer.
+    home_z: [:0]const u8 = "",
     ctl: Controller,
     effects: std.ArrayList(Effect) = .empty,
     /// For one event and its effects; reset after.
@@ -89,6 +91,7 @@ pub fn main(init: std.process.Init) u8 {
         .gpa = gpa,
         .env = init.environ_map,
         .home = home,
+        .home_z = gpa.dupeSentinel(u8, home, 0) catch return 1,
         .ctl = .init(gpa, home),
         .turn = .init(gpa),
     };
@@ -304,6 +307,12 @@ fn startRun(r: @FieldType(Effect, "run"), turn: std.mem.Allocator) void {
 }
 
 // ---- called by the system's layer, on the main thread ----
+
+/// The data folder: where the Windows and Linux layers keep the web view's
+/// own folder and the window's frame.
+export fn hdesk_home() [*:0]const u8 {
+    return app.home_z.ptr;
+}
 
 export fn hdesk_on_ready() void {
     log("ready", .{});
