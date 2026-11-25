@@ -16,6 +16,17 @@ and getting in"), and nothing more:
   fake_harness.py stop --home DIR        writes DIR/state/stop-request
   fake_harness.py autostart on|off --home DIR
   fake_harness.py autostart --home DIR   prints on or off
+  fake_harness.py init --home DIR        writes DIR/config.ini ([apps] port:
+      FAKE_PORT, or a free one)
+  fake_harness.py config set KEY VALUE [KEY VALUE]... --home DIR
+      keeps them in DIR/fake-settings.json; a value with "refuse" in it is
+      refused as harness refuses (one line on stderr, exit 1, nothing kept);
+      while `run` runs, says "harness is running: send /reload to use it."
+  fake_harness.py config get KEY --home DIR
+  fake_harness.py secret add NAME --stdin --home DIR
+      reads the value from its input into DIR/fake-store/NAME (never logged);
+      refuses it, as harness refuses a short one, while DIR/fake-refuse-secret
+      is there
 
 Everything it does goes to DIR/fake.log, a line each. FAKE_BINARY names
 the program desk.json says harness is (Windows: test/fake_harness.cmd, which
@@ -233,13 +244,49 @@ def handler(fake, other):
     return H
 
 
+def config_port(home):
+    try:
+        with open(os.path.join(home, "config.ini")) as f:
+            for line in f:
+                k, _, v = line.partition("=")
+                if k.strip() == "port":
+                    return int(v.strip())
+    except OSError:
+        pass
+    return None
+
+
+def running(home):
+    try:
+        with open(os.path.join(home, "fake.pid")) as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+DEFAULTS = {"model.provider": "omnigate", "model.model": "claude-sonnet", "model.key": "omnigate",
+            "model.memory_model": "claude-haiku", "model.worker_model": "claude-haiku"}
+
+
+def settings(home):
+    try:
+        with open(os.path.join(home, "fake-settings.json")) as f:
+            return json.load(f)
+    except OSError:
+        return {}
+
+
 def run(home, argv):
     fake = Fake(home)
     os.makedirs(fake.state, exist_ok=True)
     port = arg(argv, "--port")
     if port is None:
-        with open(os.path.join(fake.state, "desk.json")) as f:
-            port = json.load(f)["port"]
+        try:
+            with open(os.path.join(fake.state, "desk.json")) as f:
+                port = json.load(f)["port"]
+        except OSError:
+            port = config_port(home)
     fake.port = int(port)
     other = int(os.environ.get("FAKE_OTHER_PORT", "9"))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", fake.port), handler(fake, other))
@@ -273,6 +320,60 @@ def main():
         os.makedirs(fake.state, exist_ok=True)
         open(os.path.join(fake.state, "stop-request"), "w").close()
         fake.log("asked to stop")
+        return 0
+    if w[0] == "init":
+        os.makedirs(fake.state, exist_ok=True)
+        path = os.path.join(home, "config.ini")
+        if not os.path.exists(path):
+            port = os.environ.get("FAKE_PORT")
+            if not port:
+                import socket
+                s = socket.socket()
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+                s.close()
+            with open(path, "w") as f:
+                f.write("[model]\nprovider = omnigate\n[apps]\nport = %s\n" % port)
+        fake.log("init")
+        print("Data folder: " + home)
+        return 0
+    if w[0] == "config" and len(w) >= 3 and w[1] == "set":
+        pairs = w[2:]
+        if len(pairs) % 2:
+            print("usage: harness config set SECTION.KEY VALUE", file=sys.stderr)
+            return 2
+        for i in range(0, len(pairs), 2):
+            if "refuse" in pairs[i + 1]:
+                print("Not changed: config.ini line 3: %s %s is refused by the stand-in" % (pairs[i], pairs[i + 1]), file=sys.stderr)
+                fake.log("config refused")
+                return 1
+        cur = settings(home)
+        for i in range(0, len(pairs), 2):
+            cur[pairs[i]] = pairs[i + 1]
+        fake.write_whole(os.path.join(home, "fake-settings.json"), json.dumps(cur))
+        fake.log("config set " + " | ".join("%s=%s" % (pairs[i], pairs[i + 1]) for i in range(0, len(pairs), 2)))
+        if running(home):
+            print("harness is running: send /reload to use it.")
+        return 0
+    if w[0] == "config" and len(w) == 3 and w[1] == "get":
+        print(settings(home).get(w[2], DEFAULTS.get(w[2], "")))
+        return 0
+    if w[0] == "secret" and len(w) == 3 and w[1] == "add" and "--stdin" in argv:
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+        # the smoke makes it refuse a key, as harness refuses a short one
+        if len(value) < 8 or os.path.exists(os.path.join(home, "fake-refuse-secret")):
+            print("values shorter than 8 characters can't be masked reliably; nothing stored", file=sys.stderr)
+            return 1
+        store = os.path.join(home, "fake-store")
+        os.makedirs(store, exist_ok=True)
+        fake.write_whole(os.path.join(store, w[2]), value)
+        # the value itself is never logged
+        fake.log("secret add %s (%d bytes)" % (w[2], len(value)))
+        print("Stored %s in the stand-in's store." % w[2], file=sys.stderr)
         return 0
     if w[0] == "autostart":
         path = os.path.join(home, "fake-autostart")

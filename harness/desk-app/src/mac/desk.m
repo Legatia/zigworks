@@ -13,7 +13,9 @@ static const char *cstr(NSString *s) { return s ? (s.UTF8String ?: "") : ""; }
 @property(strong) NSWindow *window;
 @property(strong) WKWebView *web;
 @property(copy) NSString *userAgent;
-@property int canStart, canStop, canAutostart, autostartOn;
+@property int canStart, canStop, canAutostart, autostartOn, canProvider;
+@property(strong) NSAlert *keyAlert;
+@property(strong) NSSecureTextField *keyField;
 @end
 
 static HDDesk *desk;
@@ -72,6 +74,7 @@ static NSMenuItem *item(NSMenu *m, NSString *title, SEL action, NSString *key, i
     item(app, @"Stop harness", @selector(menuAction:), @"", self, HDESK_MENU_STOP);
     [app addItem:[NSMenuItem separatorItem]];
     item(app, @"Open at login", @selector(menuAction:), @"", self, HDESK_MENU_AUTOSTART);
+    item(app, @"Provider and key…", @selector(menuAction:), @"", self, HDESK_MENU_PROVIDER);
     [app addItem:[NSMenuItem separatorItem]];
     item(app, @"Hide harness", @selector(hide:), @"h", nil, 0);
     NSMenuItem *others = item(app, @"Hide Others", @selector(hideOtherApplications:), @"h", nil, 0);
@@ -119,6 +122,7 @@ static NSMenuItem *item(NSMenu *m, NSString *title, SEL action, NSString *key, i
     case HDESK_MENU_AUTOSTART:
         i.state = self.autostartOn == 1 ? NSControlStateValueOn : NSControlStateValueOff;
         return self.canAutostart;
+    case HDESK_MENU_PROVIDER: return self.canProvider;
     default: return YES;
     }
 }
@@ -360,11 +364,83 @@ void hdesk_open_external(const char *url) {
     if (u) [[NSWorkspace sharedWorkspace] openURL:u];
 }
 
-void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on) {
+void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on, int provider) {
     desk.canStart = start;
     desk.canStop = stop;
     desk.canAutostart = autostart_enabled;
     desk.autostartOn = autostart_on;
+    desk.canProvider = provider;
+}
+
+// ---- the key ----
+
+// The field's text goes to Zig as bytes in a buffer of our own, which is
+// zeroed and freed right after; the field is emptied first. (The NSString
+// AppKit made from the typing can't be zeroed: it is dropped at once.)
+static void keyAnswered(NSModalResponse r) {
+    NSSecureTextField *field = desk.keyField;
+    desk.keyAlert = nil;
+    desk.keyField = nil;
+    if (r != NSAlertFirstButtonReturn) {
+        field.stringValue = @"";
+        hdesk_on_key(NULL, -1);
+        return;
+    }
+    NSString *s = field.stringValue;
+    field.stringValue = @"";
+    NSUInteger cap = [s maximumLengthOfBytesUsingEncoding:NSUTF8StringEncoding] + 1;
+    char *buf = calloc(cap, 1);
+    if (!buf) {
+        hdesk_on_key(NULL, -1);
+        return;
+    }
+    NSUInteger used = 0;
+    [s getBytes:buf maxLength:cap - 1 usedLength:&used encoding:NSUTF8StringEncoding options:0 range:NSMakeRange(0, s.length) remainingRange:NULL];
+    s = nil;
+    hdesk_on_key(buf, (int)used);
+    memset_s(buf, cap, 0, cap);
+    free(buf);
+}
+
+void hdesk_ask_key(const char *title, const char *note) {
+    if (desk.keyAlert) return;
+    NSAlert *a = [NSAlert new];
+    a.messageText = str(title);
+    [a addButtonWithTitle:@"Save"];
+    [a addButtonWithTitle:@"Cancel"];
+    // the field, and under it where the key goes
+    NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 50)];
+    NSSecureTextField *f = [[NSSecureTextField alloc] initWithFrame:NSMakeRect(0, 26, 300, 24)];
+    f.usesSingleLineMode = YES;
+    f.accessibilityLabel = str(title);
+    NSTextField *n = [NSTextField labelWithString:str(note)];
+    n.frame = NSMakeRect(0, 0, 300, 18);
+    n.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    n.textColor = NSColor.secondaryLabelColor;
+    [box addSubview:f];
+    [box addSubview:n];
+    a.accessoryView = box;
+    desk.keyAlert = a;
+    desk.keyField = f;
+    [desk.window makeKeyAndOrderFront:nil];
+    [a beginSheetModalForWindow:desk.window completionHandler:^(NSModalResponse r) { keyAnswered(r); }];
+    [a.window makeFirstResponder:f];
+}
+
+int hdesk_test_key(int action) {
+#ifdef HDESK_TEST_HOOKS
+    // a fake key, built into test builds only, typed into the real field
+    static NSString *const fake = @"sk-test-not-a-key";
+    NSAlert *a = desk.keyAlert;
+    if (!a) return 0;
+    int secure = [desk.keyField isKindOfClass:[NSSecureTextField class]] ? 1 : 0;
+    if (action == 1) desk.keyField.stringValue = fake;
+    [desk.window endSheet:a.window returnCode:action == 1 ? NSAlertFirstButtonReturn : NSAlertSecondButtonReturn];
+    return secure;
+#else
+    (void)action;
+    return -1;
+#endif
 }
 
 void hdesk_alert(const char *title, const char *text) {

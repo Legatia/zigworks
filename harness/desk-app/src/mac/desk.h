@@ -7,7 +7,7 @@
 enum { HDESK_ALLOW = 0, HDESK_EXTERNAL = 1, HDESK_CANCEL = 2 };
 enum { HDESK_FRAME_MAIN = 0, HDESK_FRAME_SUB = 1, HDESK_FRAME_NEW_WINDOW = 2 };
 enum { HDESK_MEDIA_MIC = 0, HDESK_MEDIA_CAMERA = 1, HDESK_MEDIA_BOTH = 2 };
-enum { HDESK_MENU_START = 0, HDESK_MENU_STOP = 1, HDESK_MENU_AUTOSTART = 2, HDESK_MENU_RELOAD = 3 };
+enum { HDESK_MENU_START = 0, HDESK_MENU_STOP = 1, HDESK_MENU_AUTOSTART = 2, HDESK_MENU_RELOAD = 3, HDESK_MENU_PROVIDER = 4 };
 
 // Runs the app; returns only if it couldn't start. `user_agent` is added to
 // the web view's user agent ("harness-desk/0.3.0").
@@ -31,7 +31,18 @@ void hdesk_open_external(const char *url);
 
 // The menu: which items work, and Open at login's check mark
 // (autostart_on: 1 on, 0 off, -1 not known).
-void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on);
+void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on, int provider);
+
+// The key, in a sheet of the app's own with a secure field (never in the
+// page): `title` above it, `note` under it, [Save] and [Cancel]. Answers
+// hdesk_on_key once: the bytes typed (copied out of the field, which is
+// emptied; the copy is zeroed after the call), or NULL and -1 on Cancel.
+void hdesk_ask_key(const char *title, const char *note);
+// Test hooks only: the open key sheet filled with the test build's fake
+// key and saved (1), or cancelled (0). Returns 1 when the sheet's field is
+// an NSSecureTextField, 0 when no sheet is open, -1 in a build without
+// test hooks (which does nothing).
+int hdesk_test_key(int action);
 
 // A sheet on the window with one OK button.
 void hdesk_alert(const char *title, const char *text);
@@ -58,4 +69,5 @@ void hdesk_on_finish(const char *url);
 void hdesk_on_failed(const char *url, int code);
 int hdesk_on_media(const char *proto, const char *host, int port, int main_frame, int kind);
 void hdesk_on_menu(int item);
+void hdesk_on_key(const char *buf, int len);
 void hdesk_on_crashed(void);

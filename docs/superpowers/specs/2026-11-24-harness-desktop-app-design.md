@@ -790,7 +790,10 @@ This section closes them. It is my call throughout, not the owner's (see
   - Provider: Anthropic, OpenAI, OpenRouter, opencode, omnigate, or
     Other (an address that speaks OpenAI's or Anthropic's format);
   - Model, filled in with the provider's usual one;
-  - Address, for omnigate and Other only;
+  - Address, for omnigate and Other only. While it starts `http://`
+    and isn't this computer (localhost, 127.x.x.x, ::1), one line under
+    it says the key would cross the network unencrypted. It is on the
+    page, not behind the "i": a risk to see before [Continue];
   - [Continue].
 - **What [Continue] does,** in order:
   1. runs `harness init`;
@@ -879,3 +882,41 @@ This section closes them. It is my call throughout, not the owner's (see
 - **`utc_offset = auto`** is the default for new data folders.
 - **The fit files ship in the release archives,** fetched in the release
   job, not committed and not built into the binary.
+- **The app's setup, as built** (2026-11-25, `platform/desk-app-setup`;
+  the builder's calls, which the spec left open):
+  - The Set up screen is a built-in page in the app's web view, the same
+    HTML on all three systems. Only the key's field is native.
+  - The form opens on Anthropic. The usual models come from harness's own
+    code and README:
+    - omnigate: `claude-sonnet` (helpers `claude-haiku`), as `harness init`
+      writes them;
+    - Anthropic: `claude-opus-4-8` (helpers `claude-haiku-4-5`). It is the
+      newest Claude that answers without thinking when a request doesn't
+      ask for it, and harness's requests don't carry thinking blocks;
+    - OpenAI: `gpt-5`;
+    - OpenRouter: `anthropic/claude-sonnet-4`;
+    - opencode and Other: none named, so the owner types one.
+  - Other is written as `[provider other]` (`api`, `url`), with
+    `model.provider other`, in one `config set`. A provider of one's own
+    already in use keeps its section's name.
+  - `memory_model` and `worker_model` follow the model (or the provider's
+    helper) at the first setup and when the provider changes, since the old
+    ones belonged to the old provider. Otherwise they stay as the owner set
+    them.
+  - "Provider and key…" asks for the key again when Replace the key is
+    ticked, or when the provider's key is stored under another name.
+  - A change while harness runs: `harness config set`'s own line ("send
+    /reload to use it.") in an alert, then the desk again. The app doesn't
+    restart harness, which would end the owner's turn in progress. When
+    harness isn't running, the app starts it.
+  - `harness init` runs only when the data folder has no config.ini.
+  - [Continue] asks for the key before any command runs, so Cancel in the
+    key's field changes nothing. The commands then run in this section's
+    order: init, config set, then the key piped to secret add. A first
+    setup that stopped after init leaves `state/setup-unfinished`, and the
+    next start shows "Set up" again.
+  - For Other the key may be left empty, for a server that takes none. Its
+    section then gets `auth = none`, and nothing is stored.
+  - The key is trimmed of spaces and line ends before it is stored.
+  - The package's fit files come from `pack-desk-assets.sh`, strictly, in
+    the release. `DESK_ASSETS=none` leaves them out, and says so, for CI.

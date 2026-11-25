@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     // the butler's routines (examples/butler/), built in
     const butler_files = b.createModule(.{ .root_source_file = b.path("examples/butler/files.zig") });
     mod.addImport("butler_files", butler_files);
-    linkSystem(mod, target);
+    linkSystem(b, mod, target);
     const exe = b.addExecutable(.{ .name = "harness", .root_module = mod });
     b.installArtifact(exe);
 
@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addOptions("build_options", test_options);
     test_mod.addImport("butler_files", butler_files);
-    linkSystem(test_mod, target);
+    linkSystem(b, test_mod, target);
     // -Dtest-filter=NAME (more than once for more): only the unit tests whose name has it
     const filters = b.option([]const []const u8, "test-filter", "Run only the unit tests whose names contain this") orelse &.{};
     const unit = b.addTest(.{ .root_module = test_mod, .filters = filters });
@@ -83,7 +83,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&smoke.step);
 }
 
-fn linkSystem(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
+fn linkSystem(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     switch (target.result.os.tag) {
         .windows => {
             mod.linkSystemLibrary("ws2_32", .{});
@@ -92,6 +92,18 @@ fn linkSystem(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
             mod.linkSystemLibrary("userenv", .{});
         },
         .macos => {
+            // A named Mac target is a cross build to Zig, which then doesn't
+            // look for the SDK: on a Mac, give it Xcode's (the desk app's
+            // package carries harness for both kinds of Mac). The path comes
+            // from xcrun and moves with Xcode, as desk-app/build.zig has it.
+            if (target.query.os_tag != null and b.graph.host.result.os.tag == .macos) {
+                b.graph.poisonCache();
+                if (std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result)) |sdk| {
+                    mod.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+                    mod.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+                    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/lib" }) });
+                }
+            }
             mod.linkFramework("Security", .{});
             mod.linkFramework("CoreFoundation", .{});
         },

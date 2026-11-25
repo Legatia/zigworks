@@ -104,10 +104,15 @@ jobs:
           set -o pipefail
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
       - run: zig build test -Doptimize=ReleaseSafe
-      - run: scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
+      # the fit files are left out here: no network, and the base head may
+      # not be in the repository yet (the release packs them, strictly)
+      - run: DESK_ASSETS=none scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
+      # the smoke's setup runs once against the stand-in and once against
+      # this harness (a data folder and secrets of its own, no model called)
       - run: |
           set -o pipefail
-          zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+          (cd .. && zig build)
+          DESK_SMOKE_HARNESS="$PWD/../zig-out/bin/harness" zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       - if: failure()
         run: |
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do

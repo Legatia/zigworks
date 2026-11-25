@@ -14,7 +14,9 @@ name: Release
 # harness's tag also builds the desk's macOS app on the macOS job:
 # harness-desk-<version>-macos.zip, harness-desk.app for Apple Silicon and Intel
 # Macs in one bundle, signed ad hoc (it opens through System Settings ›
-# Privacy & Security › Open Anyway on its first run).
+# Privacy & Security › Open Anyway on its first run). One download: the
+# bundle carries harness (both kinds of Mac) and the fit files, packed as
+# for the archives; a missing fit file fails the job with one line.
 # And the desk's Windows and Linux apps on their jobs:
 # harness-desk-<version>-windows.zip (harness-desk.exe with Microsoft's
 # WebView2Loader.dll beside it, the NuGet package pinned in
@@ -111,6 +113,7 @@ jobs:
           version="${GITHUB_REF_NAME#*-v}"
           cd harness/desk-app
           zig build test
+          # DESK_ASSETS unset: the fit files are packed here, strictly
           scripts/package-macos.sh "$version" "$GITHUB_WORKSPACE/harness/harness-desk-$version-macos.zip"
       - name: Desk app (Windows)
         if: env.SKIP != '1' && matrix.name == 'x86_64-windows' && startsWith(github.ref_name, 'harness-v')
