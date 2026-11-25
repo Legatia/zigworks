@@ -3813,8 +3813,9 @@ The fit needs its files: MediaPipe tasks-vision 0.10.14 and its face
 landmarker model (Apache 2.0), and the base head, `base-head.bin`.
 harness's release archives hold them in `desk-assets/` beside the
 binary, with MediaPipe's licence (`LICENSE-mediapipe.txt`), the
-libraries its WebAssembly links (`THIRD-PARTY-mediapipe.txt`) and a
-`NOTICE.txt` naming each file. harness serves each file from the first
+libraries its WebAssembly links (`THIRD-PARTY-mediapipe.txt`), the base
+head's notice (`base-head-NOTICE.txt`) and a `NOTICE.txt` naming each
+file. harness serves each file from the first
 of these that has it:
 
 1. the data folder's `desk-assets/`;
@@ -3829,6 +3830,20 @@ MediaPipe's files and checks each by SHA-256; copy
 `desk-assets/base-head.bin` from the repository beside them.
 `sh scripts/pack-desk-assets.sh DEST` makes the release's folder (the
 release job runs it).
+
+The base head is in this repository, `desk-assets/base-head.bin` (3.3 MB),
+made from USC ICT's ICT-FaceKit (MIT; its notice and how the file was made
+are in `desk-assets/base-head-NOTICE.txt`): ICT's neutral head with its face, the back
+of its head and its mouth's inside (no neck, no ears: the portrait's own
+pixels carry those), simplified to 4,500 vertices, its expressions mapped
+onto the 52 ARKit shapes, its real teeth, gums and tongue, and the 478
+landmarks found on it. `node tools/make-base-head.mjs DATA OUT` makes it
+again from ICT-FaceKit's files at a pinned commit (tools/README); the
+result is the same file, byte for byte. A fitted head is about 3.3 MB.
+A data folder that still has an older `desk-assets/base-head.bin` (one made
+from Face Cap before 2026-11-25) fits on that one: copy this one over it.
+A head fitted on this base names it (`"base": "ICT-FaceKit"` in its
+header).
 
 With no avatar chosen, or its pack not there, the desk's stage shows the
 outline of a head and shoulders and Add a portrait, which opens Settings
@@ -3892,17 +3907,21 @@ lid tones) and `eyeCrop`; its arrays are `head.pos`,
 `head.nrm`, `head.uv`, `head.uvC` (the eyes-closed projection),
 `head.idx`, a `shape.NAME.pos` and `shape.NAME.nrm` per shape (16-bit,
 scaled by `shapeScale`), `teeth.pos` and `teeth.idx`. Coordinates are
-the photo's pixels, x right, y up. The base head is the same container
-with `"kind": "base"`, the model's own units, and the 478 landmarks.
+the photo's pixels, x right, y up. A head fitted on the ICT-FaceKit base
+also has `teeth.jaw` (f32, each mouth part's motion as the jaw opens),
+`teeth.show` (f32, the upper teeth's 2 mm down as the lips part; shut lips
+hide them), `teeth.kind` (u8: 0 a tooth, 1 gums or tongue) and `head.part` (u8: 1 the
+mouth's inside), and `base` names the base it was fitted on; a head
+without them (fitted on an older base) still draws, with its teeth as
+before. The base head is the same container with `"kind": "base"`, the
+model's own units (cm), and the 478 landmarks.
 
 ### What isn't shipped yet
 
-The base head is three.js's Face Cap sample (r170, by Bannaflak), and its
-license hasn't been verified, so neither `base-head.bin` nor the built-in
-butler (its portraits and its fitted files) is in the repository or the
-release yet; until it's cleared, fitting works only where the owner made
-the base head locally. The gaps list keeps this open, with an own base
-head as the alternative.
+The built-in butler (its portraits and its fitted files) isn't in the
+repository or the release yet: the portraits' licensing isn't cleared. The
+base head is (above), so fitting your own portrait works wherever the
+desk's assets are installed.
 
 ## Commands
 

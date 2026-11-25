@@ -167,19 +167,22 @@ export function voicedSpan(samples, rate) {
 
 // ---------- behaviour ----------
 
+// The brows' weights are set for the ICT-FaceKit base head, whose brow
+// shapes move about half (browInnerUp) and two thirds (browOuterUp,
+// browDown) as far as the Face Cap head's the states were first tuned on.
 const PROFILES = {
   resting: { shapes: { mouthClose: 0.03, mouthRollLower: 0.06, ...both('mouthPress', 0.08) }, closed: 1, pitch: 2.6, yaw: 0.4, roll: 0.6, breathRate: 0.16, breathAmp: 1.5, micro: 0.35, gaze: 'closed', nod: null, slow: true },
   quiet: { shapes: { mouthClose: 0.03, mouthRollLower: 0.06, ...both('mouthPress', 0.08) }, closed: 1, pitch: 3, yaw: 0.4, roll: 0.6, breathRate: 0.13, breathAmp: 1.7, micro: 0.25, gaze: 'closed', nod: null, slow: true, dim: 0.6 },
-  working: { shapes: { browDown_L: 0.32, browInnerUp: 0.18, ...both('mouthPress', 0.22), mouthRollLower: 0.12, mouthLeft: 0.1, eyeSquint_L: 0.22, eyeSquint_R: 0.14 }, closed: 0, pitch: -1.0, yaw: -2.2, roll: -1.8, breathRate: 0.22, breathAmp: 0.9, micro: 0.8, gaze: 'think', nod: [9, 16] },
-  needs: { shapes: { browInnerUp: 0.22, ...both('browOuterUp', 0.16), ...both('eyeWide', 0.1), ...both('mouthSmile', 0.08) }, closed: 0, pitch: -0.8, yaw: 0, roll: 0.4, breathRate: 0.25, breathAmp: 1, micro: 0.8, gaze: 'viewer', nod: [10, 18] },
-  urgent: { shapes: { browInnerUp: 0.45, ...both('browOuterUp', 0.36), ...both('eyeWide', 0.28) }, closed: 0, pitch: -1.4, yaw: 0, roll: 0, breathRate: 0.3, breathAmp: 1, micro: 0.5, gaze: 'viewer', nod: null },
-  speaking: { shapes: { browInnerUp: 0.06 }, closed: 0, pitch: -0.6, yaw: 0, roll: 0.3, breathRate: 0.24, breathAmp: 0.9, micro: 0.9, gaze: 'talk', nod: null },
+  working: { shapes: { browDown_L: 0.48, browInnerUp: 0.36, ...both('mouthPress', 0.22), mouthRollLower: 0.12, mouthLeft: 0.1, eyeSquint_L: 0.22, eyeSquint_R: 0.14 }, closed: 0, pitch: -1.0, yaw: -2.2, roll: -1.8, breathRate: 0.22, breathAmp: 0.9, micro: 0.8, gaze: 'think', nod: [9, 16] },
+  needs: { shapes: { browInnerUp: 0.44, ...both('browOuterUp', 0.24), ...both('eyeWide', 0.1), ...both('mouthSmile', 0.08) }, closed: 0, pitch: -0.8, yaw: 0, roll: 0.4, breathRate: 0.25, breathAmp: 1, micro: 0.8, gaze: 'viewer', nod: [10, 18] },
+  urgent: { shapes: { browInnerUp: 0.9, ...both('browOuterUp', 0.54), ...both('eyeWide', 0.28) }, closed: 0, pitch: -1.4, yaw: 0, roll: 0, breathRate: 0.3, breathAmp: 1, micro: 0.5, gaze: 'viewer', nod: null },
+  speaking: { shapes: { browInnerUp: 0.12 }, closed: 0, pitch: -0.6, yaw: 0, roll: 0.3, breathRate: 0.24, breathAmp: 0.9, micro: 0.9, gaze: 'talk', nod: null },
 };
 const MOMENTS = {
   smile: { shapes: { ...both('mouthSmile', 0.58), ...both('cheekSquint', 0.32), ...both('eyeSquint', 0.22), ...both('mouthDimple', 0.12) }, secs: 2 },
-  concern: { shapes: { browInnerUp: 0.62, ...both('browDown', 0.18), ...both('mouthFrown', 0.32), ...both('mouthPress', 0.2), ...both('eyeSquint', 0.1) }, secs: 2.5 },
+  concern: { shapes: { browInnerUp: 1, ...both('browDown', 0.27), ...both('mouthFrown', 0.32), ...both('mouthPress', 0.2), ...both('eyeSquint', 0.1) }, secs: 2.5 },
 };
-const GLANCE = { browInnerUp: 0.2, ...both('browOuterUp', 0.12), ...both('eyeWide', 0.12) };
+const GLANCE = { browInnerUp: 0.4, ...both('browOuterUp', 0.18), ...both('eyeWide', 0.12) };
 const MOUTH = /^(mouth|jaw|cheekPuff|tongue)/;
 // the shapes that push the lids; a shut lid sits where the closed projection has it
 const LID_LOOKS = ['eyeSquint', 'eyeWide', 'eyeLookUp', 'eyeLookDown', 'eyeLookIn', 'eyeLookOut'];
@@ -216,6 +219,8 @@ async function loadPack(base) {
       ]);
       const head = readHead(buf);
       if (head.meta.kind !== 'head') throw new Error(files.head + ' is not a fitted head');
+      const odd = optionalProblem(head);
+      if (odd) throw new Error(odd);
       const [W, H] = head.meta.image || [];
       if (W !== still.width || H !== still.height) throw new Error(`it was fitted to a ${W}×${H} photo and the still is ${still.width}×${still.height}`);
       if (head.meta.still && head.meta.still.sha256 && stillBytes && (await sha256Hex(stillBytes)) !== head.meta.still.sha256) throw new Error('it was fitted to another photo');
@@ -234,7 +239,31 @@ async function loadPack(base) {
  *  portrait when there is none. Per column of the eye, from the crease to
  *  the lash line: the crease's shadow, the lit lid, darker into the lashes;
  *  the skin's grain borrowed from under the eye; soft at every edge. */
-export function drawClosedEyes(still, meta) {
+/** Where a drawn shut lid lies in column x of an eye (photo pixels, row
+ *  down): { top, bot }, from the crease over the upper lashes to just under
+ *  the lower lid, or null outside the eye; its lash line is at 0.9 of the
+ *  way down. drawClosedEyes draws by it; the checks find the lash line by it. */
+export function closedLidSpan(e, x) {
+  const k = e.width / 130, o = e.outline;
+  // the lower lid runs corner to corner over points 0–8, the upper over 8–15 and back to 0
+  const lower = o.slice(0, 9), upper = [o[8], ...o.slice(9), o[0]];
+  const yAt = (arc, xx) => {
+    for (let i = 1; i < arc.length; i++) {
+      const [ax, ay] = arc[i - 1], [bx, by] = arc[i];
+      if ((xx - ax) * (xx - bx) <= 0 && ax !== bx) return ay + ((by - ay) * (xx - ax)) / (bx - ax);
+    }
+    return null;
+  };
+  const xs = o.map((p) => p[0]), xL = Math.min(...xs), xR = Math.max(...xs);
+  const xc = clamp(x, xL + 0.5, xR - 0.5);
+  const yt0 = yAt(upper, xc), yb0 = yAt(lower, xc);
+  if (yt0 === null || yb0 === null) return null;
+  const u = (xc - xL) / (xR - xL);
+  const top = yt0 - 4 * k * Math.sin(Math.PI * u); // over the upper lashes
+  return { top, bot: Math.max(top + 1, yb0 + 1.5 * k) };
+}
+
+export function drawClosedEyes(still, meta, breakPx = 0) {
   const c = document.createElement('canvas');
   c.width = still.width; c.height = still.height;
   const g = c.getContext('2d', { willReadFrequently: true });
@@ -270,12 +299,11 @@ export function drawClosedEyes(still, meta) {
     }
     mean = mn ? mean.map((v) => v / mn) : lid;
     for (let x = bx0; x < bx1; x++) {
-      const xc = clamp(x, xL + 0.5, xR - 0.5);
-      const yt0 = yAt(upper, xc), yb0 = yAt(lower, xc);
-      if (yt0 === null || yb0 === null) continue;
-      const u = (xc - xL) / (xR - xL);
-      const top = yt0 - 4 * k * Math.sin(Math.PI * u); // over the upper lashes
-      const bot = Math.max(top + 1, yb0 + 1.5 * k);
+      const span = closedLidSpan(e, x);
+      if (!span) continue;
+      // (checks only: breakPx moves the outer half of the lid down, a step on purpose)
+      const shift = breakPx && x >= (xL + xR) / 2 ? breakPx : 0;
+      const top = span.top + shift, bot = span.bot + shift;
       const side = clamp(Math.min(x - (xL - feather), xR + feather - x) / (2 * feather), 0, 1); // soft at the corners
       for (let y = Math.max(by0, Math.floor(top - feather)); y < Math.min(by1, Math.ceil(bot + feather)); y++) {
         const v = (y - top) / (bot - top);
@@ -300,6 +328,56 @@ export function drawClosedEyes(still, meta) {
 }
 
 // ---------- the head ----------
+/** The edge fade's distances for a head: a head with its own mouth parts
+ *  (fitted on the ICT-FaceKit base) fades towards its cut edge; an older
+ *  head has open edges round its lips, so it doesn't fade at all. */
+export function headEdge(pos, idx, meta) {
+  if (!meta.arrays || !meta.arrays['teeth.jaw']) return new Float32Array(pos.length / 3).fill(1e6);
+  return edgeDistance(pos, idx, meta.eyes).map((d) => Math.min(d, 1e6));
+}
+
+/** Why a head's optional arrays don't fit it (a plain line), or null:
+ *  teeth.jaw and teeth.show 3 values a mouth-part point, teeth.kind 1,
+ *  head.part 1 a vertex. */
+export function optionalProblem(head) {
+  const has = (n) => !!(head.meta.arrays && head.meta.arrays[n]);
+  const n = head.arr('head.pos').length / 3, t = head.arr('teeth.pos').length / 3;
+  for (const [name, want] of [['teeth.jaw', 3 * t], ['teeth.show', 3 * t], ['teeth.kind', t], ['head.part', n]]) {
+    if (has(name) && head.arr(name).length !== want) return `its ${name} has ${head.arr(name).length} values, not ${want}`;
+  }
+  return null;
+}
+
+/** How far each head vertex is from the head's outer open edge, along its
+ *  surface (photo pixels): the edge where the head was cut from its neck,
+ *  not the eye openings (open edges within an eye's width of an eye's
+ *  centre). The head fades out towards that edge, so it never shows as a
+ *  line against the backplate. eyes: [{ center: [x, row], width }]. */
+export function edgeDistance(pos, idx, eyes) {
+  const n = pos.length / 3, count = new Map(), adj = Array.from({ length: n }, () => []);
+  for (let t = 0; t < idx.length; t += 3) for (let e = 0; e < 3; e++) {
+    const a = idx[t + e], b = idx[t + (e + 1) % 3], key = Math.min(a, b) * n + Math.max(a, b);
+    if (!count.has(key)) { const l = Math.hypot(pos[a * 3] - pos[b * 3], pos[a * 3 + 1] - pos[b * 3 + 1], pos[a * 3 + 2] - pos[b * 3 + 2]); adj[a].push(b, l); adj[b].push(a, l); }
+    count.set(key, (count.get(key) || 0) + 1);
+  }
+  const dist = new Float32Array(n).fill(Infinity);
+  const nearEye = (v) => eyes.some((e) => Math.hypot(pos[v * 3] - e.center[0], -pos[v * 3 + 1] - e.center[1]) < e.width);
+  let frontier = [];
+  for (const [key, c] of count) if (c === 1) for (const v of [Math.floor(key / n), key % n]) if (dist[v] && !nearEye(v)) { dist[v] = 0; frontier.push(v); }
+  // Dijkstra by a sorted frontier (a few thousand vertices)
+  while (frontier.length) {
+    let bi = 0;
+    for (let i = 1; i < frontier.length; i++) if (dist[frontier[i]] < dist[frontier[bi]]) bi = i;
+    const v = frontier[bi]; frontier[bi] = frontier[frontier.length - 1]; frontier.pop();
+    const A = adj[v];
+    for (let i = 0; i < A.length; i += 2) {
+      const w = A[i], d = dist[v] + A[i + 1];
+      if (d < dist[w]) { if (dist[w] === Infinity) frontier.push(w); dist[w] = d; }
+    }
+  }
+  return dist;
+}
+
 
 function texture(canvas) {
   const t = new THREE.CanvasTexture(canvas);
@@ -310,10 +388,10 @@ function texture(canvas) {
 
 /** The scene for a fitted pack: the projected head, the eyeballs, the
  *  teeth and the backplate (the prototype's method). */
-function buildHead(pack, canvas) {
+function buildHead(pack, canvas, hideMouth = false, alphaView = false, lidBreak = 0) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, stencil: true, powerPreference: 'high-performance' });
   try {
-    return buildScene(pack, renderer);
+    return buildScene(pack, renderer, hideMouth, alphaView, lidBreak);
   } catch (e) {
     letGo(renderer);
     throw e;
@@ -329,7 +407,7 @@ function letGo(renderer) {
   if (ext && !gl.isContextLost()) ext.loseContext();
 }
 
-function buildScene(pack, renderer) {
+function buildScene(pack, renderer, hideMouth, alphaView, lidBreak) {
   renderer.setPixelRatio(Math.min(globalThis.devicePixelRatio || 1, 2));
   renderer.setClearColor(0x07070d, 1);
   const { meta, arr } = pack.head;
@@ -341,7 +419,7 @@ function buildScene(pack, renderer) {
   const mouth = { x: meta.mouth.center[0], y: meta.mouth.center[1], w: meta.mouth.right[0] - meta.mouth.left[0] };
   const textures = [];
   const tex = (c) => { const t = texture(c); textures.push(t); return t; };
-  const tOpen = tex(pack.still), tClosed = tex(pack.closed || drawClosedEyes(pack.still, meta)), tEyes = tex(pack.eyes), tMask = tex(pack.mask);
+  const tOpen = tex(pack.still), tClosed = tex(pack.closed || drawClosedEyes(pack.still, meta, lidBreak)), tEyes = tex(pack.eyes), tMask = tex(pack.mask);
 
   // the head's geometry, with the 52 shapes
   const hpos = arr('head.pos'), hn = hpos.length / 3, hidx = arr('head.idx');
@@ -351,11 +429,35 @@ function buildScene(pack, renderer) {
   hg.setAttribute('uv', new THREE.BufferAttribute(arr('head.uv'), 2));
   hg.setAttribute('uvC', new THREE.BufferAttribute(arr('head.uvC'), 2));
   hg.setIndex(new THREE.BufferAttribute(hidx, 1));
+  // the mouth's inside (a head fitted on the ICT-FaceKit base marks it; an
+  // older head finds it by what's hidden inside the lips)
+  const part = meta.arrays['head.part'] ? arr('head.part') : new Uint8Array(hn);
+  hg.setAttribute('part', new THREE.BufferAttribute(Float32Array.from(part), 1));
+  hg.setAttribute('edge', new THREE.BufferAttribute(headEdge(hpos, hidx, meta), 1));
   hg.morphAttributes.position = [];
   hg.morphAttributes.normal = [];
+  // the lips' middle (the photo's inner-lip landmarks 13 and 14, one spot when the
+  // lips are shut): the upper and lower lip there, told apart by what the jaw does
+  // to them (it moves the lower lip down and the upper hardly), among the lips'
+  // front vertices (not the mouth's inside) within 12 px (×k); their gap, from
+  // the shapes' weights, says how far the lips part
+  const jawI = meta.shapes.indexOf('jawOpen'), jawD = arr('shape.jawOpen.pos'), jawS = meta.shapeScale[jawI][0] / 32767;
+  const lipMid = [(meta.mouth.inner[15][0] + meta.mouth.inner[5][0]) / 2, (meta.mouth.inner[15][1] + meta.mouth.inner[5][1]) / 2];
+  const nearLips = [];
+  let zMax = -Infinity;
+  for (let i = 0; i < hn; i++) {
+    if (part[i] || Math.hypot(hpos[i * 3] - lipMid[0], hpos[i * 3 + 1] + lipMid[1]) > 12 * k) continue;
+    nearLips.push(i); zMax = Math.max(zMax, hpos[i * 3 + 2]);
+  }
+  const front = nearLips.filter((i) => hpos[i * 3 + 2] > zMax - 15 * k);
+  const jawDy = (i) => jawD[i * 3 + 1] * jawS;
+  let lipUp = front[0] ?? 0, lipLo = front[0] ?? 0;
+  for (const i of front) { if (Math.abs(jawDy(i)) < Math.abs(jawDy(lipUp))) lipUp = i; if (jawDy(i) < jawDy(lipLo)) lipLo = i; }
+  const lipDY = new Float32Array(meta.shapes.length);
   meta.shapes.forEach((name, s) => {
     const [mx, mxn] = meta.shapeScale[s];
     const p = arr('shape.' + name + '.pos'), n = arr('shape.' + name + '.nrm');
+    lipDY[s] = ((p[lipUp * 3 + 1] - p[lipLo * 3 + 1]) * mx) / 32767;
     const fp = new Float32Array(p.length), fn = new Float32Array(n.length);
     for (let i = 0; i < p.length; i++) { fp[i] = (p[i] * mx) / 32767; fn[i] = (n[i] * mxn) / 32767; }
     const ap = new THREE.BufferAttribute(fp, 3); ap.name = name;
@@ -475,6 +577,7 @@ function buildScene(pack, renderer) {
       void main() { gl_FragColor = vec4(texture2D(tMap, vUv).rgb, 1.0); }`,
   });
   const plateMesh = new THREE.Mesh(plate, plateMat); plateMesh.renderOrder = -10; plateMesh.frustumCulled = false;
+  if (alphaView) plateMesh.visible = false;
   scene.add(plateMesh);
 
   // the head's material: the photo, the closed portrait at a full blink, the relight term
@@ -486,7 +589,7 @@ function buildScene(pack, renderer) {
     tOpen: { value: tOpen }, tClosed: { value: tClosed }, tMask: { value: tMask },
     blinkA: { value: 0 }, blinkB: { value: 0 },
     eyeA: { value: eyeA }, eyeB: { value: eyeB }, boxA: { value: bbox(eyeA) }, boxB: { value: bbox(eyeB) },
-    mouthC: { value: new THREE.Vector2(mouth.x, -mouth.y) },
+    mouthC: { value: new THREE.Vector2(mouth.x, -mouth.y) }, mouthW: { value: mouth.w }, alphaView: { value: alphaView ? 1 : 0 }, insideBack: { value: meta.arrays['teeth.jaw'] ? 0 : 1 },
     lipPoly: { value: meta.mouth.outer.map((p) => new THREE.Vector2(mouth.x + (p[0] - mouth.x) * 1.12, -(mouth.y + (p[1] - mouth.y) * 1.9))) },
     L0: { value: new THREE.Vector3(0.0, 0.42, 1.0).normalize() }, relight: { value: 0.85 }, k: { value: k },
   };
@@ -496,10 +599,10 @@ function buildScene(pack, renderer) {
     vertexShader: `
       #include <common>
       #include <morphtarget_pars_vertex>
-      attribute vec2 uvC; attribute float hid;
-      varying vec2 vUv; varying vec2 vUvC; varying vec3 vN; varying vec3 vN0; varying vec3 vRest; varying float vHid;
+      attribute vec2 uvC; attribute float hid; attribute float part; attribute float edge;
+      varying vec2 vUv; varying vec2 vUvC; varying vec3 vN; varying vec3 vN0; varying vec3 vRest; varying float vHid; varying float vPart; varying float vEdge;
       void main() {
-        vUv = uv; vUvC = uvC; vRest = position; vN0 = normal; vHid = hid;
+        vUv = uv; vUvC = uvC; vRest = position; vN0 = normal; vHid = hid; vPart = part; vEdge = edge;
         #include <beginnormal_vertex>
         #include <morphnormal_vertex>
         #include <begin_vertex>
@@ -511,8 +614,8 @@ function buildScene(pack, renderer) {
       uniform sampler2D tOpen; uniform sampler2D tClosed; uniform sampler2D tMask;
       uniform float blinkA; uniform float blinkB;
       uniform vec2 eyeA[16]; uniform vec2 eyeB[16]; uniform vec4 boxA; uniform vec4 boxB;
-      uniform vec2 mouthC; uniform vec2 lipPoly[20]; uniform vec3 L0; uniform float relight; uniform float k;
-      varying vec2 vUv; varying vec2 vUvC; varying vec3 vN; varying vec3 vN0; varying vec3 vRest; varying float vHid;
+      uniform vec2 mouthC; uniform float mouthW; uniform vec2 lipPoly[20]; uniform float insideBack; uniform float alphaView; uniform vec3 L0; uniform float relight; uniform float k;
+      varying vec2 vUv; varying vec2 vUvC; varying vec3 vN; varying vec3 vN0; varying vec3 vRest; varying float vHid; varying float vPart; varying float vEdge;
       bool inA(vec2 p) {
         if (p.x < boxA.x || p.x > boxA.z || p.y < boxA.y || p.y > boxA.w) return false;
         bool c = false;
@@ -537,8 +640,13 @@ function buildScene(pack, renderer) {
         // the eye openings: the eyeballs show through
         if (inA(vRest.xy) || inB(vRest.xy)) discard;
         float crease = 12.0 * k; // hidden-surface tests need a margin at creases
-        bool mouthZone = abs(vRest.x - mouthC.x) < 220.0 * k && abs(vRest.y - mouthC.y) < 140.0 * k && inLips(vRest.xy);
-        bool inside = mouthZone && (!gl_FrontFacing || vHid > crease);
+        // (not above the upper lip: a mouth close to the nose would reach the
+        // nose's creases, which are hidden at rest)
+        bool mouthZone = abs(vRest.x - mouthC.x) < 220.0 * k && abs(vRest.y - mouthC.y) < 140.0 * k && vRest.y - mouthC.y < 0.4 * mouthW && inLips(vRest.xy);
+        // the mouth's inside, within the lips: the marked socket, or what's
+        // hidden there at rest (the socket reaches up behind the nose, where
+        // the skin's deep creases are cut away, so it counts only here)
+        bool inside = mouthZone && (vPart > 0.5 || !gl_FrontFacing || vHid > crease);
         vec3 col;
         float a = 1.0;
         if (inside) {
@@ -558,12 +666,17 @@ function buildScene(pack, renderer) {
           vec2 m = texture2D(tMask, vUvC).rg;
           float wc = clamp(m.r * smoothstep(0.5, 0.97, blinkA) + m.g * smoothstep(0.5, 0.97, blinkB), 0.0, 1.0);
           col = mix(col, texture2D(tClosed, vUvC).rgb, wc);
-          a = smoothstep(0.04, 0.32, n0.z);
+          // faded at the silhouette and over 60 px (×k) to the cut edge: the jaw's
+          // underside, out of sight at rest, turns into view as the jaw drops
+          a = smoothstep(0.04, 0.32, n0.z) * smoothstep(0.0, 60.0 * k, vEdge);
           // what can't be seen, or is hidden at rest, must not mask the eyeballs
           if (a < 0.02 || vHid > crease || !gl_FrontFacing) discard;
         }
-        gl_FragColor = vec4(col, a);
-        gl_FragDepth = inside ? 0.9999 : gl_FragCoord.z; // the mouth's inside sits behind the teeth
+        gl_FragColor = alphaView > 0.5 ? vec4(vec3(a), 1.0) : vec4(col, a); // checks only: the head's opacity
+        // an older head's reseated teeth sit behind its mouth's inside by depth;
+        // a head with its own mouth parts keeps the true depth (the lips hide
+        // the teeth where they meet)
+        gl_FragDepth = inside && insideBack > 0.5 ? 0.9999 : gl_FragCoord.z;
       }`,
   });
   const head = new THREE.Mesh(hg, headMat);
@@ -622,46 +735,93 @@ function buildScene(pack, renderer) {
         }`,
     });
     const mesh = new THREE.Mesh(g, m); mesh.position.copy(center); mesh.renderOrder = 6; mesh.frustumCulled = false;
+    if (alphaView) mesh.visible = false;
     headSpace.add(mesh);
     return { mesh, u, glintLocal: new THREE.Vector3(cl[0], -cl[1], zFront + 5 * k) };
   });
 
-  // the teeth: the base's upper row seated at the lip line, a mirrored lower row on the jaw
-  const tpos0 = arr('teeth.pos'), tidx = arr('teeth.idx');
-  let tminY = Infinity, tmaxZ = -Infinity, tcx = 0;
-  for (let i = 0; i < tpos0.length; i += 3) { tminY = Math.min(tminY, tpos0[i + 1]); tmaxZ = Math.max(tmaxZ, tpos0[i + 2]); tcx += tpos0[i]; }
-  tcx /= tpos0.length / 3;
-  const tipY = -mouth.y - 6 * k, dyT = tipY - tminY, dzT = zLip - 28 * k - tmaxZ, dxT = mouth.x - tcx;
-  const upperPos = new Float32Array(tpos0.length), lowerPos = new Float32Array(tpos0.length);
-  for (let i = 0; i < tpos0.length; i += 3) {
-    const x = tpos0[i] + dxT, y = tpos0[i + 1] + dyT, z = tpos0[i + 2] + dzT;
-    upperPos.set([mouth.x + (x - mouth.x) * 0.95, y, z], i);
-    lowerPos.set([mouth.x + (x - mouth.x) * 0.86, tipY + 4 * k - (y - tipY) * 0.85, z - 11 * k], i);
-  }
-  const lowerIdx = new (tidx.constructor)(tidx.length);
-  for (let t = 0; t < tidx.length; t += 3) { lowerIdx[t] = tidx[t]; lowerIdx[t + 1] = tidx[t + 2]; lowerIdx[t + 2] = tidx[t + 1]; }
+  // the mouth's parts. A head fitted on the ICT-FaceKit base has both rows of
+  // teeth, the gums and the tongue, each point with its own motion as the jaw
+  // opens; an older head has one row, seated at the lip line, and a mirrored
+  // lower row riding the jaw vector.
+  const tpos0 = arr('teeth.pos'), tidx = arr('teeth.idx'), tn = tpos0.length / 3;
+  const own = !!meta.arrays['teeth.jaw'];
+  const kind = own && meta.arrays['teeth.kind'] ? arr('teeth.kind') : new Uint8Array(tn);
+  let zTeeth = -Infinity;
+  for (let i = 0; i < tn; i++) if (!kind[i]) zTeeth = Math.max(zTeeth, tpos0[i * 3 + 2]);
   const teethMat = new THREE.ShaderMaterial({
-    uniforms: { zFront: { value: zLip - 30 * k }, k: { value: k } },
-    vertexShader: `varying vec3 vN; varying vec3 vP;
-      void main() { vP = position; vN = normalize(mat3(modelMatrix) * normal); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: `uniform float zFront; uniform float k; varying vec3 vN; varying vec3 vP;
+    uniforms: { zFront: { value: own ? zTeeth : zLip - 30 * k }, k: { value: k }, zone: { value: own ? 1 : 0 }, open: { value: 1 },
+      // the upper lip's top above the mouth's centre, with half its height to spare (the
+      // lip lifts a little in speech), in mouth widths
+      zoneUp: { value: (1.5 * (mouth.y - Math.min(...meta.mouth.outer.map((p) => p[1])))) / mouth.w }, mouthC: { value: new THREE.Vector2(mouth.x, -mouth.y) }, mouthW: { value: mouth.w } },
+    vertexShader: `
+      #include <common>
+      #include <morphtarget_pars_vertex>
+      attribute float kind;
+      varying vec3 vN; varying vec3 vP; varying float vKind;
       void main() {
+        vP = position; vKind = kind; vN = normalize(mat3(modelMatrix) * normal);
+        #include <begin_vertex>
+        #include <morphtarget_vertex>
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
+      }`,
+    fragmentShader: `uniform float zFront; uniform float k; uniform float zone; uniform float open; uniform vec2 mouthC; uniform float mouthW; uniform float zoneUp;
+      varying vec3 vN; varying vec3 vP; varying float vKind;
+      void main() {
+        // only where the lips can show them: no higher than the upper lip's top
+        // (the gums reach up behind the nose, whose underside is cut away where
+        // it's hidden at rest and opens as the head pitches down)
+        vec2 dm = (vP.xy - mouthC) / mouthW;
+        vec2 e = vec2(dm.x / 0.75, dm.y / (dm.y > 0.0 ? zoneUp : 0.9));
+        if (zone > 0.5 && dot(e, e) > 1.0) discard;
         float lit = 0.5 + 0.5 * max(0.0, dot(normalize(vN), normalize(vec3(0.0, 0.35, 1.0))));
-        float depth = smoothstep(zFront - 110.0 * k, zFront - 4.0 * k, vP.z);
-        vec3 col = vec3(0.78, 0.74, 0.68) * lit * mix(0.16, 0.85, depth);
-        gl_FragColor = vec4(col, 1.0);
+        // darker further back: a whole row (ICT's) falls into shadow sooner
+        // than an older head's single front row
+        float depth = zone > 0.5 ? smoothstep(zFront - 60.0 * k, zFront - 3.0 * k, vP.z) : smoothstep(zFront - 110.0 * k, zFront - 4.0 * k, vP.z);
+        float shade = mix(zone > 0.5 ? 0.08 : 0.16, 0.85, depth);
+        vec3 base = vec3(0.78, 0.74, 0.68); // teeth
+        if (vKind > 0.5) { // gums and tongue: a softer shadow, so the mouth's floor shows
+          base = vec3(0.5, 0.2, 0.21);
+          shade = mix(0.3, 0.8, smoothstep(zFront - 150.0 * k, zFront, vP.z));
+        }
+        gl_FragColor = vec4(base * lit * shade * mix(0.1, 1.0, open), 1.0);
       }`,
   });
   const teethGeos = [];
-  const mkTeeth = (p, ix) => {
+  const mkTeeth = (p, ix, jaw) => {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setIndex(new THREE.BufferAttribute(ix, 1)); g.computeVertexNormals();
+    g.setAttribute('kind', new THREE.BufferAttribute(Float32Array.from(kind.subarray(0, p.length / 3)), 1));
+    if (jaw) {
+      // the jaw's motion, and the upper teeth's showing as the lips part
+      g.morphAttributes.position = [new THREE.BufferAttribute(jaw, 3), new THREE.BufferAttribute(show || new Float32Array(jaw.length), 3)];
+      g.morphTargetsRelative = true;
+    }
     teethGeos.push(g);
     const m = new THREE.Mesh(g, teethMat); m.renderOrder = 1; m.frustumCulled = false; headSpace.add(m);
+    if (hideMouth) m.visible = false; // checks only: the frame without them
+    if (jaw) m.updateMorphTargets();
     return m;
   };
-  mkTeeth(upperPos, tidx);
-  const lowerTeeth = mkTeeth(lowerPos, lowerIdx);
+  let mouthParts = null, lowerTeeth = null;
+  const show = own && meta.arrays['teeth.show'] ? arr('teeth.show') : null;
+  if (own) mouthParts = mkTeeth(new Float32Array(tpos0), tidx, arr('teeth.jaw'));
+  else {
+    let tminY = Infinity, tmaxZ = -Infinity, tcx = 0;
+    for (let i = 0; i < tpos0.length; i += 3) { tminY = Math.min(tminY, tpos0[i + 1]); tmaxZ = Math.max(tmaxZ, tpos0[i + 2]); tcx += tpos0[i]; }
+    tcx /= tn;
+    const tipY = -mouth.y - 6 * k, dyT = tipY - tminY, dzT = zLip - 28 * k - tmaxZ, dxT = mouth.x - tcx;
+    const upperPos = new Float32Array(tpos0.length), lowerPos = new Float32Array(tpos0.length);
+    for (let i = 0; i < tpos0.length; i += 3) {
+      const x = tpos0[i] + dxT, y = tpos0[i + 1] + dyT, z = tpos0[i + 2] + dzT;
+      upperPos.set([mouth.x + (x - mouth.x) * 0.95, y, z], i);
+      lowerPos.set([mouth.x + (x - mouth.x) * 0.86, tipY + 4 * k - (y - tipY) * 0.85, z - 11 * k], i);
+    }
+    const lowerIdx = new (tidx.constructor)(tidx.length);
+    for (let t = 0; t < tidx.length; t += 3) { lowerIdx[t] = tidx[t]; lowerIdx[t + 1] = tidx[t + 2]; lowerIdx[t + 2] = tidx[t + 1]; }
+    mkTeeth(upperPos, tidx, null);
+    lowerTeeth = mkTeeth(lowerPos, lowerIdx, null);
+  }
   const jawVec = new THREE.Vector3(...meta.mouth.jaw);
 
   const face = { cx: faceCx, w: faceW, top: browY, h: faceH };
@@ -678,7 +838,18 @@ function buildScene(pack, renderer) {
     draw(pose, blinkA, blinkB, rise) {
       headU.blinkA.value = blinkA; headU.blinkB.value = blinkB;
       eyes[0].u.blink.value = blinkA; eyes[1].u.blink.value = blinkB;
-      lowerTeeth.position.copy(jawVec).multiplyScalar(infl[IDX.jawOpen] * 0.82);
+      if (mouthParts) {
+        // the mouth's parts show as the lips part: shut, they're in the
+        // mouth's shadow (else they show through the lips' seam) and the
+        // upper teeth sit behind the upper lip; parted 15 px (×k), in full
+        let gap = 0;
+        for (let i = 0; i < infl.length; i++) gap += infl[i] * lipDY[i];
+        const open = ease((gap - 3 * k) / (12 * k));
+        mouthParts.morphTargetInfluences[0] = infl[IDX.jawOpen];
+        mouthParts.morphTargetInfluences[1] = open;
+        teethMat.uniforms.open.value = open;
+      }
+      else lowerTeeth.position.copy(jawVec).multiplyScalar(infl[IDX.jawOpen] * 0.82);
       rig.rotation.set(pose.pitch * D2R, pose.yaw * D2R, -pose.roll * D2R);
       rig.position.set(pivot.x, pivot.y + rise * 0.45, pivot.z);
       rig.updateMatrixWorld(true);
@@ -737,8 +908,11 @@ function buildStill(pack, canvas) {
  * in element. options:
  *   reducedMotion  defaults to the system's setting
  *   still          true: draw the still only
- *   debug          { shapes, pose, gaze, breath, time, neutral }: a frozen pose for
- *                  checking by eye (neutral: no state's shapes, eyes open)
+ *   debug          { shapes, pose, gaze, breath, time, neutral, noMouthParts }: a
+ *                  frozen pose for checking by eye (neutral: no state's shapes,
+ *                  eyes open; noMouthParts: the teeth, gums and tongue not drawn;
+ *                  alphaView: the head's opacity in grey on black, nothing else;
+ *                  lidBreak: px the outer half of a drawn shut lid moves down)
  * Resolves to the avatar once its first frame is drawn; rejects only when
  * not even the still loads. avatar.mode is 'head' or 'still';
  * avatar.fitted says whether the pack has a fitted head; avatar.problem
@@ -765,7 +939,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   let head = null, still = null, stillCanvas = null;
   if (pack.head && !options.still) {
     try {
-      head = buildHead(pack, canvas);
+      head = buildHead(pack, canvas, !!(debug && (debug.noMouthParts || debug.alphaView)), !!(debug && debug.alphaView), (debug && debug.lidBreak) || 0);
       avatar.mode = 'head';
     } catch (e) {
       head = null;
@@ -982,7 +1156,7 @@ export async function createAvatar(element, packUrl, options = {}) {
     if (glancing) addTo(slowT, GLANCE);
     if (talk && tau > 0) {
       const w = talk.tl.words.find((x) => tau >= x.t0 && tau < x.t1);
-      if (w && w.long) addTo(slowT, { browInnerUp: 0.22, ...both('browOuterUp', 0.14) }); // brows lift on long words
+      if (w && w.long) addTo(slowT, { browInnerUp: 0.44, ...both('browOuterUp', 0.21) }); // brows lift on long words
     }
     for (let i = 0; i < n; i++) slowW[i] = approach(slowW[i], slowT[i], 5.5, dt);
 

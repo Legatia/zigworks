@@ -4,7 +4,8 @@ usage: python3 -I tools/devserver.py PORT DATA [--csp POLICY | --no-csp] [--cach
 
   GET  /desk/static/FILE   -> harness/src/desk/FILE (avatar.js, fit.js, vendor/)
   GET  /desk/avatars/PATH  -> DATA/avatars/PATH
-  GET  /desk/assets/PATH   -> DATA/desk-assets/PATH
+  GET  /desk/assets/PATH   -> DATA/desk-assets/PATH, or harness/desk-assets/PATH
+                              when DATA has none (the committed base head)
   GET  /tools/PATH         -> harness/tools/PATH
   POST /save/PATH          -> DATA/PATH, PATH under avatars/, desk-assets/ or
                               debug/ (the request body, up to 64 MB)
@@ -81,10 +82,10 @@ def main():
     hosts = {"127.0.0.1:%d" % port, "localhost:%d" % port}
     origins = {"http://" + h for h in hosts}
     roots = {
-        "desk/static": os.path.join(HARNESS, "src", "desk"),
-        "desk/avatars": os.path.join(data, "avatars"),
-        "desk/assets": os.path.join(data, "desk-assets"),
-        "tools": os.path.join(HARNESS, "tools"),
+        "desk/static": [os.path.join(HARNESS, "src", "desk")],
+        "desk/avatars": [os.path.join(data, "avatars")],
+        "desk/assets": [os.path.join(data, "desk-assets"), os.path.join(HARNESS, "desk-assets")],
+        "tools": [os.path.join(HARNESS, "tools")],
     }
 
     class H(BaseHTTPRequestHandler):
@@ -116,23 +117,29 @@ def main():
             if not self.host_ok():
                 return
             path = self.path.split("?", 1)[0].split("#", 1)[0]
-            for prefix, root in roots.items():
-                if path.startswith("/" + prefix + "/"):
+            for prefix, dirs in roots.items():
+                if not path.startswith("/" + prefix + "/"):
+                    continue
+                body = p = None
+                for root in dirs:
                     try:
                         p = inside(root, path[len(prefix) + 2:])
                         with open(p, "rb") as f:
                             body = f.read()
-                    except Exception:
                         break
-                    etag = None
-                    if cache and prefix == "desk/avatars":
-                        etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
-                        if self.headers.get("If-None-Match") == etag:
-                            self.head(304, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), 0, etag)
-                            return
-                    self.head(200, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), len(body), etag)
-                    self.wfile.write(body)
-                    return
+                    except Exception:
+                        body = None
+                if body is None:
+                    break
+                etag = None
+                if cache and prefix == "desk/avatars":
+                    etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+                    if self.headers.get("If-None-Match") == etag:
+                        self.head(304, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), 0, etag)
+                        return
+                self.head(200, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), len(body), etag)
+                self.wfile.write(body)
+                return
             self.answer(404, "not found")
 
         def do_POST(self):

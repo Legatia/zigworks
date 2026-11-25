@@ -392,8 +392,10 @@ cards. "See the work" opens the Work topic's latest post.
 This is the prototype's method; its code is the reference.
 
 - **The portrait is projected onto a rigged head.**
-  - The base head is three.js's Face Cap sample: a neutral head with the
-    52 ARKit expression shapes, teeth and eyes.
+  - The base head is made from USC ICT's ICT-FaceKit (MIT): its neutral
+    head with the 52 ARKit expression shapes (ICT's own, mapped), its
+    teeth, gums and tongue. (It was three.js's Face Cap sample until
+    2026-11-25; its license couldn't be verified.)
   - It's fitted to the portrait: face landmarks are found on the photo and
     on a render of the head (MediaPipe Face Landmarker), then a similarity
     transform and an RBF warp map the head onto the photo.
@@ -415,9 +417,8 @@ This is the prototype's method; its code is the reference.
   - The inside is the head's own mouth geometry, coloured dark: a roof, a
     tongue-coloured floor and the inner lips. It's found by what's hidden
     at rest.
-  - It's drawn behind the teeth.
-  - The upper teeth are seated at the lip line. A lower row rides on the
-    jaw.
+  - The teeth, gums and tongue are the base head's own, both rows, each
+    point moving with the jaw as it opens.
 - **The rest of the portrait** (hair, neck, shoulders, background) is a
   backplate. It follows the head by the face's depth and rises with each
   breath.
@@ -469,16 +470,15 @@ not in the binary because of their size):
 
 - MediaPipe's tasks-vision 0.10.14 module and WebAssembly, and its face
   landmarker model (Apache 2.0, pinned by SHA-256);
-- the base head (`base-head.bin`): the Face Cap head made neutral and the
-  landmarks found on its render.
+- the base head (`base-head.bin`): made from ICT-FaceKit (MIT), with the
+  landmarks found on its render. It's committed in the repository
+  (`harness/desk-assets/`, with `base-head-NOTICE.txt`) and made again by
+  `tools/make-base-head.mjs` from ICT-FaceKit's files at a pinned commit,
+  each checked by SHA-256.
 
-The base head is made once by a dev page from `facecap.glb` (three.js
-r170, SHA-256 `6bfce6d0fcbb5839f5102b79733007859fef7c5df6d9eb49e2264542810b5f64`).
-Face Cap's license isn't verified, so:
-
-- `facecap.glb`, `base-head.bin` and the fitted butler stay out of the
-  repository and out of releases until it's cleared (gaps list);
-- the test suite uses a small made-up head instead.
+The fitted butler stays out of the repository and out of releases until
+its portraits are cleared (gaps list); the test suite uses a small made-up
+head.
 
 **What it checks first, refusing with the reason:**
 
@@ -516,7 +516,7 @@ folder through the upload path, and the avatar switches to the fitted head.
 
   These ship in the release archive under `avatars/`, which `harness init`
   copies to the data folder. That happens only after the owner clears the
-  portraits' and Face Cap's licensing. Until then, the build takes them
+  portraits' licensing. Until then, the build takes them
   from the owner's Downloads folder for local use.
 - **The female avatar is skipped for now** (the owner, 2026-11-24).
 - The old video clips are no longer used.
@@ -713,7 +713,6 @@ From the mockup:
 - **Docs:**
   - the README: Desk; Avatar packs; Speech; the local-app limit;
   - the gaps list:
-    - Face Cap's license, and an own base head if it isn't cleared;
     - the portraits' licensing;
     - the female avatar;
     - exact lip-sync timing;

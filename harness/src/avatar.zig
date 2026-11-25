@@ -21,7 +21,7 @@ pub const max_file: u64 = 20 << 20;
 pub const head_magic = "\x89HEAD\r\n\x1a";
 pub const head_version: u32 = 1;
 
-/// The 52 ARKit expression shapes, as the base head (Face Cap) names them.
+/// The 52 ARKit expression shapes, as the base head names them.
 pub const shape_names = [52][]const u8{ "browInnerUp", "browDown_L", "browDown_R", "browOuterUp_L", "browOuterUp_R", "eyeLookUp_L", "eyeLookUp_R", "eyeLookDown_L", "eyeLookDown_R", "eyeLookIn_L", "eyeLookIn_R", "eyeLookOut_L", "eyeLookOut_R", "eyeBlink_L", "eyeBlink_R", "eyeSquint_L", "eyeSquint_R", "eyeWide_L", "eyeWide_R", "cheekPuff", "cheekSquint_L", "cheekSquint_R", "noseSneer_L", "noseSneer_R", "jawOpen", "jawForward", "jawLeft", "jawRight", "mouthFunnel", "mouthPucker", "mouthLeft", "mouthRight", "mouthRollUpper", "mouthRollLower", "mouthShrugUpper", "mouthShrugLower", "mouthClose", "mouthSmile_L", "mouthSmile_R", "mouthFrown_L", "mouthFrown_R", "mouthDimple_L", "mouthDimple_R", "mouthUpperUp_L", "mouthUpperUp_R", "mouthLowerDown_L", "mouthLowerDown_R", "mouthPress_L", "mouthPress_R", "mouthStretch_L", "mouthStretch_R", "tongueOut" };
 
 /// avatar.ini's keys, in the order they're listed.
@@ -477,6 +477,24 @@ pub fn readHeader(a: std.mem.Allocator, bytes: []const u8, why: *[]const u8) !He
             if (v >= pair[1]) return fail(why, "head.bin's array {s} points past its {d} vertices", .{ iname, pair[1] }, a);
         }
     }
+    // optional, from a base made from ICT-FaceKit: the mouth's parts' jaw
+    // motion, the upper teeth's showing as the lips part, their kind, and
+    // which vertices are the mouth's inside
+    const Opt = struct { name: []const u8, ty: []const u8, per: usize, teeth: bool };
+    for ([_]Opt{
+        .{ .name = "teeth.jaw", .ty = "f32", .per = 3, .teeth = true },
+        .{ .name = "teeth.show", .ty = "f32", .per = 3, .teeth = true },
+        .{ .name = "teeth.kind", .ty = "u8", .per = 1, .teeth = true },
+        .{ .name = "head.part", .ty = "u8", .per = 1, .teeth = false },
+    }) |o| {
+        const arr = describe(list.get(o.name) orelse continue).?;
+        if (!std.mem.eql(u8, arr.ty, o.ty)) return fail(why, "head.bin's array {s} is {s}; it should be {s}", .{ o.name, arr.ty, o.ty }, a);
+        const of: usize = if (o.teeth) teeth.count / 3 else n;
+        if (arr.count != o.per * of) {
+            const what = if (o.teeth) "teeth points" else "vertices";
+            return fail(why, "head.bin's array {s} has {d} values; {d} {s} need {d}", .{ o.name, arr.count, of, what, o.per * of }, a);
+        }
+    }
     // the still it was fitted to, when the fit knew its bytes
     var still_sha256: ?[64]u8 = null;
     if (field(root, "still")) |st| {
@@ -593,8 +611,8 @@ fn png(a: std.mem.Allocator, w: u32, h: u32) ![]u8 {
     return out.items;
 }
 
-/// A made-up head: three vertices, one triangle, the 52 shapes (no Face
-/// Cap data), with knobs that break it one way at a time.
+/// A made-up head: three vertices, one triangle, the 52 shapes (no real
+/// head's data), with knobs that break it one way at a time.
 const TestHead = struct {
     version: u32 = 1,
     kind: []const u8 = "head",
@@ -608,14 +626,17 @@ const TestHead = struct {
     outline_points: u32 = 16,
     /// the still's SHA-256 (hex) the head says it was fitted to
     still_sha256: ?[]const u8 = null,
+    /// arrays after the required ones (the optional teeth.jaw, teeth.kind, head.part)
+    extra: []const TestArr = &.{},
 };
+
+const TestArr = struct { name: []const u8, ty: []const u8, count: u32, size: u32 };
 
 const test_shapes = shape_names;
 
 fn testHead(a: std.mem.Allocator, o: TestHead) ![]u8 {
     const n: u32 = 3;
-    const TArr = struct { name: []const u8, ty: []const u8, count: u32, size: u32 };
-    var arrs: std.ArrayList(TArr) = .empty;
+    var arrs: std.ArrayList(TestArr) = .empty;
     try arrs.append(a, .{ .name = "head.pos", .ty = "f32", .count = 3 * n, .size = 4 });
     try arrs.append(a, .{ .name = "head.nrm", .ty = "f32", .count = 3 * n, .size = 4 });
     try arrs.append(a, .{ .name = "head.uv", .ty = "f32", .count = o.uv_count orelse 2 * n, .size = 4 });
@@ -635,6 +656,7 @@ fn testHead(a: std.mem.Allocator, o: TestHead) ![]u8 {
     }
     try arrs.append(a, .{ .name = "teeth.pos", .ty = "f32", .count = 9, .size = 4 });
     try arrs.append(a, .{ .name = "teeth.idx", .ty = "u16", .count = 3, .size = 2 });
+    try arrs.appendSlice(a, o.extra);
 
     var data: std.ArrayList(u8) = .empty;
     var desc: std.ArrayList(u8) = .empty;
@@ -860,6 +882,22 @@ test "the_head_header_is_checked" {
     try expectHas(try headWhy(a, try testHead(a, .{ .bad_index = true })), "head.bin's array head.idx points past its 3 vertices");
     try expectHas(try headWhy(a, try testHead(a, .{ .kind = "base" })), "head.bin is the base head, not a fitted one");
     try expectHas(try headWhy(a, try testHead(a, .{ .outline_points = 15 })), "head.bin's header has no eyes[0].outline of 16 points");
+}
+
+test "optional_arrays_are_checked_when_present" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const jaw: TestArr = .{ .name = "teeth.jaw", .ty = "f32", .count = 9, .size = 4 };
+    const kind: TestArr = .{ .name = "teeth.kind", .ty = "u8", .count = 3, .size = 1 };
+    const part: TestArr = .{ .name = "head.part", .ty = "u8", .count = 3, .size = 1 };
+    try t.expectEqualStrings("", try headWhy(a, try testHead(a, .{ .extra = &.{ jaw, kind, part } })));
+    try expectHas(try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "teeth.jaw", .ty = "f32", .count = 6, .size = 4 }} })), "head.bin's array teeth.jaw has 6 values; 3 teeth points need 9");
+    try expectHas(try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "teeth.kind", .ty = "u8", .count = 2, .size = 1 }} })), "head.bin's array teeth.kind has 2 values; 3 teeth points need 3");
+    try expectHas(try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "head.part", .ty = "u8", .count = 4, .size = 1 }} })), "head.bin's array head.part has 4 values; 3 vertices need 3");
+    try expectHas(try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "head.part", .ty = "f32", .count = 3, .size = 4 }} })), "head.bin's array head.part is f32; it should be u8");
+    try t.expectEqualStrings("", try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "teeth.show", .ty = "f32", .count = 9, .size = 4 }} })));
+    try expectHas(try headWhy(a, try testHead(a, .{ .extra = &.{.{ .name = "teeth.show", .ty = "f32", .count = 8, .size = 4 }} })), "head.bin's array teeth.show has 8 values; 3 teeth points need 9");
 }
 
 test "a_head_fitted_to_another_photo_is_a_problem" {

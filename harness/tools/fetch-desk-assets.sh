@@ -6,8 +6,8 @@
 #
 #   sh tools/fetch-desk-assets.sh DIR
 #
-# The base head (DIR/base-head.bin) isn't downloaded: tools/make-base-head.html
-# makes it from facecap.glb, whose license isn't cleared (README: Avatar packs).
+# The base head isn't fetched: it's committed as harness/desk-assets/base-head.bin
+# (made from ICT-FaceKit, MIT, by tools/make-base-head.mjs; desk-assets/base-head-NOTICE.txt).
 #
 # The hashes were taken from the npm package @mediapipe/tasks-vision@0.10.14
 # (its tarball checked against the registry's sha512) and match jsDelivr's

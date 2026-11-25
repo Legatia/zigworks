@@ -8,7 +8,8 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
   devserver.py PORT DATA [--csp POLICY | --no-csp] [--cache]
       127.0.0.1 only. The desk's URL layout over this tree and DATA:
       /desk/static/ (src/desk/), /desk/avatars/ (DATA/avatars/),
-      /desk/assets/ (DATA/desk-assets/), /tools/; POST /save/PATH writes
+      /desk/assets/ (DATA/desk-assets/, else desk-assets/ in this tree: the
+      committed base head), /tools/; POST /save/PATH writes
       DATA/PATH under avatars/, desk-assets/ or debug/. It prints a token
       for the run: pages that save are opened with #token=TOKEN and send
       it as X-Dev-Token (another page in the browser can't), and requests
@@ -20,12 +21,23 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       waits for EXPR (default window.__ready), prints the page's console,
       a value and a screenshot.
 
+  make-base-head.mjs DATA OUT [--parts-only]
+      The base head (OUT; the committed one is desk-assets/base-head.bin)
+      from USC ICT's ICT-FaceKit (MIT), at a pinned commit: downloads the
+      neutral head and 53 expressions into DATA/ict-facekit/ (each checked
+      by SHA-256), keeps the face, the back of the head and the mouth's
+      inside, simplifies them keeping every vertex where it is, maps the
+      expressions onto the 52 ARKit names (base-head-lib.mjs), adds the
+      teeth, gums and tongue, then runs make-base-head.html through the dev
+      server in headless Chrome for the landmarks. Needs
+      DATA/desk-assets/mediapipe/ (fetch-desk-assets.sh). The same inputs
+      give the same file, byte for byte.
+
   make-base-head.html
-      desk-assets/base-head.bin from desk-assets/facecap.glb (three.js
-      r170's Face Cap sample, SHA-256 checked): the neutral head rendered,
-      MediaPipe's 478 landmarks found on it and kept as points on its
-      surface. three's loaders come from jsDelivr (0.170.0), so the dev
-      server runs with --no-csp for it.
+      Its landmark step: renders ICT's neutral head, finds MediaPipe's 478
+      landmarks on it and keeps them as points on its surface, the eye
+      outlines moved onto the kept head's eye openings; writes
+      desk-assets/base-head.bin and debug/base-render.png.
 
   fit-pack.html?pack=NAME#token=TOKEN
       Fits avatars/NAME's still (and closed photo) with the desk's fit.js
@@ -48,7 +60,9 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       The module's behaviour, live: speech from avatars/audio/voice.wav
       (0.5 s silence, 1.2 s voice, 0.4 s silence), speech replaced,
       stopped and disposed, the browser voice, frame rates, hiding, the
-      states, moments, reduced motion.
+      states, moments, reduced motion; the drawn shut lids' lash line
+      (avatars/drawn: the butler's still alone, fitted), the closed lips
+      and the chin's edge as the jaw opens.
 
   cache-checks.html#token=TOKEN
       Against the dev server with --cache (the desk's caching: max-age
@@ -57,7 +71,8 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       the still.
 
   test-avatar.mjs [--write-fixture]
-      node checks for fit.js's and avatar.js's pure parts; --write-fixture
+      node checks for fit.js's, avatar.js's and base-head-lib.mjs's pure
+      parts; --write-fixture
       rewrites src/testdata/avatar/tiny-head.bin (the Zig tests' head).
 
 Run them from harness/:
@@ -65,5 +80,6 @@ Run them from harness/:
   sh tools/fetch-desk-assets.sh DATA/desk-assets
   python3 -I tools/devserver.py 8731 DATA
 
-Keep DATA outside the repository: the base head, Face Cap's model and the
-butler's files aren't cleared for it (README: Avatar packs).
+Keep DATA outside the repository: the butler's portraits and fitted files
+aren't cleared for it (README: Avatar packs), and the ICT-FaceKit download
+isn't committed (only the base head made from it).

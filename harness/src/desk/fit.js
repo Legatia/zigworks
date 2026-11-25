@@ -284,6 +284,24 @@ export function fitGeometry(base, P, W, H) {
   arrays['teeth.pos'] = tpos;
   const tidx = base.arr('teeth.idx');
   arrays['teeth.idx'] = tb.length / 3 < 65536 ? new Uint16Array(tidx) : new Uint32Array(tidx);
+  // optional (a base made from ICT-FaceKit has them): the mouth's parts' own
+  // motion as the jaw opens, which of them are teeth (0) or gums and tongue
+  // (1), and which head vertices are the mouth's inside (1)
+  const opt = (name) => { try { return base.arr(name) || null; } catch { return null; } };
+  // (teeth.show: the upper teeth's few mm down as the lips part)
+  const tk = opt('teeth.kind'), hp = opt('head.part');
+  for (const name of ['teeth.jaw', 'teeth.show']) {
+    const d = opt(name);
+    if (!d) continue;
+    const out = new Float32Array(tb.length);
+    for (let i = 0; i < tb.length / 3; i++) {
+      const w = full([tb[i * 3] + d[i * 3], tb[i * 3 + 1] + d[i * 3 + 1], tb[i * 3 + 2] + d[i * 3 + 2]]);
+      for (let k = 0; k < 3; k++) out[i * 3 + k] = w[k] - tpos[i * 3 + k];
+    }
+    arrays[name] = out;
+  }
+  if (tk) arrays['teeth.kind'] = new Uint8Array(tk);
+  if (hp) arrays['head.part'] = new Uint8Array(hp);
 
   // the photo's own features, in image pixels (row down)
   const lm = (i) => img(P[i]);
@@ -302,6 +320,7 @@ export function fitGeometry(base, P, W, H) {
   eyes.sort((a, b) => a.center[0] - b.center[0]);
   const meta = {
     kind: 'head', vertices: N, image: [W, H], shapes: SHAPES, shapeScale,
+    ...(base.meta.source && base.meta.source.name ? { base: base.meta.source.name } : {}),
     face: { noseTip: lm(1), chin: lm(152), forehead: lm(10), left: lm(234), right: lm(454) },
     mouth: { center: img(centroid(LIP_IN.map((i) => P[i]))), left: lm(61), right: lm(291), inner: LIP_IN.map(lm), outer: LIP_OUT.map(lm), jaw },
     eyes,

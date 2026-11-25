@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import * as fit from '../src/desk/fit.js';
 import * as av from '../src/desk/avatar.js';
+import * as bh from './base-head-lib.mjs';
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
 const fixturePath = here('../src/testdata/avatar/tiny-head.bin');
@@ -181,6 +182,30 @@ check('fit_geometry_of_a_similar_photo_is_the_similarity', () => {
   eq(g.meta.eyes[0].center[0] < g.meta.eyes[1].center[0], true, 'image-left eye first');
 });
 
+check('fit_geometry_carries_the_teeths_jaw_and_kind', () => {
+  const b = syntheticBase();
+  b.meta.source = { name: 'ICT-FaceKit' };
+  b.arr['teeth.jaw'] = new Float32Array([0, 0, 0, 0, 0, 0, 0, -0.5, 0.2]); // the third point drops and comes forward
+  b.arr['teeth.kind'] = new Uint8Array([0, 0, 1]);
+  b.arr['head.part'] = new Uint8Array(81).fill(0); b.arr['head.part'][40] = 1;
+  const s = 40, th = (5 * Math.PI) / 180;
+  const g = fit.fitGeometry(baseOf(b), similarLandmarks(b, s, th, 1000, -600), W, H);
+  const j = g.arrays['teeth.jaw'];
+  eq(j instanceof Float32Array, true); eq(j.length, 9);
+  near(j[0], 0, 1e-4); near(j[1], 0, 1e-4); near(j[2], 0, 1e-4);
+  near(j[6], s * Math.sin(th) * 0.5, 1e-3, 'dx'); near(j[7], -s * Math.cos(th) * 0.5, 1e-3, 'dy'); near(j[8], s * 0.2, 1e-3, 'dz');
+  eq(JSON.stringify([...g.arrays['teeth.kind']]), '[0,0,1]');
+  eq('teeth.show' in g.arrays, false, 'no teeth.show without the base having one');
+  b.arr['teeth.show'] = new Float32Array([0, -0.2, 0, 0, -0.2, 0, 0, 0, 0]); // the upper points come down when the lips part
+  const gs = fit.fitGeometry(baseOf(b), similarLandmarks(b, s, th, 1000, -600), W, H);
+  near(gs.arrays['teeth.show'][1], -s * Math.cos(th) * 0.2, 1e-3, 'show dy'); near(gs.arrays['teeth.show'][0], s * Math.sin(th) * 0.2, 1e-3, 'show dx');
+  near(gs.arrays['teeth.show'][7], 0, 1e-4);
+  eq(g.arrays['head.part'].length, 81); eq(g.arrays['head.part'][40], 1);
+  eq(g.meta.base, 'ICT-FaceKit');
+  // a base without them: no such arrays, no base name
+  const g0 = fit.fitGeometry(baseOf(syntheticBase()), similarLandmarks(b, s, th, 1000, -600), W, H);
+  eq('teeth.jaw' in g0.arrays || 'teeth.kind' in g0.arrays || 'head.part' in g0.arrays || 'base' in g0.meta, false);
+});
 check('fit_geometry_warps_a_distorted_photo_onto_its_landmarks', () => {
   const b = syntheticBase();
   const P = similarLandmarks(b, 40, 0, 1000, -600).map(([x, y, z]) => [x + 8 * Math.sin(x / 60), y + 5 * Math.cos(y / 50), z]);
@@ -385,6 +410,177 @@ check('a_catchlight_is_found_or_none_never_nan', () => {
   eq(fit.findCatchlight(field(70, 70), inCrop, 30, 30, 20, 70), null);
 });
 
+// ---------- the base head's maker (tools/base-head-lib.mjs) ----------
+check('obj_faces_and_vertices_are_read', () => {
+  const o = bh.parseObj('# a comment\nmtllib x.mtl\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nv 2 0 0\nvt 0 0\nusemtl M\nf 1/1 2/1 3/1 4/1\nf 2/1 5/1 3/1\n');
+  eq(o.pos.length, 15); eq(o.pos[3], 1); eq(o.pos[13], 0);
+  eq(JSON.stringify(o.faces), '[[0,1,2,3],[1,4,2]]');
+});
+check('every_arkit_name_maps_and_the_split_ones_sum', () => {
+  eq(Object.keys(bh.ARKIT_FROM_ICT).length, 52);
+  for (const s of SHAPES) eq(Array.isArray(bh.ARKIT_FROM_ICT[s]), true, s);
+  eq(JSON.stringify(bh.ARKIT_FROM_ICT.browInnerUp), '["browInnerUp_L","browInnerUp_R"]');
+  eq(JSON.stringify(bh.ARKIT_FROM_ICT.cheekPuff), '["cheekPuff_L","cheekPuff_R"]');
+  eq(bh.ARKIT_FROM_ICT.tongueOut.length, 0);
+  for (const s of SHAPES) if (!['browInnerUp', 'cheekPuff', 'tongueOut'].includes(s)) eq(JSON.stringify(bh.ARKIT_FROM_ICT[s]), JSON.stringify([s]));
+  // the files to fetch: the neutral and 53 expressions
+  eq(bh.ICT_FILES.length, 54); eq(bh.ICT_FILES[0], 'generic_neutral_mesh.obj');
+});
+check('quads_split_on_the_shorter_diagonal', () => {
+  // a rhombus: 0-2 is the long diagonal, 1-3 the short one
+  const pos = new Float64Array([0, 0, 0, 2, 1, 0, 4, 0, 0, 2, -1, 0]);
+  const t = bh.triangulate([[0, 1, 2, 3]], pos);
+  eq(t.length, 6);
+  eq([...t].filter((v) => v === 1 || v === 3).length, 4, 'both triangles hold the short diagonal');
+  eq(JSON.stringify([...bh.triangulate([[0, 1, 2]], pos)]), '[0,1,2]');
+});
+check('the_neck_is_what_faces_the_camera_below_the_jaw', () => {
+  // the jaw's contour seen from the front, [|x|, y], and level past its end
+  const jaw = { contour: [[0, -7.5], [3, -6.9], [6.3, -3.9]], facing: 0.25, floor: -10 };
+  //   chin's front    under the chin   throat          neck's side    ear lobe       back of the neck  deep
+  const pos = [0, -7.4, 10, 1, -8.2, 9, 0, -9.5, 6, 6.5, -5, 3, 8, -1.5, 1, 0, -8, -8, 0, -11, -5];
+  const nrm = [0, -0.3, 0.95, 0, -0.95, 0.1, 0, -0.1, 0.99, 0.6, 0, 0.8, 0.3, 0, 0.95, 0, 0, -1, 0, 0, -1];
+  const neck = bh.isNeck(new Float64Array(pos), new Float64Array(nrm), jaw);
+  eq(JSON.stringify([0, 1, 2, 3, 4, 5, 6].map(neck)), '[false,false,true,true,false,false,true]');
+  eq(bh.vertexNormals(new Float64Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), new Uint32Array([0, 1, 2]))[2], 1);
+});
+check('the_fold_behind_an_opening_is_found', () => {
+  // a sheet at z=1 with a hole round vertex (5,5); the hole's ring folds back under the sheet
+  const k = 11, pos = [], idx = [];
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) pos.push(c, r, 1);
+  const inHole = (r, c) => r >= 4 && r < 6 && c >= 4 && c < 6;
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) {
+    if (inHole(r, c)) continue;
+    const a = r * k + c; idx.push(a, a + 1, a + k + 1, a, a + k + 1, a + k);
+  }
+  const ring = [[4, 4], [4, 5], [4, 6], [5, 6], [6, 6], [6, 5], [6, 4], [5, 4]].map(([r, c]) => r * k + c);
+  const fold = ring.map((v) => { const x = pos[v * 3], y = pos[v * 3 + 1]; pos.push(5 + (x - 5) * 1.4, 5 + (y - 5) * 1.4, 0); return pos.length / 3 - 1; });
+  for (let i = 0; i < 8; i++) { const j = (i + 1) % 8; idx.push(ring[i], ring[j], fold[j], ring[i], fold[j], fold[i]); }
+  const hidden = bh.foldsBehind({ pos: new Float64Array(pos), idx: new Uint32Array(idx), seeds: fold, eps: 0.05 });
+  eq(JSON.stringify([...hidden].sort((a, b) => a - b)), JSON.stringify([...fold].sort((a, b) => a - b)));
+});
+// a dome grid, k×k, with its triangles
+function dome(k) {
+  const pos = new Float64Array(k * k * 3), idx = [];
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) {
+    const x = c / (k - 1) * 2 - 1, y = r / (k - 1) * 2 - 1;
+    pos.set([x, y, 1 - 0.5 * (x * x + y * y)], (r * k + c) * 3);
+  }
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) { const a = r * k + c; idx.push(a, a + 1, a + k + 1, a, a + k + 1, a + k); }
+  return { pos, idx: new Uint32Array(idx) };
+}
+const used = (idx) => new Set(idx);
+const normalZ = (pos, idx, t) => {
+  const p = (i) => [pos[idx[t + i] * 3], pos[idx[t + i] * 3 + 1], pos[idx[t + i] * 3 + 2]];
+  const [a, b, c] = [p(0), p(1), p(2)];
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+};
+check('simplify_keeps_locked_vertices_and_reaches_its_target', () => {
+  const k = 21, { pos, idx } = dome(k);
+  const lock = new Uint8Array(k * k);
+  for (let i = 0; i < k; i++) lock[i] = lock[(k - 1) * k + i] = lock[i * k] = lock[i * k + k - 1] = 1;
+  const out = bh.simplify({ pos, idx, poses: [pos], lock, target: 120 });
+  const u = used(out);
+  eq(u.size <= 120, true, 'vertices used ' + u.size);
+  for (let i = 0; i < k * k; i++) if (lock[i]) eq(u.has(i), true, 'locked ' + i);
+  for (let t = 0; t < out.length; t += 3) eq(normalZ(pos, out, t) > 0, true, 'triangle ' + t / 3 + ' faces up');
+  // a manifold: every edge has one or two triangles, and the border's edges one
+  const ec = new Map();
+  for (let t = 0; t < out.length; t += 3) for (let e = 0; e < 3; e++) { const a = out[t + e], b = out[t + (e + 1) % 3]; const key = Math.min(a, b) + ',' + Math.max(a, b); ec.set(key, (ec.get(key) || 0) + 1); }
+  eq([...ec.values()].every((c) => c <= 2), true, 'manifold');
+});
+check('simplify_keeps_where_a_pose_moves', () => {
+  const k = 21, pos = new Float64Array(k * k * 3), idx = [];
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) pos.set([c, r, 0], (r * k + c) * 3);
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) { const a = r * k + c; idx.push(a, a + 1, a + k + 1, a, a + k + 1, a + k); }
+  // the pose folds the grid along row 10 (a crease, as lips parting)
+  const pose = new Float64Array(pos);
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) pose[(r * k + c) * 3 + 2] = Math.abs(r - 10) * 0.8;
+  const lock = new Uint8Array(k * k);
+  for (let i = 0; i < k; i++) lock[i] = lock[(k - 1) * k + i] = lock[i * k] = lock[i * k + k - 1] = 1;
+  const out = bh.simplify({ pos, idx: new Uint32Array(idx), poses: [pos, pose], lock, target: 130 });
+  const u = used(out);
+  let crease = 0, flat = 0;
+  for (let c = 1; c < k - 1; c++) { if (u.has(10 * k + c)) crease++; if (u.has(5 * k + c)) flat++; }
+  eq(crease > flat, true, `crease row kept ${crease}, a flat row ${flat}`);
+});
+check('simplify_keeps_more_where_a_vertex_weighs_more', () => {
+  // a gently curved sheet: the right half weighs 20 times the left
+  const k = 21, pos = new Float64Array(k * k * 3), idx = [];
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) pos.set([c, r, 0.02 * ((c - 10) ** 2 + (r - 10) ** 2)], (r * k + c) * 3);
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) { const a = r * k + c; idx.push(a, a + 1, a + k + 1, a, a + k + 1, a + k); }
+  const weight = new Float64Array(k * k);
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) weight[r * k + c] = c > 10 ? 20 : 1;
+  const out = bh.simplify({ pos, idx: new Uint32Array(idx), poses: [pos], lock: new Uint8Array(k * k), weight, target: 150 });
+  const u = used(out);
+  let right = 0, left = 0;
+  for (let r = 1; r < k - 1; r++) for (let c = 1; c < k - 1; c++) if (u.has(r * k + c)) { if (c > 10) right++; else if (c < 10) left++; }
+  eq(right > left * 1.5, true, `right ${right}, left ${left}`);
+});
+check('the_blink_is_sealed_so_the_lids_meet', () => {
+  // lower margin at y 0 (0–4), upper margin at y 1 closing by 0.9 (a 0.1 gap),
+  // a lid point 0.2 above the margin, a brow point far above, the lower margin still
+  const pos = new Float32Array([0, 0, 0, 2, 0, 0, 4, 0, 0, 0, 1, 0, 2, 1, 0, 4, 1, 0, 2, 1.2, 0, 2, 3, 0]);
+  const delta = new Float32Array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -0.9, 0, 0, -0.9, 0, 0, -1.2, 0, 0, -0.9, 0, 0, 0, 0]);
+  const out = bh.sealBlink({ pos, delta, upper: [3, 4, 5], lower: [0, 1, 2], overlap: 0.03, reach: 0.4 });
+  near(out[4 * 3 + 1], -1.03, 1e-6, 'the margin goes 0.03 past');
+  near(out[3 * 3 + 1], -1.03, 1e-6);
+  near(out[5 * 3 + 1], -1.2, 1e-6, 'already past: unchanged');
+  near(out[6 * 3 + 1], -0.9 - 0.13 * 0.5, 1e-6, 'half the correction 0.2 up');
+  eq(out[7 * 3 + 1], 0, 'far above: unchanged');
+  eq(out[1 * 3 + 1], 0, 'the lower margin: unchanged');
+});
+check('a_jagged_cut_is_smoothed_by_its_neighbours', () => {
+  // a 9×9 grid cut below row 4, with one vertex of row 4 cut too (a tooth) and one of row 5 kept (a notch)
+  const k = 9, idx = [];
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) { const a = r * k + c; idx.push(a, a + 1, a + k + 1, a, a + k + 1, a + k); }
+  const cut = new Uint8Array(k * k);
+  for (let r = 5; r < k; r++) for (let c = 0; c < k; c++) cut[r * k + c] = 1;
+  cut[4 * k + 4] = 1; cut[5 * k + 2] = 0;
+  const out = bh.majority(cut, new Uint32Array(idx), 2);
+  eq(out[4 * k + 4], 0, 'the tooth is kept again'); eq(out[5 * k + 2], 1, 'the notch is cut');
+  eq(out[2 * k + 2], 0); eq(out[7 * k + 7], 1, 'far from the edge: unchanged');
+});
+check('compact_maps_used_vertices_in_order', () => {
+  const { map, kept } = bh.compact(new Uint32Array([4, 2, 7, 2, 7, 9]), 10);
+  eq(kept, 4);
+  eq(JSON.stringify([...map]), '[-1,-1,0,-1,1,-1,-1,2,-1,3]');
+});
+
+check('the_head_fades_towards_its_outer_edge_not_its_eye_openings', () => {
+  // a 9×9 grid, 10 px apart, with a hole round vertex (4,4) standing for an eye opening
+  const k = 9, pos = new Float32Array(k * k * 3), idx = [];
+  for (let r = 0; r < k; r++) for (let c = 0; c < k; c++) pos.set([c * 10, -r * 10, 0], (r * k + c) * 3);
+  for (let r = 0; r < k - 1; r++) for (let c = 0; c < k - 1; c++) {
+    if (r >= 3 && r < 5 && c >= 3 && c < 5) continue;
+    const a = r * k + c; idx.push(a, a + k, a + 1, a + 1, a + k, a + k + 1);
+  }
+  const eyes = [{ center: [40, 40], width: 20 }];
+  const d = av.edgeDistance(pos, new Uint16Array(idx), eyes);
+  eq(d[0], 0); eq(d[4 * k], 0, 'the outer edge');
+  near(d[1 * k + 1], 10, 1e-6, 'one in'); near(d[2 * k + 2], 20, 1e-6);
+  eq(d[3 * k + 3] > 0, true, 'the eye opening is not an edge'); near(d[3 * k + 3], 30, 1e-6);
+});
+check('only_a_head_with_its_own_mouth_parts_fades_to_its_edge', () => {
+  // an open edge round a "mouth" (an older head's lips): no fade there
+  const pos = new Float32Array([0, 0, 0, 10, 0, 0, 0, -10, 0]), idx = new Uint16Array([0, 1, 2]);
+  const eyes = [{ center: [100, 100], width: 10 }];
+  const old = av.headEdge(pos, idx, { eyes, arrays: {} });
+  eq([...old].every((d) => d >= 1e6), true, 'an older head: no fade');
+  const own = av.headEdge(pos, idx, { eyes, arrays: { 'teeth.jaw': [] } });
+  eq(own[0], 0, 'a head with its own mouth parts fades');
+});
+check('an_optional_array_of_the_wrong_size_is_a_problem', () => {
+  const head = (n, t, extra) => ({ meta: { vertices: n, arrays: { 'head.pos': ['f32', 0, 0], 'teeth.pos': ['f32', 0, 0], ...Object.fromEntries(Object.keys(extra).map((k) => [k, ['f32', 0, 0]])) } },
+    arr: (name) => ({ 'head.pos': new Float32Array(n * 3), 'teeth.pos': new Float32Array(t * 3), ...extra })[name] });
+  eq(av.optionalProblem(head(3, 2, {})), null);
+  eq(av.optionalProblem(head(3, 2, { 'teeth.jaw': new Float32Array(6), 'teeth.kind': new Uint8Array(2), 'head.part': new Uint8Array(3) })), null);
+  has(av.optionalProblem(head(3, 2, { 'teeth.jaw': new Float32Array(3) })), 'teeth.jaw');
+  has(av.optionalProblem(head(3, 2, { 'teeth.kind': new Uint8Array(3) })), 'teeth.kind');
+  has(av.optionalProblem(head(3, 2, { 'head.part': new Uint8Array(2) })), 'head.part');
+  has(av.optionalProblem(head(3, 2, { 'teeth.show': new Float32Array(5) })), 'teeth.show');
+  eq(av.optionalProblem(head(3, 2, { 'teeth.show': new Float32Array(6) })), null);
+});
 // ---------- the made-up head the Zig tests read ----------
 function tinyHead() {
   const b = syntheticBase(3);

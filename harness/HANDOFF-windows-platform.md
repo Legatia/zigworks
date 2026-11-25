@@ -195,9 +195,19 @@ Nothing changes in your apps. For the record:
 
 ### The base head and what can't ship yet
 
-- The base head the fit starts from was made from the Face Cap model,
-  whose licence isn't cleared. A replacement from ICT-FaceKit (MIT) is
-  being built on `platform/desk-base-head`.
+- The base head is now in the repository: `harness/desk-assets/base-head.bin`
+  (3.3 MB), made from USC ICT's ICT-FaceKit (MIT), with its notice beside it
+  (`base-head-NOTICE.txt`). `scripts/pack-desk-assets.sh` puts both in the
+  release's `desk-assets/`. It replaces the one made from the Face Cap
+  model, whose licence isn't cleared.
+- A head fitted on it is about 3.3 MB and names its base (`"base":
+  "ICT-FaceKit"`). The head format is still version 1; `teeth.jaw`,
+  `teeth.kind`, `teeth.show` and `head.part` are optional and
+  `harness avatar check` checks them when present. Packs fitted on the
+  Face Cap base still draw as before.
+- Seen only in headless Chrome so far, on three faces. Not yet seen in
+  WKWebView or WebView2: please look at a fitted head on Windows (the
+  nose's underside at rest, the open mouth's teeth, shut lips).
 - The built-in butler's portraits are held too, until the owner says
   where they came from. A fresh install starts with no avatar, and the
   stage offers [Add a portrait].
@@ -387,10 +397,10 @@ against the spec and adjust.
 | `platform/desk` | harness's side and the desk page | merged into harness-logins: reviewed, unit 1513/1535, smoke 162 (195 with the stand-ins); avatar.js, fit.js and three.js are stand-ins until the avatar lands |
 | `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | merged (2ec85ec) |
 | `platform/desk-voice` | the desk's voice: any provider that speaks OpenAI's or Gemini's format | merged (aea003e) |
-| `platform/desk-base-head` | a base head made from ICT-FaceKit (MIT), replacing the Face Cap one | building |
-| `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | building |
-| `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | building |
-| `platform/desk-app-setup` | the macOS app carries harness and sets it up (one download, the Set up screen, the key in a native field) | built; see "the app sets harness up" above |
+| `platform/desk-base-head` | a base head made from ICT-FaceKit (MIT), replacing the Face Cap one | merged as one commit (squashed, so the 3.3 MB file is in history once) |
+| `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | merged (453b522) |
+| `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | merged (99463fd) |
+| `platform/desk-app-setup` | the macOS app carries harness and sets it up (one download, the Set up screen, the key in a native field) | merged (8c4130a); see "the app sets harness up" above |
 
 ### The desk app's code is yours to extend
 
