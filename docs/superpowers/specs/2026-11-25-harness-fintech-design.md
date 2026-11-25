@@ -19,6 +19,12 @@ research changed is in the next section and marked "(revised)" where it
 changed a part. The research report itself is kept out of this public
 repository: it repeats single, unverified user reviews of named vendors.
 
+Since 2026-11-26 this file has a companion,
+`2026-11-26-harness-money-jobs-design.md`: the owner concluded that this
+is "not just for fintech, rather a general b2b money tool". The disputes
+pack and the parts here (cases, people, documents, measuring) are used
+there; onboarding, for regulated companies, stays here.
+
 ## Intent
 
 A company that takes payments or opens accounts runs harness on its own
