@@ -29,6 +29,7 @@ const autostart = @import("autostart.zig");
 const mail_mod = @import("mail.zig");
 const sock = @import("sock.zig");
 const avatar = @import("avatar.zig");
+const config_cmd = @import("config_cmd.zig");
 const Io = std.Io;
 const Core = core_mod.Core;
 
@@ -39,6 +40,10 @@ const usage =
     \\
     \\  init [--butler]            write the data folder with commented defaults; asks
     \\                             (--butler: says yes) whether it is a home butler
+    \\  config set SECTION.KEY VALUE
+    \\                             write one setting in config.ini (comments kept; a
+    \\                             value that doesn't read is refused, the file untouched)
+    \\  config get SECTION.KEY     the value in use; a named section: provider NAME.url
     \\  secret add NAME [--stdin]  store a secret (typed, not shown)
     \\  secret rm NAME             remove a stored secret
     \\  secret list                which of the configured secrets are stored
@@ -429,6 +434,7 @@ fn dispatch(app: *App, args: []const []const u8) !Exit {
         return .ok;
     }
     if (eql(cmd, "init")) return initCmd(app, rest);
+    if (eql(cmd, "config")) return configCmd(app, rest);
     if (eql(cmd, "secret")) return secretCmd(app, rest);
     if (eql(cmd, "login")) return loginCmd(app, rest);
     if (eql(cmd, "pair")) return pairCmd(app);
@@ -497,6 +503,63 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
     try outAll(app.io, try initText(app.arena, app.home, butler_on, asked));
     // a Hermes setup to bring over: said, never done
     if (hermes_import.noticeFor(app.io, app.arena, app.env)) |line| try outPrint(app.io, "{s}\n", .{line});
+    return .ok;
+}
+
+const config_usage = "usage: harness config set SECTION.KEY VALUE [SECTION.KEY VALUE]... | config get SECTION.KEY (a named section: provider NAME.KEY)";
+
+/// Whether a `harness config` line has what it takes: `set` a key and its
+/// value (more pairs: written together), `get` a key; a key is one
+/// argument, or two for a named section.
+fn configArgs(rest: []const []const u8) ?void {
+    if (rest.len < 2) return null;
+    var buf: [2048]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    if (eql(rest[0], "set")) return if (config_cmd.parsePairs(fba.allocator(), rest[1..]) != null) {} else null;
+    if (eql(rest[0], "get")) return if (config_cmd.parseKey(fba.allocator(), rest[1..]) != null) {} else null;
+    return null;
+}
+
+/// `harness config set SECTION.KEY VALUE | get SECTION.KEY`: one setting of
+/// config.ini (config_cmd.zig). A set that doesn't parse leaves the file
+/// as it was; when harness runs, it says what the change waits for.
+fn configCmd(app: *App, rest: []const []const u8) !Exit {
+    if (configArgs(rest) == null) {
+        complain(config_usage, .{});
+        return .usage;
+    }
+    const set = eql(rest[0], "set");
+    const p = try core_mod.Paths.init(app.arena, app.home);
+    const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch |e| {
+        if (e == error.FileNotFound) complain("no config.ini in {s}; run harness init first", .{app.home}) else complain("can't read {s}: {s}", .{ p.config, @errorName(e) });
+        return .failed;
+    };
+    if (!set) {
+        const got = try config_cmd.getValue(app.arena, text, config_cmd.parseKey(app.arena, rest[1..]).?);
+        if (got.refused) |line| {
+            complain("{s}", .{line});
+            return .failed;
+        }
+        try outPrint(app.io, "{s}\n", .{got.value.?});
+        return .ok;
+    }
+    const pairs = config_cmd.parsePairs(app.arena, rest[1..]).?;
+    const got = try config_cmd.setAll(app.arena, text, pairs);
+    if (got.refused) |line| {
+        complain("{s}", .{line});
+        return .failed;
+    }
+    util.writeReplace(app.io, p.config, got.text.?) catch |e| {
+        complain("config.ini could not be written: {s}; it is as it was", .{@errorName(e)});
+        return .failed;
+    };
+    const restart = for (pairs) |pr| {
+        if (config_cmd.needsRestart(pr.key)) break true;
+    } else false;
+    if (core_mod.lockHeld(app.io, p)) try outAll(app.io, if (restart)
+        "harness is running: restart it to use this (harness stop, then harness run).\n"
+    else
+        "harness is running: send /reload to use it.\n");
     return .ok;
 }
 
@@ -2636,6 +2699,7 @@ fn badArgs(args: []const []const u8) ?[]const u8 {
         if (eql(cmd, c)) return if (rest.len == 0) null else "usage: harness " ++ c ++ " (it takes no arguments)";
     }
     if (eql(cmd, "brief")) return if (rest.len <= 1) null else "usage: harness brief [NAME]";
+    if (eql(cmd, "config")) return if (configArgs(rest) != null) null else config_usage;
     if (eql(cmd, "task")) return if (rest.len == 2 and eql(rest[0], "run")) null else "usage: harness task run NAME";
     if (eql(cmd, "memory")) {
         if (rest.len == 0 or (rest.len == 1 and eql(rest[0], "list"))) return null;
@@ -3126,6 +3190,7 @@ test "login_add_and_rm_say_exactly_what_they_stored_and_removed" {
 
 test {
     _ = @import("config.zig");
+    _ = @import("config_cmd.zig");
     _ = @import("rules.zig");
     _ = @import("gate.zig");
     _ = @import("util.zig");
@@ -3612,4 +3677,18 @@ test "run_says_why_the_desk_is_the_only_way_in" {
     const broke = try deskAlone(a, true, "telegram", true, false);
     try t.expectEqualStrings("no bot token is stored under \"telegram\" and the desk's server didn't start (see above): fix that, or run: harness secret add telegram", broke.fail.?);
     try t.expect((try deskAlone(a, true, "telegram", true, true)).fail == null);
+}
+
+test "config_takes_set_and_get_with_their_keys" {
+    try t.expect(configArgs(&.{ "set", "model.url", "https://a.example" }) != null);
+    try t.expect(configArgs(&.{ "set", "provider", "local.url", "https://a.example" }) != null);
+    try t.expect(configArgs(&.{ "set", "provider local.url", "https://a.example", "model.provider", "local" }) != null);
+    try t.expect(configArgs(&.{ "get", "provider", "local.url" }) != null);
+    try t.expect(configArgs(&.{ "get", "model.url" }) != null);
+    try t.expect(configArgs(&.{ "set", "model.url" }) == null);
+    try t.expect(configArgs(&.{ "get", "model.url", "x" }) == null);
+    try t.expect(configArgs(&.{ "show", "model.url" }) == null);
+    try t.expect(configArgs(&.{"set"}) == null);
+    try t.expect(badArgs(&.{ "config", "get" }) != null);
+    try t.expect(badArgs(&.{ "config", "get", "chat.utc_offset" }) == null);
 }

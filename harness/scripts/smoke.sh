@@ -1089,11 +1089,16 @@ done
 check "a command's approval waits on the desk with its buttons, in Needs you and in the chat" '[ -n "$AID" ] && desk_has main "\"item\":$AID" && "$F" --desk-api "$AH" "$ACOOKIE" GET state | grep -qF "{\"key\":\"once\",\"label\":\"Allow once\"}"'
 check "the item is answered on the desk, and the turn goes on" '"$F" --desk-api "$AH" "$ACOOKIE" POST answer "{\"id\":$AID,\"key\":\"once\"}" | grep -qF "\"took\":\"taken\"" && desk_has main "Said it." 15 && grep -qF "desk-alone" "$(req)"'
 check "nothing went to Telegram" '[ "$(wc -l <"$OUT")" = "$tg_before" ]'
+check "config set while harness runs says what the change waits for" 'HARNESS_HOME="$AH" "$H" config set limits.sends_per_hour 50 | grep -qxF "harness is running: send /reload to use it." && HARNESS_HOME="$AH" "$H" config set chat.telegram on | grep -qF "restart it to use this"'
 HARNESS_HOME="$AH" "$H" stop >/dev/null 2>&1
 wait "$RPID" 2>/dev/null
 RPID=""
 printf '[apps]\non = off\n' >>"$AH/config.ini"
 check "with no bot token and no desk server, run fails with one line naming what to turn on" '! HARNESS_HOME="$AH" HARNESS_STORE="$AS" "$H" run >"$T/arun2.out" 2>&1 && grep -qF "server is off: turn on [apps] on in config.ini, or run: harness secret add telegram" "$T/arun2.out"'
+check "config set writes one setting in place, config get reads the value in use" 'HARNESS_HOME="$AH" "$H" config set chat.utc_offset +02:00 >/dev/null && HARNESS_HOME="$AH" "$H" config get chat.utc_offset | grep -qxF "+02:00" && grep -qxF "utc_offset = +02:00" "$AH/config.ini" && HARNESS_HOME="$AH" "$H" config get model.max_tokens | grep -qxF 4096'
+cp "$AH/config.ini" "$T/aconfig.before"
+check "a value that doesn't read is refused: non-zero, one line on stderr, the file untouched" '! HARNESS_HOME="$AH" "$H" config set chat.utc_offset 5 >/dev/null 2>"$T/acfg.err" && [ "$(wc -l <"$T/acfg.err" | tr -d " ")" = 1 ] && grep -qF "Not changed: config.ini line" "$T/acfg.err" && cmp -s "$T/aconfig.before" "$AH/config.ini"'
+check "a provider of one's own goes in with its api and url in one call" 'HARNESS_HOME="$AH" "$H" config set provider other.api openai "provider other.url" "$URL/v1" model.provider other >/dev/null && HARNESS_HOME="$AH" "$H" config get provider other.url | grep -qxF "$URL/v1" && HARNESS_HOME="$AH" "$H" config get model.provider | grep -qxF other'
 
 # Coming from Hermes: harness import hermes against a Hermes home of its
 # own (a fake key in .env and in a memory entry), then harness skill
