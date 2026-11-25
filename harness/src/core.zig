@@ -14850,7 +14850,7 @@ pub const Core = struct {
             const offered = std.mem.eql(u8, sp, "off") or (std.mem.eql(u8, sp, "browser") and builtin.os.tag != .linux) or for (c.deskSpeakers(a)) |x| {
                 if (std.mem.eql(u8, x, sp)) break true;
             } else false;
-            if (!offered) return deskErr(a, .bad_request, "speak is off, browser, or a provider whose api is openai");
+            if (!offered) return deskErr(a, .bad_request, "speak is off, browser, or a provider that can speak (api = openai or gemini)");
             key = "speak";
             value = sp;
         } else return deskErr(a, .bad_request, "{\"avatar\":NAME} or {\"speak\":VALUE}");
@@ -14954,7 +14954,10 @@ pub const Core = struct {
         // copies: a /reload meanwhile frees the settings
         const prov_ref = c.providers.find(sp) orelse return deskErr(a, .conflict, "That provider isn't set up.");
         const prov = try ownProvider(a, prov_ref.*);
-        var speaker: voice_mod.Speaker = .{ .gpa = c.gpa, .io = c.io, .provider = prov, .model = try a.dupe(u8, c.cfg.desk.speak_model), .voice = try a.dupe(u8, c.cfg.desk.speak_voice) };
+        // its kind's model and voice unless [desk] names them
+        const def = voice_mod.speakDefaults(prov.api) orelse return deskErr(a, .conflict, "That provider can't speak.");
+        const d = c.cfg.desk;
+        var speaker: voice_mod.Speaker = .{ .gpa = c.gpa, .io = c.io, .provider = prov, .model = try a.dupe(u8, if (d.speak_model.len > 0) d.speak_model else def.model), .voice = try a.dupe(u8, if (d.speak_voice.len > 0) d.speak_voice else def.voice) };
         const audio = speaker.speak(a, try deskwin.spoken(a, found.msg.text), call.stop) catch |e| {
             const why = speaker.failure(a, e);
             c.log.write(.chat, false, .{ .event = "desk speech failed", .provider = prov.name, .why = why }) catch {};
@@ -15229,13 +15232,9 @@ pub const Core = struct {
         return out.items;
     }
 
-    /// Providers whose speech the desk can fetch: openai's preset and the
-    /// `[provider NAME]` sections whose api is openai.
+    /// Providers whose speech the desk can fetch (config.speakers).
     fn deskSpeakers(c: *Core, a: std.mem.Allocator) []const []const u8 {
-        var out: std.ArrayList([]const u8) = .empty;
-        out.append(a, "openai") catch return out.items;
-        for (c.cfg.providers) |p| if (p.api) |api| if (api == .openai and !std.mem.eql(u8, p.name, "openai")) out.append(a, p.name) catch {};
-        return out.items;
+        return config.speakers(a, c.cfg) catch &.{};
     }
 
     // ---- the agent's app tools ----
@@ -36626,6 +36625,66 @@ test "desk_speech_fetches_the_providers_audio" {
     // speak = off or browser: harness fetches nothing
     _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"off\"}");
     try t.expectEqual(std.http.Status.conflict, deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id})).status);
+}
+
+/// The fixture opened again with `extra` added to config.ini and the
+/// stored secrets `named`; the first message of main's desk history.
+fn deskSpeechFix(f: *Fix, extra: []const u8, named: []const Secrets.Named) !i64 {
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n{s}", .{ f.core.readOr(a, p.config), extra }) });
+    f.core.close();
+    f.core = try Core.open(t.allocator, t.io, f.home, .{ .omnigate = "og-key-for-tests", .search = "search-key-123", .named = named });
+    f.core.attach(f.rec.channel());
+    f.core.say("Three flats match.");
+    const h = deskCall(f, .GET, "history", "conv=main", "").body;
+    return jv.int(jv.at(jv.parse(a, h), &.{ "messages", "0", "id" })).?;
+}
+
+test "desk_speech_reads_aloud_through_gemini_as_wav" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const id = try deskSpeechFix(&f, try std.fmt.allocPrint(a, "[provider gem]\napi = gemini\nurl = {s}/v1beta\n[desk]\nspeak = gem\n", .{try f.e.url()}), &.{.{ .name = "gem", .value = "gm-desk-speech-1" }});
+    const got = deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id}));
+    try t.expectEqual(std.http.Status.ok, got.status);
+    try t.expectEqualStrings("audio/wav", got.content_type);
+    try t.expect(std.mem.startsWith(u8, got.body, "RIFF"));
+    try t.expectEqualStrings("Three flats match.", got.body[44..]);
+    // the kind's defaults; the key in Gemini's header, never in the answer
+    const req = try f.e.tmp.dir.readFileAlloc(t.io, "gemini-requests/001.json", a, .unlimited);
+    try expectHas(req, "/v1beta/models/gemini-3.8-flash-lite-tts:generateContent");
+    try expectHas(req, "\\\"voiceName\\\":\\\"Schedar\\\"");
+    try expectHas(req, "\"x-goog-api-key\":\"gm-desk-speech-1\"");
+    try t.expect(std.mem.indexOf(u8, got.body, "gm-desk") == null);
+    // Google's refusal: said in plain words, the key masked
+    try f.e.tmp.dir.writeFile(t.io, .{ .sub_path = "gemini/002.json", .data = "{\"status\":429}" });
+    const limited = deskCall(&f, .POST, "speech", "", try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id}));
+    try t.expectEqual(std.http.Status.bad_gateway, limited.status);
+    try expectHas(limited.body, "Speech is rate limited at gem; try again later.");
+}
+
+test "desk_speech_uses_each_kinds_defaults_and_the_desks_choice" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // an install that set nothing: tts-1 and alloy, as before
+    const id = try deskSpeechFix(&f, try std.fmt.allocPrint(a, "[provider tts]\napi = openai\nurl = {s}/v1\n[desk]\nspeak = tts\n", .{try f.e.url()}), &.{.{ .name = "tts", .value = "sk-desk-speech-1" }});
+    const body = try std.fmt.allocPrint(a, "{{\"id\":{d}}}", .{id});
+    try t.expectEqualStrings("audio/mpeg", deskCall(&f, .POST, "speech", "", body).content_type);
+    const r1 = try f.e.tmp.dir.readFileAlloc(t.io, "speech-requests/001.json", a, .unlimited);
+    try expectHas(r1, "\\\"model\\\":\\\"tts-1\\\"");
+    try expectHas(r1, "\\\"voice\\\":\\\"alloy\\\"");
+    // a voice of its own
+    const p = f.core.paths;
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try mail_mod.setKey(a, f.core.readOr(a, p.config), "desk", "speak_voice", "onyx") });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    _ = deskCall(&f, .POST, "speech", "", body);
+    const r2 = try f.e.tmp.dir.readFileAlloc(t.io, "speech-requests/002.json", a, .unlimited);
+    try expectHas(r2, "\\\"voice\\\":\\\"onyx\\\"");
+    try expectHas(r2, "\\\"model\\\":\\\"tts-1\\\"");
 }
 
 test "a_taken_port_moves_to_the_next_and_is_written" {

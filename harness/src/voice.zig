@@ -646,7 +646,6 @@ fn gemSpeaker(e: *model.TestEnv, auth: model.Auth, key: []const u8) !Speaker {
 
 fn gemScript(e: *model.TestEnv, n: u32, body: []const u8) !void {
     const name = try std.fmt.allocPrint(e.arena.allocator(), "gemini/{d:0>3}.json", .{n});
-    try e.tmp.dir.createDirPath(t.io, "gemini");
     try e.tmp.dir.writeFile(t.io, .{ .sub_path = name, .data = body });
 }
 

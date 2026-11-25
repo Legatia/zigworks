@@ -215,11 +215,12 @@ pub const Config = struct {
         /// The avatar: a folder of `avatars/` (`butler` is built in).
         avatar: []const u8 = "butler",
         /// Replies read aloud: off, browser (the system's voice), or a
-        /// provider whose api is openai (`/audio/speech`).
+        /// provider that can speak (`speakApi`).
         speak: []const u8 = "off",
-        /// The provider's speech model and voice.
-        speak_model: []const u8 = "tts-1",
-        speak_voice: []const u8 = "alloy",
+        /// The provider's speech model and voice; "": its kind's default
+        /// (voice.speakDefaults).
+        speak_model: []const u8 = "",
+        speak_voice: []const u8 = "",
     };
     /// The butler's manners.
     pub const Butler = struct {
@@ -385,8 +386,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     const dk = cfg.desk;
     if (!avatarName(dk.avatar)) return error.BadDesk;
     if (!std.mem.eql(u8, dk.speak, "off") and !std.mem.eql(u8, dk.speak, "browser")) {
-        if (providerApi(cfg, dk.speak) != .openai) return error.BadDesk;
-        if (dk.speak_model.len == 0 or dk.speak_voice.len == 0) return error.BadDesk;
+        if (speakApi(cfg, dk.speak) == null) return error.BadDesk;
     }
     return cfg;
 }
@@ -436,6 +436,32 @@ pub fn providerApi(cfg: Config, name: []const u8) ?model.Api {
     return null;
 }
 
+/// The format provider `name` reads aloud in, when it can: the `openai`
+/// and `gemini` presets (their section's api if it sets one), or a
+/// `[provider NAME]` whose own api line says openai or gemini. A chat
+/// preset with no such line has no speech of its own.
+pub fn speakApi(cfg: Config, name: []const u8) ?model.Api {
+    var api: ?model.Api = null;
+    for (cfg.providers) |p| if (std.mem.eql(u8, p.name, name)) {
+        api = p.api;
+    };
+    if (api == null and (std.mem.eql(u8, name, "openai") or std.mem.eql(u8, name, "gemini"))) api = providerApi(cfg, name);
+    const got = api orelse return null;
+    return if (got == .openai or got == .gemini) got else null;
+}
+
+/// The providers the desk can read aloud through: the two presets, then
+/// the sections that can, in the file's order.
+pub fn speakers(a: std.mem.Allocator, cfg: Config) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(a, &.{ "openai", "gemini" });
+    for (cfg.providers) |p| {
+        if (std.mem.eql(u8, p.name, "openai") or std.mem.eql(u8, p.name, "gemini")) continue;
+        if (speakApi(cfg, p.name) != null) try out.append(a, p.name);
+    }
+    return out.items;
+}
+
 /// What the providers are made from (`model.Providers.resolve`).
 pub fn providerSettings(cfg: Config) model.Settings {
     return .{ .default = cfg.model.provider, .omnigate_url = cfg.model.url, .omnigate_key = cfg.model.key, .sections = cfg.providers };
@@ -451,7 +477,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
         error.SpeechOnlyModel => "api = gemini is for speech only for now ([desk] speak); a model needs a provider with api = anthropic or openai",
-        error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -), speak = off, browser, or a provider whose api is openai (with speak_model and speak_voice)",
+        error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -); speak = off, browser, openai, gemini, or a [provider NAME] with api = openai or gemini; speak_model and speak_voice are that provider's (unset: its default)",
         else => null,
     };
 }
@@ -887,9 +913,9 @@ pub const defaults_ini =
     \\[desk]                              ; the desk, harness's own window (README: Desk)
     \\echo = on                           ; Telegram gets a quiet echo of what you type on the desk
     \\avatar = butler                     ; a folder in avatars/
-    \\speak = off                         ; replies read aloud: off, browser, or a provider with api = openai
-    \\speak_model = tts-1                 ; that provider's speech model and voice
-    \\speak_voice = alloy
+    \\speak = off                         ; replies read aloud: off, browser, openai, gemini, or a [provider NAME] with api = openai or gemini
+    \\; speak_model = tts-1               ; the provider's speech model; default tts-1 (openai), gemini-3.8-flash-lite-tts (gemini)
+    \\; speak_voice = alloy               ; its voice; default alloy (openai), Schedar (gemini)
     \\
     \\[butler]
     \\; quiet = 22:00-07:00                ; quiet hours, your time: posts of schedules, triggers and workflows wait for a digest
@@ -1560,24 +1586,50 @@ test "desk_section_reads_and_checks" {
     try t.expect(d.desk.echo);
     try t.expectEqualStrings("butler", d.desk.avatar);
     try t.expectEqualStrings("off", d.desk.speak);
-    try t.expectEqualStrings("tts-1", d.desk.speak_model);
-    try t.expectEqualStrings("alloy", d.desk.speak_voice);
+    // model and voice unset: the chosen provider's kind's defaults
+    try t.expectEqualStrings("", d.desk.speak_model);
+    try t.expectEqualStrings("", d.desk.speak_voice);
     try t.expectEqualDeep(d.desk, (try parse(a, defaults_ini)).desk);
     const b = try parse(a, "[desk]\necho = off\navatar = my-face\nspeak = browser\n");
     try t.expect(!b.desk.echo);
     try t.expectEqualStrings("my-face", b.desk.avatar);
     try t.expectEqualStrings("browser", b.desk.speak);
     _ = try parse(a, "[desk]\nspeak = openai\n");
+    _ = try parse(a, "[desk]\nspeak = gemini\n");
     _ = try parse(a, "[provider tts]\napi = openai\nurl = https://tts.example.com/v1\n[desk]\nspeak = tts\nspeak_voice = onyx\n");
+    _ = try parse(a, "[provider gem]\napi = gemini\nurl = https://p.example.com/v1beta\n[desk]\nspeak = gem\nspeak_model = gemini-3.8-flash-tts\n");
+    // an old init's lines still read
+    const old = try parse(a, "[desk]\nspeak = off\nspeak_model = tts-1\nspeak_voice = alloy\n");
+    try t.expectEqualStrings("tts-1", old.desk.speak_model);
     for ([_][]const u8{
         "[desk]\nspeak = anthropic\n",
         "[desk]\nspeak = nowhere\n",
+        // a chat preset has no speech of its own
+        "[desk]\nspeak = openrouter\n",
+        "[provider proxy]\napi = anthropic\nurl = https://p.example.com/v1\n[desk]\nspeak = proxy\n",
         "[desk]\navatar = Bad Name\n",
         "[desk]\navatar = ../x\n",
     }) |text| try t.expectError(error.BadDesk, parse(a, text));
     // an empty value is any section's error
     try t.expectError(error.BadConfig, parse(a, "[desk]\navatar = \n"));
     try t.expect(reason(error.BadDesk) != null);
+}
+
+test "speakers_are_the_two_presets_and_speaking_sections" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const none = try parse(a, "");
+    try t.expectEqualDeep(@as([]const []const u8, &.{ "openai", "gemini" }), try speakers(a, none));
+    const c = try parse(a, "[provider kokoro]\napi = openai\nurl = http://127.0.0.1:8880/v1\nauth = none\n[provider chat]\napi = anthropic\nurl = https://p.example.com/v1\n[provider openrouter]\napi = openai\n[provider opencode]\nheader = X-A: b\n[provider gem]\napi = gemini\nurl = https://p.example.com/v1beta\n[provider gemini]\nurl = https://eu.example.com/v1beta\n");
+    try t.expectEqualDeep(@as([]const []const u8, &.{ "openai", "gemini", "kokoro", "openrouter", "gem" }), try speakers(a, c));
+    try t.expectEqual(model.Api.openai, speakApi(c, "kokoro").?);
+    try t.expectEqual(model.Api.gemini, speakApi(c, "gem").?);
+    try t.expectEqual(model.Api.gemini, speakApi(c, "gemini").?);
+    try t.expect(speakApi(c, "chat") == null);
+    try t.expect(speakApi(c, "opencode") == null);
+    try t.expect(speakApi(c, "anthropic") == null);
+    try t.expect(speakApi(c, "off") == null);
 }
 
 test "butler_escalate_reads" {

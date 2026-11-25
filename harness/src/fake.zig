@@ -93,7 +93,7 @@ pub const Server = struct {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
         s.* = .{ .io = io, .dir = try gpa.dupe(u8, dir), .listener = listener, .port = listener.port, .mcp = .{ .io = io } };
-        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests", "gemini-requests" }) |sub| {
+        inline for (.{ "requests", "model", "pages", "telegram/in", "telegram/files", "transcribe", "transcribe-requests", "speech-requests", "gemini", "gemini-requests" }) |sub| {
             const p = try std.fs.path.join(gpa, &.{ dir, sub });
             defer gpa.free(p);
             try Io.Dir.cwd().createDirPath(io, p);
