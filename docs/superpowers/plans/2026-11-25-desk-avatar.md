@@ -176,7 +176,34 @@
 10. The still is decoded through an image element into a canvas for both the fit and the renderer, so an EXIF orientation is applied the same way in both — cost if wrong: none found.
 11. Dev tools load three's addons and the basis transcoder from jsDelivr pinned at 0.170.0; they never ship — cost if wrong: the base-head page needs the network once.
 12. Avatar names for `avatar check`: lowercase letters, digits, `-` and `_`, 1–64, first a letter or digit — cost if wrong: an upload named otherwise can't be checked by name.
+13. Task order 1, 2, 4, 3, 5, 6, 7, 8 (the base-head page uses Task 4's packer) — cost if wrong: none.
+14. avatar.js imports `readHead`, `loadImage` and `fit` from fit.js statically; fit.js loads MediaPipe only when fit() first runs — cost if wrong: fit.js (about 30 KB) is fetched with avatar.js.
+15. The head's format version lives in the 16-byte preamble only, not also in the JSON — cost if wrong: none.
+16. main.zig isn't `zig fmt`-clean at the base (0.17.1's fmt rewrites builtins across the file); only my lines are formatted — cost if wrong: none.
+17. similarity2D and solveRbf take arrays of [x, y, z], solveRbf the unit (1/scale) too — cost if wrong: none.
+18. The similarity's scale is the prototype's (the square root of the spreads' ratio) — cost if wrong: depth a few percent off the least-squares fit.
+19. The closed photo's shift: the mean 2D distance in photo pixels of landmarks 0–467 farther than 0.8 eye-widths from each eye's centre; the butler's pair reads 5.7 px (the spec's "about 8" was the prototype's 3D mean); the limit stays 12 px — cost if wrong: a pair that moved 12–15 px in 3D terms passes.
+20. Beyond the spec, the closed photo must be the still's size and have a face (both read "doesn't line up") and read as closed (both blink scores ≥ 0.5; its own line, "The eyes in the eyes-closed photo are open. Close the eyes and change nothing else.") — cost if wrong: a closed photo read as half open is refused, with a line not in the spec's table.
+21. A CDP driver (tools/headless.mjs) instead of bare `--screenshot`, since the pages load wasm and fetch first — cost if wrong: none (dev only).
+22. The base-head page's camera sits in front of the head's front, the far plane widened to match — cost if wrong: none.
+23. The drawn lid's tone is the skin 6–22 px under the lower lid (the butler: about 125,100,100 against his real closed lids' 135,119,115; the band above the open lid is the socket's shadow, 52,34,37) — cost if wrong: a face lit from below gets lids a little bright.
+24. A MediaPipe start failure and missing fit files share code `assets` and one line, "Fitting couldn't start: its files (desk-assets) are missing or blocked." — cost if wrong: a CSP mistake reads like missing files; the console has the cause.
+25. The mask's blur is a box blur in JS, since WebKit's 2D canvas has no `filter` — cost if wrong: none.
+26. (Security fix, the coordinator's) /csp-report stays tokenless but takes only `application/csp-report` bodies, 64 KB each, 1 MB in all — cost if wrong: a browser that sends reports as another type isn't logged.
+27. (Spec change 793df7d) fit() resolves `{ ok, message?, code?, warnings[], faceWidth, closedUsed, files, report }` and doesn't reject; the refusals and warnings are the spec's table word for word, decided by pure photoFacts, judgePhoto and judgeClosed — cost if wrong: none (the coordinator's shape).
+28. "Mouth open" = jawOpen ≥ 0.2 or the inner lips (13, 14) more than 2.5% of the face's width apart (teeth showing) — cost if wrong: lips slightly parted at rest are refused.
+29. Face width = cheek to cheek (234–454) in photo pixels (the butler's 613); "soft" warns only when the face isn't refused as too small — cost if wrong: none.
+30. A closed photo that fails refuses the whole fit, so the page keeps the head it had — cost if wrong: the owner removes the closed photo to refit the still alone.
+31. "Turned" = the forward axis's angle from frontal, yaw as read and pitch less the landmarker's own 11° (overturns the line-of-sight measure first used, which read the butler 6.4° wide and 9.3° in a tall crop; now 0.9–1.7° in every crop) — cost if wrong: the 11° is calibrated on one face.
+32. The prototype's pixel constants scale with the face's width over the butler's 613 px — cost if wrong: none for the butler (k = 1.0).
+33. stretchTimeline maps the spoken part (first sound to last) onto the voice's voiced span — cost if wrong: none.
+34. speak also takes onWord(i0, i1) for a caption — cost if wrong: an unused option.
+35. The per-frame step is capped at 0.1 s (the prototype's 0.05), so slow frames keep real time — cost if wrong: a 100 ms hitch moves the face a bigger step.
+36. The 30 fps cap is checked as frames at least 29 ms apart while resting — cost if wrong: none.
 
 ## Done
 
-(Filled in at the end.)
+- Commits: the plan (7fa525b); avatar check and head v1 (a8cf5ad); three.js vendored, fetch script, dev server (c112fd5); fit.js's geometry, packer, reader (cddf85d); the base-head page and headless driver (23716ed); fit() in the browser and the butler fitted (2621c3b); the dev server's cross-site write fixed (58a3fde); the module, preview and the fit's table (3767d36); the border and the drawn lids (042536a); behaviour checks (0d8b6e4); a phone photo's size in avatar check (b931db7); docs.
+- Checks: node tools/test-avatar.mjs, 18; behaviour-checks, 12; fit-checks on real images; the Zig numbers and the merge in the ledger.
+- Ugly cases found and fixed, each also in the prototype: two catchlights per eye (the photo's reflection kept, a spot of the wet lid edge removed); lid landmarks fallen through the eye holes into the back of the skull (a red fleck in the open mouth); the photo's top border pulled into view at a few degrees of pitch. And: drawn closed lids that looked pasted on; a phone photo's size in avatar check; the turn read against the camera's axis or line of sight.
+- Deferred: lip-sync with a real provider's audio and the browser voice heard by ear (checked by numbers in headless Chrome); fitting on the desk app's web views (WKWebView, WebView2, WebKitGTK) by the desk builders; the 11° frontal pitch calibrated on more faces; an own base head if Face Cap's license isn't cleared.

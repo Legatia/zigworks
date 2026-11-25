@@ -27,6 +27,29 @@ Dev tools for the desk's avatar. Not shipped; harness doesn't use them.
       surface. three's loaders come from jsDelivr (0.170.0), so the dev
       server runs with --no-csp for it.
 
+  fit-pack.html?pack=NAME#token=TOKEN
+      Fits avatars/NAME's still (and closed photo) with the desk's fit.js
+      and saves head.bin, eyes.png, eyemask.png and avatar.ini into it.
+
+  fit-checks.html
+      The fit's checks on real images made from avatars/butler: no face,
+      two faces, eyes closed, a small face, a soft one, a tall photo, a
+      closed photo moved, resized or open; the reflections removed; an
+      Exif-turned copy (avatars/checks/still-exif6.jpg) fitted upright.
+
+  avatar-preview.html
+      The avatar module with buttons for each state, moment, arrive,
+      speak and stop. Its query freezes a pose for screenshots: pack,
+      state, shapes=jawOpen:0.3,..., pose=YAW,PITCH,ROLL, gaze=X,Y,
+      breath, neutral=1 (no state's shapes), reduced=1, nogl=1, lose=1,
+      bare=1 (no controls). It sets window.__ready when drawn.
+
+  behaviour-checks.html
+      The module's behaviour, live: speech from avatars/audio/voice.wav
+      (0.5 s silence, 1.2 s voice, 0.4 s silence), speech replaced,
+      stopped and disposed, the browser voice, frame rates, hiding, the
+      states, moments, reduced motion.
+
   test-avatar.mjs [--write-fixture]
       node checks for fit.js's and avatar.js's pure parts; --write-fixture
       rewrites src/testdata/avatar/tiny-head.bin (the Zig tests' head).
