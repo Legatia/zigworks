@@ -308,3 +308,9 @@ and branch, test-driven, then merged here, suite + cross builds, CI.
   - run 45662585632 (94c3f94): Windows harness smoke checks 64-66 failed with `harness-fake: FileNotFound` (Git's sh rewrote the stand-in's path); fixed in 3f97af9. Three macOS jobs cancelled.
   - run 45667859969 (3f97af9): 33 of 34 jobs passed, Windows harness in Debug and ReleaseSafe among them. `test (macos-15, headterm)` was cancelled: no macOS arm64 runner took it. Not re-run; the next run covers the same code.
   - run 45671644320 (8c4130a): all 34 jobs passed.
+- 2026-11-25 by-eye pass of the desk in the macOS app (scratch home, stand-in model), three defects fixed, each with an app smoke check seen failing first:
+  - the message field was pushed below the window by a long conversation (stage floor 480 px): the page is now window-high, stage floor 240 px;
+  - the conversation lost its newest message when the window shrank: it stays at the end;
+  - the muted sound button changed only its colour: it draws a cross.
+  - Debug and ReleaseSafe 1604/1626 (22 skipped), smoke all ok; cross builds ok; desk app smoke 110/110 with this harness.
+  - Seen working: the stopped page, Settings at both sizes, "Provider and key…", a still-only avatar, the fit in WKWebView (an open-mouth photo refused, a closed-mouth one fitted and drawn), a reply, an `ask_owner` question with the badge and its answer. Not judged: the head's movement (screen locked, the page got no frames) and speech by ear.

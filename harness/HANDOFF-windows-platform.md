@@ -5,6 +5,36 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the desk page fits its window (2026-11-25, late)
+
+Found by looking at the page in the macOS app, not by a test. Your app
+shows the same page, so it gets these with the next merge; nothing to
+change on your side unless your window can be made smaller than ours.
+
+- **The page is exactly as tall as the window.** Before, the stage kept
+  480 px and a long conversation pushed the message field below the
+  window's edge (816 px against 770 at the size the app opens at). Now
+  `.app` is `100vh`, the stage takes what the top bar and the chat leave,
+  and its floor is 240 px. Measured: 1280x820 inside gives the stage 457
+  and the field's bottom at 804; 1024x700 gives 363 and 684. Keep your
+  window's minimum at 1024x700 inside or larger. Below 900 px wide the
+  page stacks and scrolls as before.
+- **The conversation stays on its newest message when the window changes
+  size** (a `ResizeObserver` on the log, only while the reader is at the
+  end).
+- **The muted sound button draws a cross** where the waves were. Before,
+  only its colour changed.
+- The app smoke checks all three with the real harness
+  (`desk-app/scripts/smoke.sh`: "a long conversation leaves the message
+  field inside the window" and the five lines after it). They use the
+  desk page's bridge directly, `desk_probe`, since that page has no
+  `post()`. If your smoke drives the desk page, the same expressions work.
+- Also seen working in the macOS app with a stand-in model: the fit run
+  inside the web view (MediaPipe and WebGL 2), a question from the model
+  raising "needs you", the dock badge, and the answer clearing them. Not
+  judged: the head's movement, because the Mac's screen was locked and a
+  hidden page gets no animation frames.
+
 ## For you: the app sets harness up; the shared part is ready (2026-11-25, night)
 
 Branch `platform/desk-app-setup` (plan

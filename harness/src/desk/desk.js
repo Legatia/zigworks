@@ -357,6 +357,19 @@ async function press(box, id, n) {
   }
 }
 
+// The conversation stays on its newest message when the window changes size:
+// a smaller window makes the log shorter and its lines wrap, which would leave
+// the newest one below the edge.
+let logAtEnd = true;
+{
+  const log = $("log");
+  const far = () => log.scrollHeight - log.scrollTop - log.clientHeight;
+  log.addEventListener("scroll", () => { logAtEnd = far() < 40; });
+  if (globalThis.ResizeObserver) {
+    new ResizeObserver(() => { if (logAtEnd && far() > 0) log.scrollTop = log.scrollHeight; }).observe(log);
+  }
+}
+
 function renderChat() {
   const log = $("log");
   const atEnd = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
