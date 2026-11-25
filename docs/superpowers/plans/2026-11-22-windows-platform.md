@@ -707,6 +707,29 @@ Left: macOS (sandbox-exec) is the Mac session's to run. A run nobody
 watches that a rule doesn't allow a command in the sandbox still skips it
 with "Allow for this task" (`shell@sandbox`), as on the host before.
 
+Also changed: `/env rm sandbox` says the built-in one stays; smoke has two
+checks (`harness env list` names the built-in sandbox; doctor's line).
+After the merge of the Mac session's desk (2f458ff), its test
+`enter_sets_a_session_cookie_once` failed on Windows (it walks a folder
+not opened for listing): the fixture opens it so (5594b23).
+
+Numbers, on the merge with origin 2f458ff (5594b23):
+
+- Windows 11: 1502 pass, 56 skip, 0 fail; smoke all ok.
+- Linux (WSL, user tester): 1536 pass, 21 skip, and the one failure this
+  machine's WSL always has (`mcp_list_says_each_servers_kind_sign_in_and_tools`);
+  smoke all ok run alone.
+- Linux with bubblewrap moved aside for the run (before the merge): 1458
+  pass, 35 skip, the same one failure: the suite holds on a machine that
+  can make no sandbox.
+- Cross builds from Windows: x86_64-linux and aarch64-linux build;
+  aarch64-macos doesn't from here (no Apple frameworks), as before.
+- By hand, the built harness on a new data folder: `harness env list`
+  shows the built-in sandbox and both defaults; `harness env check
+  sandbox` passes every probe; doctor says "Routines' commands: run in
+  sandbox (sandbox; workspace rw, no network), by AppContainer"; the
+  marker says "nothing to do".
+
 ## 11. The desk app's shared code on Windows (2026-11-25, same branch)
 
 The Windows and Linux desk apps (WebView2; GTK 3 and WebKitGTK) are this
