@@ -115,7 +115,7 @@ pub fn imageSize(bytes: []const u8) ?[2]u32 {
                 if (m == 0xd9 or m == 0xda) return null; // no frame before the scan
                 const len = std.mem.readInt(u16, bytes[i + 2 ..][0..2], .big);
                 const sof = m >= 0xc0 and m <= 0xcf and m != 0xc4 and m != 0xc8 and m != 0xcc;
-                if (m == 0xe1 and len >= 2 and i + 2 + len <= bytes.len) {
+                if (m == 0xe1 and len >= 2 and i + 2 + @as(usize, len) <= bytes.len) {
                     if (exifOrientation(bytes[i + 4 .. i + 2 + len])) |o| turned = o >= 5 and o <= 8;
                 }
                 if (sof) {
@@ -124,7 +124,7 @@ pub fn imageSize(bytes: []const u8) ?[2]u32 {
                     const w = std.mem.readInt(u16, bytes[i + 7 ..][0..2], .big);
                     return if (turned) .{ h, w } else .{ w, h };
                 }
-                i += 2 + len;
+                i += 2 + @as(usize, len);
             }
             return null;
         },
@@ -949,4 +949,17 @@ test "phone_photos_are_sized_as_shown" {
     try p.put("still.jpg", try jpegTurned(p.a(), 32, 64, 6, false));
     try p.put("closed.jpg", try jpegTurned(p.a(), 32, 64, 6, true));
     try t.expectEqualStrings("", try problemsText(p.a(), try p.check()));
+}
+
+test "a_segment_of_the_largest_length_is_skipped" {
+    // libjpeg writes ICC profile chunks at exactly 65535 bytes
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "\xff\xd8\xff\xe2\xff\xff");
+    try out.appendNTimes(a, 0, 0xffff - 2);
+    const rest = try jpeg(a, 640, 480, 0xc0, false);
+    try out.appendSlice(a, rest[2..]);
+    try t.expectEqual([2]u32{ 640, 480 }, imageSize(out.items).?);
 }
