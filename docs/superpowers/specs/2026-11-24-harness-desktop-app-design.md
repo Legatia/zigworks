@@ -21,11 +21,28 @@ The owner, 2026-11-24, across one conversation:
 
 > "It should be an desktop app, not on web. Skip female for now."
 
-The mockup from this conversation is the reference for look and layout:
-https://claude.ai/artifact/NnXy5J39fEoiQFwsmxavC1 (Desktop app; the female
-version; the states sheet). The clips and stills made for it are in the
-owner's Downloads folder (named below). This design was builder-checked
-against the code, and its answers are folded in.
+2026-11-25:
+
+> "What if we try to build the face with blender 3d? More flexible for
+> expressions just user custom will be more complicated" / "Build it. Try
+> your best to make it realistic"
+
+> "Use 3d head. Finish the frontend now"
+
+**Approved by the owner on 2026-11-25, with the avatar as a live 3D head**
+(this revision) instead of video clips.
+
+The references:
+
+- **Look and layout:** the mockup, https://claude.ai/artifact/NnXy5J39fEoiQFwsmxavC1
+  (Desktop app; the states sheet).
+- **The avatar:** the 3D head prototype, https://claude.ai/artifact/KsZmbH6vXA6qLaPmSrVdW8.
+  Its code and data are in `~/Downloads/butler-3d-head/` (README.txt
+  there): `prototype.html`, the render and behaviour; `fit.html`, the fit;
+  `head.bin`, `eyes.png` and `eyemask.png`, the fitted butler.
+
+The design was builder-checked against the code, and its answers are
+folded in.
 
 ## Intent
 
@@ -57,10 +74,13 @@ assistant.
    Telegram.
 3. **The side panel:** Needs you, Topics and Lately.
 4. **The avatar:**
-   - a choice of the built-in male or the owner's upload (female later);
-   - motion from a clip pack;
+   - a live 3D head: the portrait fitted onto a rigged head with the 52
+     standard (ARKit) expression shapes;
+   - a choice of the built-in butler or the owner's upload (female later);
+   - motion generated live: blinks, gaze, breathing, nods, expressions and
+     lip-sync;
    - states from harness's own state, never from the model.
-5. **Speech:** the desk can speak replies; the avatar talks only while the
+5. **Speech:** the desk can speak replies; the mouth moves only while the
    voice does.
 6. **The look:** the mockup's sharp dark style, with no outside hosts.
 
@@ -72,9 +92,13 @@ assistant.
 - Drawing the interface natively per system: inside the window it's HTML
   in the system's web view, as in most desktop apps; no Electron, no
   bundled browser.
-- Exact lip-sync on every word. That's a later GPU add-on (LiveTalking).
-- Generating avatar clips from inside harness. The owner makes them with
-  a tool they have, following the desk's guide.
+- Exact lip-sync on every sound. Mouth shapes are estimated from the
+  reply's text, timed by the voice; exact timing is a later add-on.
+- Head turns beyond what one photo shows. The head turns a few degrees at
+  most (about ±4°).
+- Making the eyes-closed portrait from inside harness. The owner makes it
+  with an image tool, following the desk's guide; without it, the closed
+  eyes are drawn.
 
 ## Anti-goals
 
@@ -82,10 +106,11 @@ assistant.
   closed, or attentive with real blinks.
 - **Looping speech.** One spoken message per reply, with talking motion
   only while the voice plays.
-- **Fake blinks.** No swapping stills; blinks come only from video.
+- **Fake blinks.** No swapping or cross-fading whole stills: the lid moves
+  over the eye, and a full close lands on the eyes-closed portrait.
 - **The model choosing the avatar's mood or the status text.** States and
   status lines come from harness's own facts.
-- **Outside hosts.** Fonts, scripts, images and clips are all served by
+- **Outside hosts.** Fonts, scripts, images and the avatar are all served by
   harness.
 - **Tokens on disk.** The desk is entered without writing a reusable
   credential to a file (see "Getting in").
@@ -171,7 +196,8 @@ own through the bridge's `reenter`; you don't notice.
 - the Cookie header, and Set-Cookie;
 - POST on the desk paths;
 - a 10 MB body limit for the voice and upload paths only;
-- 20 MB byte-range serving from `avatars/`.
+- serving the avatar files from `avatars/` and the fit files from
+  `desk-assets/` (up to 20 MB a file, for these paths only).
 
 The new owner-acting desk paths answer only to the session cookie:
 
@@ -201,10 +227,11 @@ token path as today.
   `%LOCALAPPDATA%\harness\desk-webview`. If the WebView2 Runtime is
   missing (a few Windows 10 machines), the app says so and links
   Microsoft's installer. CI's smoke installs the runtime first.
-- **Linux:** MP4 (H.264) needs `gstreamer1.0-libav` and
-  `gstreamer1.0-plugins-bad`. The README and CI install them. WebKitGTK has
-  no speech synthesis, so `speak = browser` isn't offered on Linux; a
-  provider, or off.
+- **WebGL 2 is on** in every web view, since the avatar draws with it.
+  WebKitGTK needs `enable-webgl` and its hardware acceleration policy set to
+  always.
+- **Linux:** WebKitGTK has no speech synthesis, so `speak = browser` isn't
+  offered on Linux; a provider, or off.
 
 **Badge and attention:**
 
@@ -322,12 +349,23 @@ does:
 
 | State | When | Avatar |
 |---|---|---|
-| urgent | an urgent item or alert is open | attentive loop, no nods; red frame |
-| speaking | the voice is reading a reply | talking clip while the voice plays |
-| needs you | an inbox item is open | attentive loop; the glance clip once when it arrives; magenta frame |
-| working | a run is in progress | attentive loop, with a nod or thinking clip every 9–16 s; cyan frame |
-| quiet | quiet hours | resting loop, dimmed |
-| resting | none of the above | resting loop: eyes closed, breathing |
+| urgent | an urgent item or alert is open | eyes on you, brows raised, no nods; red frame |
+| speaking | the voice is reading a reply | lip-sync while the voice plays; brows lift on long words; a small nod at each sentence's end |
+| needs you | an inbox item is open | eyes on you, brows a little raised; one glance toward you when an item arrives; magenta frame |
+| working | a run is in progress | thinking: gaze up and aside, brow drawn, a glance back now and then, a nod every 9–16 s; cyan frame |
+| quiet | quiet hours | eyes closed, slow breathing, dimmed |
+| resting | none of the above | eyes closed, breathing |
+
+**Two moments, also from facts:**
+
+- A run that ends with a reply gives a brief smile, 2 s.
+- A run that ends in an error gives a brief concern.
+
+**Always moving.** Each state keeps the live layer running: breathing, a
+slight drift of the head, saccades with the lids following the gaze, and
+blinks every 2.5–6 s (more often while speaking). With eyes closed there
+are no blinks, but slower, deeper breathing. Nothing loops: the timings are
+random within their ranges.
 
 ### The status card
 
@@ -349,93 +387,167 @@ The card reads, for example:
 When it's resting, the card shows the next thing coming, from the
 cards. "See the work" opens the Work topic's latest post.
 
-### The clip pack
+### How the head works
 
-An avatar is a folder, `avatars/NAME/`, with `avatar.ini` naming its
-files. A still may be JPEG or PNG; uploads keep their own format, and
-nothing is re-encoded.
+This is the prototype's method; its code is the reference.
+
+- **The portrait is projected onto a rigged head.**
+  - The base head is three.js's Face Cap sample: a neutral head with the
+    52 ARKit expression shapes, teeth and eyes.
+  - It's fitted to the portrait: face landmarks are found on the photo and
+    on a render of the head (MediaPipe Face Landmarker), then a similarity
+    transform and an RBF warp map the head onto the photo.
+  - The photo becomes the texture by projection, so at rest the head looks
+    exactly like the portrait.
+- **The expression shapes are carried through the warp,** so every shape
+  acts where the photo's features are.
+- **Eyes:**
+  - The eyeballs are spheres behind the eye openings, textured from a
+    cleaned crop of the photo's eyes (the reflections removed). A
+    reflection is drawn live, so it stays put as the eyes move.
+  - The openings are cut by the photo's eye outline, and the eyeballs show
+    only there (a stencil).
+- **Blinks:** the lids close by the blink shapes. Near a full close, the
+  eye region blends into the eyes-closed portrait, projected onto the
+  closed lids. Without that portrait, the closed lid is drawn in the
+  lid's own skin tone.
+- **The mouth:**
+  - The inside is the head's own mouth geometry, coloured dark: a roof, a
+    tongue-coloured floor and the inner lips. It's found by what's hidden
+    at rest.
+  - It's drawn behind the teeth.
+  - The upper teeth are seated at the lip line. A lower row rides on the
+    jaw.
+- **The rest of the portrait** (hair, neck, shoulders, background) is a
+  backplate. It follows the head by the face's depth and rises with each
+  breath.
+- **Lighting:** a relight term shades the deformations against the
+  photo's own light, so a smile or an open jaw reads in 3D.
+- **Rendering:** WebGL 2 through three.js. three.js is pinned at r170,
+  vendored in the binary, and its MIT notice is kept. The desk draws at 30
+  frames a second when resting or quiet, and stops while the window is
+  hidden. Without WebGL 2, the desk shows the still, breathing by a 0.6%
+  scale ease.
+
+### The avatar pack
+
+An avatar is a folder, `avatars/NAME/`, with `avatar.ini` naming its files.
 
 | File | What it is |
 |---|---|
-| `still` | the portrait, eyes open |
-| `closed` | the portrait, eyes closed |
-| `rest.mp4` | eyes closed, breathing; starts and ends on `closed`; loops |
-| `attentive.mp4` | eyes open, breathing, real blinks; starts and ends on `still`; back to back |
-| `nod.mp4`, `glance.mp4`, `smile.mp4`, `concern.mp4` | expressions starting and ending on `still` |
-| `talk.mp4` | speaking motion, starting and ending on `still` |
-| `wake.mp4`, `sleep.mp4` | `closed` to `still`, and back |
+| `still` | the portrait, eyes open, facing the camera, mouth closed (JPEG or PNG) |
+| `closed` | optional: the same portrait with the eyes closed, nothing else changed |
+| `head` | the fitted head (`head.bin`): a JSON header and arrays (positions, normals, the two projections, the 52 shapes, teeth, eye and mouth data), versioned |
+| `eyes` | the cleaned eye crop (PNG) |
+| `eyemask` | where the eyes-closed portrait blends (PNG) |
 
-**Playback:**
-
-- One clip plays at a time, over the still.
-- A change happens only at a clip's end, so joins are matching frames.
-- A missing clip falls back: no `wake` means a cut; no `nod` means
-  attentive only.
-- A pack with only a still breathes by a 0.6% scale ease over 4 s.
+A pack with only a still hasn't been fitted yet: it shows the still,
+breathing, and the desk offers to fit it.
 
 **Serving the pack** (the app server learns to):
 
-- serve `mp4`, `jpeg`, `png` and `woff2` from `avatars/` to the desk,
-  with HTTP byte ranges (206; Safari needs them);
-- up to 20 MB a file, for this path only;
-- `Cache-Control: private, max-age=86400` with an ETag. Not `no-store`
-  here, so clips aren't fetched again at every switch.
+- serve `avatars/` files to the desk, up to 20 MB a file, for this path
+  only;
+- with `Cache-Control: private, max-age=86400` and an ETag, not
+  `no-store`, so the head isn't fetched again at every load.
 
-**Checking a pack:**
+**Checking a pack:** `harness avatar check NAME`, std only, checks:
 
-- `harness avatar check NAME` checks the structure, std only: the files
-  exist, their types by magic bytes, their sizes, and `avatar.ini`.
-- The frame match is checked in the desk, where the browser decodes video
-  and images. "Check pack" in the avatar settings draws each clip's first
-  and last frames and its still to a canvas, at the clip's size. It
-  reports the mean difference per clip, and passes under about 4 out of
-  255 (the samples measured about 2).
+- the files exist, with their types by magic bytes and their sizes;
+- `avatar.ini`;
+- the head's header: its version, vertex count, shape names, and that its
+  arrays fit the file.
+
+### Fitting a portrait
+
+The fit runs in the desk, where the browser has WebGL and can run the
+landmark model. It's the prototype's `fit.html` made into a step of the
+Avatar settings.
+
+**What it needs, the fit files** (`desk-assets/`, from the release archive,
+not in the binary because of their size):
+
+- MediaPipe's tasks-vision 0.10.14 module and WebAssembly, and its face
+  landmarker model (Apache 2.0, pinned by SHA-256);
+- the base head (`base-head.bin`): the Face Cap head made neutral and the
+  landmarks found on its render.
+
+The base head is made once by a dev page from `facecap.glb` (three.js
+r170, SHA-256 `6bfce6d0fcbb5839f5102b79733007859fef7c5df6d9eb49e2264542810b5f64`).
+Face Cap's license isn't verified, so:
+
+- `facecap.glb`, `base-head.bin` and the fitted butler stay out of the
+  repository and out of releases until it's cleared (gaps list);
+- the test suite uses a small made-up head instead.
+
+**What it checks first:**
+
+- one face;
+- facing the camera, within 8°;
+- eyes open and mouth closed, by the landmarker's own blink and jaw
+  scores.
+
+When a check fails, it says so, for example: "Use a photo facing the
+camera with the mouth closed."
+
+**For the eyes-closed version:** it must line up with the still. The
+landmarks outside the eyes may move by at most 12 px; the butler's pair
+moved about 8. If not: "This eyes-closed photo doesn't line up with the
+portrait. Change only the eyes."
+
+**What it writes:** `head`, `eyes` and `eyemask` go into the avatar's
+folder through the upload path, and the avatar switches to the fitted head.
 
 ### Built-in avatars
 
-- **The male pack ships in the release archive** under `avatars/`, not in
-  the binary (about 12 MB). `harness init` copies it to the data folder.
-- **The male pack's files** (made 2026-11-24):
+- **The butler** (male), made 2026-11-24/25:
 
   | Pack file | Source |
   |---|---|
   | `still` | `Neon Cyborg Officer (Clean Skin).jpg` |
   | `closed` | `Neon Cyborg Officer (Eyes Closed).jpg` |
-  | `talk` | `neon_cyberpunk_headshot.mp4` |
-  | `nod` | `neon_male_performer.mp4` |
-  | `attentive` | `neon host portrait.mp4` |
-  | `rest` | `neon_suited_man.mp4` |
+  | `head`, `eyes`, `eyemask` | `~/Downloads/butler-3d-head/` (the prototype's fit) |
 
-  Still to make: `wake`, `sleep`, `glance`, `smile` and `concern`.
-- **The female avatar is skipped for now** (the owner, 2026-11-24). Only
-  her still exists (`Neon Butler Portrait (Female).jpg`). This round ships
-  the male pack alone.
-- **Shipping** the generated portraits publicly is the owner's call
-  before a release, and is noted in the gaps list.
+  These ship in the release archive under `avatars/`, which `harness init`
+  copies to the data folder. That happens only after the owner clears the
+  portraits' and Face Cap's licensing. Until then, the build takes them
+  from the owner's Downloads folder for local use.
+- **The female avatar is skipped for now** (the owner, 2026-11-24).
+- The old video clips are no longer used.
 
 ### Your own avatar
 
 The Avatar settings in the desk:
 
-- **Choose** the built-in male, or one of your own (female later). The choice is written to
-  `[desk] avatar` through harness's write-then-reload path, as `/persona`
-  does.
-- **Upload a photo**, JPEG or PNG, up to 10 MB. The upload requires one
+- **Choose** the built-in butler or one of your own. The choice is written
+  to `[desk] avatar` through harness's write-then-reload path, as
+  `/persona` does.
+- **Upload a photo,** JPEG or PNG, up to 10 MB. The upload requires one
   ticked line:
 
   > This is me, someone who agreed, or a made-up character.
 
   The photo stays on this computer, in `avatars/NAME/`.
-- **An upload works at once** as a breathing still.
-- **For full motion**, the desk's guide lists the clips to make:
-  - each with its prompt, its first and last frame (`still` or `closed`)
-    and its length (3–4 s);
-  - a rough cost (about 600–850 credits a clip on Kling 4.0 through
-    mitte.ai at today's prices);
-  - and where to put each file.
+- **Fitting runs at once,** taking a few seconds, and the head goes live.
+  While it runs, the still breathes.
+- **"Add an eyes-closed version"** takes a second photo. The guide says
+  how to make one: ask an image tool to close the eyes and change nothing
+  else. It's one image edit, not a video.
 
-  Then "Check pack" shows what passes, and what each missing clip falls
-  back to.
+### The avatar module
+
+The desk page and the avatar meet at one plain-JS module, so they can be
+built apart:
+
+- `createAvatar(element, packUrl, options)` loads a pack and starts
+  drawing;
+- `setState(state)` takes one of the six states above;
+- `moment("smile" | "concern")` plays a brief expression;
+- `arrive()` plays the glance for a new item;
+- `speak({ text, audioUrl })`, or `speak({ text, browser: true })`, plays
+  the voice and lip-syncs; it resolves when the voice ends;
+- `stop()` ends speech;
+- `fit(photo, closedPhoto)` returns the pack files.
 
 ## Speech
 
@@ -451,8 +563,14 @@ The Avatar settings in the desk:
     sentences, then "The rest is on screen."
   - Urgent alerts are always spoken while the desk is open and not muted.
   - Quiet hours: urgent alerts only.
-- **Talking motion:** `talk.mp4` from its start, repeated while the voice
-  still plays, ending on its last frame. Then back to the state's loop.
+- **Lip-sync:**
+  - The spoken text becomes a timeline of mouth shapes (visemes, mapped to
+    the ARKit shapes).
+  - With the browser's voice, its word boundaries keep the timeline in
+    step.
+  - With a provider's audio, the timeline is stretched to the audio's
+    length, and the jaw follows the audio's loudness.
+  - The mouth moves only while the voice plays.
 - **No click needed:** the desk app's web view is set to play media and
   speech without one, so an urgent alert is spoken at once.
 - **"Play the message"** replays the last spoken reply.
@@ -472,15 +590,19 @@ From the mockup:
 - **Type:** Chakra Petch for the interface, JetBrains Mono for readouts.
   Both are OFL; the WOFF2 files are embedded.
 - **Accessibility:** contrast at least 4.5:1, targets at least 44 px,
-  visible focus. With reduced motion, the sweep and the scale breathing
-  stop, and clips play only when speaking.
+  visible focus. With reduced motion:
+  - the sweep stops;
+  - the head keeps blinking and breathing, but drops the drift and nods;
+  - the mouth moves only when speaking.
 - **Sizes:** layout from 1024 px wide. Under 900 px the side panel goes
   below the chat.
 
 ## Constraints
 
-- Zig 0.17.1, std only, on harness's side, built as today. The desk is HTML, CSS and
-  plain JS in the binary, with no build step.
+- Zig 0.17.1, std only, on harness's side, built as today. The desk is
+  HTML, CSS and plain JS in the binary, with no build step. three.js r170
+  (MIT) is vendored as one pinned file in the binary. The fit files are
+  in the release archive.
 - **The desk app is the one exception:** it links each system's own window
   and web-view libraries (Cocoa and WebKit; WebView2 and its loader; GTK
   and WebKitGTK 4.1). It's built on each system, not cross-built. The CI
@@ -513,13 +635,16 @@ From the mockup:
   - urgent items;
   - the run view: label, helpers and start time;
   - the state table;
-  - serving with byte ranges and caching;
-  - `avatar check` on good and bad packs;
+  - serving the avatar files with caching;
+  - `avatar check` on good and bad packs, with the made-up head;
   - the smoke opens the desk over HTTP and drives one message.
 - **Docs:**
   - the README: Desk; Avatar packs; Speech; the local-app limit;
-  - the gaps list: pack licensing, the female clips, the GPU add-on, clip
-    generation by API;
+  - the gaps list:
+    - Face Cap's license, and an own base head if it isn't cleared;
+    - the portraits' licensing;
+    - the female avatar;
+    - exact lip-sync timing;
   - the ledger and the Windows handoff.
 
 ## Who builds what
@@ -556,8 +681,13 @@ From the mockup:
 - **Private conversations' desk history stays in memory only.**
 - **States and the status card come from harness's facts,** never from
   model text.
-- **The built-in male pack ships beside the binary;** female comes later.
-  Speech is off by default.
-- **Uploads work as a still at once.** Full motion comes from a pack you
-  make with the guide.
+- **The avatar is a live 3D head** fitted to the portrait (the owner's
+  choice, 2026-11-25), not video clips:
+  - three.js is vendored;
+  - the fit runs in the desk;
+  - the fit files ship beside the binary.
+- **The built-in butler ships beside the binary,** once its licensing is
+  cleared. Female comes later. Speech is off by default.
+- **Uploads are fitted at once,** in the desk. The eyes-closed version is
+  optional, and made with the owner's own image tool.
 - **Upload requires the consent line.**

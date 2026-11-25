@@ -5,6 +5,45 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the desk is approved, with a 3D head (2026-11-25)
+
+> "Use 3d head. Finish the frontend now"
+
+Spec: `docs/superpowers/specs/2026-11-24-harness-desktop-app-design.md`, now
+approved, with the avatar as a live 3D head (WebGL 2, three.js vendored)
+instead of video clips.
+
+**The Mac session is building:**
+
+- harness's side and the desk page, on `platform/desk`;
+- the avatar module, on `platform/desk-avatar`;
+- the macOS app, on `platform/desk-mac`.
+
+**Yours, as the spec's "Who builds what" says:**
+
+- the Windows app (WebView2, `WebView2Loader.dll` loaded at run time,
+  `WebView2.h`'s C interfaces from Zig);
+- the Linux app (GTK 3 and WebKitGTK 4.1, tested in WSLg).
+
+Both run against the same pages and entry. What changed for you with the
+3D head:
+
+- **WebGL 2 must be on.** WebView2 has it. WebKitGTK needs `enable-webgl`
+  and its hardware acceleration policy set to always; WSLg may draw it in
+  software, so check the frame rate.
+- **No video any more,** so the GStreamer MP4 plugins aren't needed on
+  Linux.
+- **The entry protocol is unchanged:**
+  - `state/open-request`, then `state/desk-code` (60 s, used once), then
+    `GET /enter?code=…`, which sets the session cookie;
+  - `GET /alive` every 5 s while disconnected;
+  - the bridge messages `{"badge": N}`, `{"attention": "urgent"}` and
+    `{"reenter": true}`;
+  - `state/desk.json` for the port and the binary.
+
+`platform/desk` defines the exact paths. Pull it when it lands, or build
+against the spec and adjust.
+
 ## For you: the owner answered question 3 (2026-11-24)
 
 > "Move money with a budget. Sandbox on priority"
