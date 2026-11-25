@@ -5525,7 +5525,7 @@ pub const Core = struct {
                 .port = port,
                 .log = &c.log,
                 .version = @import("build_options").version,
-                .desk = .{ .home = c.paths.home, .state = c.paths.state },
+                .desk = .{ .home = c.paths.home, .state = c.paths.state, .exe_dir = c.exe_dir },
             }) catch |e| switch (e) {
                 error.AddressInUse, error.AccessDenied => if (i + 1 < tries) continue else return e,
                 else => return e,
@@ -14834,47 +14834,75 @@ pub const Core = struct {
 
     /// `POST settings {"avatar":NAME}`, `{"speak":VALUE}`,
     /// `{"speak_model":M}` or `{"speak_voice":V}` ("": the kind's
-    /// default): `[desk]` in config.ini, written and applied (as /persona
-    /// does). Choosing a provider of another kind than the one before
-    /// clears the model and the voice, which were the other kind's.
+    /// default), one at a time: `[desk]` in config.ini, written and
+    /// applied (as /persona does). Choosing a provider of another kind than
+    /// the one config.ini names clears the model and the voice, which were
+    /// the other kind's.
     fn deskSettings(c: *Core, a: std.mem.Allocator, body: []const u8) !appserver.Answer {
+        if (try c.deskSettingWrite(a, body)) |refused| return refused;
+        // applied after the write's lock: a reload that waits for a run
+        // holds up no other setting
+        if (c.applySetup()) |why| return deskErr(a, .conflict, why);
+        return .{ .body = "{\"ok\":true}" };
+    }
+
+    /// deskSettings' change written to config.ini, one writer at a time;
+    /// null when written, else the refusal.
+    fn deskSettingWrite(c: *Core, a: std.mem.Allocator, body: []const u8) !?appserver.Answer {
         const shape = "{\"avatar\":NAME}, {\"speak\":VALUE}, {\"speak_model\":M} or {\"speak_voice\":V}";
         const v = jv.parse(a, body) orelse return deskErr(a, .bad_request, shape);
+        // exactly one setting, its value a string
         var key: []const u8 = "";
         var value: []const u8 = "";
+        for ([_][]const u8{ "avatar", "speak", "speak_model", "speak_voice" }) |k| if (jv.get(v, k)) |x| {
+            if (key.len > 0) return deskErr(a, .bad_request, "One setting at a time: " ++ shape);
+            key = k;
+            value = jv.str(x) orelse return deskErr(a, .bad_request, shape);
+        };
+        if (key.len == 0) return deskErr(a, .bad_request, shape);
+        // one writer of config.ini at a time (setup's answers take it too)
+        c.setup_mutex.lockUncancelable(c.io);
+        defer c.setup_mutex.unlock(c.io);
         var text = c.readOr(a, c.paths.config);
-        if (jv.str(jv.get(v, "avatar"))) |name| {
-            if (!config.avatarName(name)) return deskErr(a, .bad_request, "no such avatar");
+        if (std.mem.eql(u8, key, "avatar")) {
+            if (!config.avatarName(value)) return deskErr(a, .bad_request, "no such avatar");
             const there = for (try c.deskAvatars(a)) |x| {
-                if (std.mem.eql(u8, x, name)) break true;
+                if (std.mem.eql(u8, x, value)) break true;
             } else false;
             if (!there) return deskErr(a, .bad_request, "no such avatar");
-            key = "avatar";
-            value = name;
-        } else if (jv.str(jv.get(v, "speak"))) |sp| {
-            const offered = std.mem.eql(u8, sp, "off") or (std.mem.eql(u8, sp, "browser") and builtin.os.tag != .linux) or for (c.deskSpeakers(a)) |x| {
-                if (std.mem.eql(u8, x, sp)) break true;
-            } else false;
+        } else if (std.mem.eql(u8, key, "speak")) {
+            // what harness runs with, read under its lock (a /reload frees it)
+            const offered, const kind = blk: {
+                c.settings_mutex.lockUncancelable(c.io);
+                defer c.settings_mutex.unlock(c.io);
+                const on = std.mem.eql(u8, value, "off") or (std.mem.eql(u8, value, "browser") and builtin.os.tag != .linux) or for (c.deskSpeakers(a)) |x| {
+                    if (std.mem.eql(u8, x, value)) break true;
+                } else false;
+                break :blk .{ on, config.speakApi(c.cfg, value) };
+            };
             if (!offered) return deskErr(a, .bad_request, "speak is off, browser, or a provider that can speak (api = openai or gemini)");
-            key = "speak";
-            value = sp;
-            if (config.speakApi(c.cfg, sp)) |kind| {
-                const was = config.speakApi(c.cfg, c.cfg.desk.speak);
-                if (was == null or was.? != kind) {
+            if (kind) |k| {
+                const was = c.writtenSpeakKind(a, text);
+                if (was == null or was.? != k) {
                     text = try mail_mod.unsetKey(a, text, "desk", "speak_model");
                     text = try mail_mod.unsetKey(a, text, "desk", "speak_voice");
                 }
             }
-        } else if (jv.str(jv.get(v, "speak_model")) orelse jv.str(jv.get(v, "speak_voice"))) |given| {
-            key = if (jv.get(v, "speak_model") != null) "speak_model" else "speak_voice";
-            value = given;
-            if (given.len > 0 and !speakName(given)) return deskErr(a, .bad_request, "Model and voice use letters, digits and . _ - : / @ +, up to 100.");
-        } else return deskErr(a, .bad_request, shape);
+        } else if (value.len > 0 and !speakName(value)) return deskErr(a, .bad_request, "Model and voice use letters, digits and . _ - : / @ +, up to 100.");
         text = if (value.len == 0) try mail_mod.unsetKey(a, text, "desk", key) else try mail_mod.setKey(a, text, "desk", key, value);
         c.writeSetting(c.paths.config, text) catch |e| return deskErr(a, .internal_server_error, try std.fmt.allocPrint(a, "Not changed: config.ini could not be written ({s}).", .{@errorName(e)}));
         c.log.write(.config, false, .{ .event = "desk setting", .key = key, .value = value }) catch {};
-        if (c.applySetup()) |why| return deskErr(a, .conflict, why);
-        return .{ .body = "{\"ok\":true}" };
+        return null;
+    }
+
+    /// The kind of voice config.ini's `[desk] speak` names, by the file's
+    /// own providers: a switch whose reload waited, or a hand edit, counts.
+    /// The file unreadable: what harness runs with.
+    fn writtenSpeakKind(c: *Core, a: std.mem.Allocator, text: []const u8) ?model.Api {
+        if (config.parse(a, text)) |written| return config.speakApi(written, written.desk.speak) else |_| {}
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
+        return config.speakApi(c.cfg, c.cfg.desk.speak);
     }
 
     /// A speech model's or voice's name as the desk takes it: 1 to 100 of
@@ -15214,6 +15242,13 @@ pub const Core = struct {
 
     /// The desk's settings and their choices.
     fn deskSettingsJson(c: *Core, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        // the fit's files: all there in one place or another, and the
+        // folder they go in (the data folder's); looked at before the lock
+        const dirs = try appserver.assetDirs(a, c.paths.home, c.exe_dir);
+        const fit_there = appserver.fitFilesThere(c.io, a, dirs);
+        // read under the settings' lock: a /reload frees them
+        c.settings_mutex.lockUncancelable(c.io);
+        defer c.settings_mutex.unlock(c.io);
         const d = c.cfg.desk;
         try out.appendSlice(a, "{\"avatar\":");
         try util.jsonString(out, a, d.avatar);
@@ -15256,22 +15291,32 @@ pub const Core = struct {
             try util.jsonString(out, a, if (c.providers.find(name)) |p| p.key_name else name);
             try out.append(a, '}');
         }
-        try out.print(a, "],\"echo\":{s},\"voice\":{s}}}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+        try out.print(a, "],\"echo\":{s},\"voice\":{s}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+        try out.print(a, ",\"fit_files\":{s},\"fit_dir\":", .{if (fit_there) "true" else "false"});
+        try util.jsonString(out, a, dirs[0]);
+        try out.append(a, '}');
     }
 
-    /// The avatars there are: `avatars/`'s folders, butler first.
+    /// The avatars there are: `avatars/`'s folders, butler first (its pack
+    /// is held until its portraits are cleared, so it's listed only when
+    /// placed by hand).
     fn deskAvatars(c: *Core, a: std.mem.Allocator) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
-        try out.append(a, "butler");
         const dir = try std.fs.path.join(a, &.{ c.paths.home, "avatars" });
         var d = Io.Dir.cwd().openDir(c.io, dir, .{ .iterate = true }) catch return out.items;
         defer d.close(c.io);
+        var butler_there = false;
         var it = d.iterate();
         while (it.next(c.io) catch null) |e| {
-            if (e.kind != .directory or !config.avatarName(e.name) or std.mem.eql(u8, e.name, "butler")) continue;
+            if (e.kind != .directory or !config.avatarName(e.name)) continue;
+            if (std.mem.eql(u8, e.name, "butler")) {
+                butler_there = true;
+                continue;
+            }
             try out.append(a, try a.dupe(u8, e.name));
         }
-        std.mem.sort([]const u8, out.items[1..], {}, struct {
+        if (butler_there) try out.insert(a, 0, "butler");
+        std.mem.sort([]const u8, out.items[@intFromBool(butler_there)..], {}, struct {
             fn lt(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
             }
@@ -36586,7 +36631,72 @@ test "desk_settings_write_and_reload" {
     try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"avatar\":\"me\"}").body);
     try t.expectEqualStrings("me", f.core.cfg.desk.avatar);
     const st = deskCall(&f, .GET, "state", "", "").body;
-    try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"butler\",\"me\"]");
+    try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"me\"]");
+}
+
+test "desk_state_says_whether_the_fit_files_are_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const data = try std.fs.path.join(a, &.{ f.home, "desk-assets" });
+    const bin = try std.fs.path.join(a, &.{ f.e.dir, "bin" });
+    f.core.exe_dir = bin;
+    const fitOf = struct {
+        fn of(fx: *Fix, al: std.mem.Allocator) !struct { there: bool, dir: []const u8 } {
+            const v = jv.parse(al, deskCall(fx, .GET, "state", "", "").body) orelse return error.TestUnexpectedResult;
+            return .{ .there = jv.boolean(jv.at(v, &.{ "settings", "fit_files" })) orelse return error.TestUnexpectedResult, .dir = jv.str(jv.at(v, &.{ "settings", "fit_dir" })) orelse return error.TestUnexpectedResult };
+        }
+    }.of;
+    // none: said, with the data folder's desk-assets/ as where they go
+    const none = try fitOf(&f, a);
+    try t.expect(!none.there);
+    try t.expectEqualStrings(data, none.dir);
+    for (appserver.fit_files) |rel| {
+        const p = try std.fs.path.join(a, &.{ data, rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try t.expect((try fitOf(&f, a)).there);
+    // the base head beside the binary instead: still all there
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ bin, "desk-assets" }));
+    try Io.Dir.cwd().rename(try std.fs.path.join(a, &.{ data, "base-head.bin" }), Io.Dir.cwd(), try std.fs.path.join(a, &.{ bin, "desk-assets", "base-head.bin" }), t.io);
+    try t.expect((try fitOf(&f, a)).there);
+}
+
+test "fit_files_are_there_only_when_all_are" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const data = try std.fs.path.join(a, &.{ f.home, "desk-assets" });
+    // MediaPipe's files without the base head, then all but one wasm
+    for (appserver.fit_files) |rel| {
+        if (std.mem.eql(u8, rel, "base-head.bin")) continue;
+        const p = try std.fs.path.join(a, &.{ data, rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":false");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ data, "base-head.bin" }), .data = "x" });
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":true");
+    try Io.Dir.cwd().deleteFile(t.io, try std.fs.path.join(a, &.{ data, "mediapipe", "wasm", "vision_wasm_nosimd_internal.wasm" }));
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":false");
+}
+
+test "the_avatars_listed_are_the_packs_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a fresh install: the default butler isn't there, so nothing is listed
+    try t.expectEqualStrings("butler", f.core.cfg.desk.avatar);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"avatar\":\"butler\",\"avatars\":[]");
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"avatar\":\"butler\"}").status);
+    // its pack placed: listed, and chosen
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.home, "avatars", "butler" }));
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"avatars\":[\"butler\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"avatar\":\"butler\"}").body);
 }
 
 test "desk_voice_is_transcribed_then_a_turn" {
@@ -36742,6 +36852,77 @@ test "choosing_another_kind_clears_model_and_voice" {
     try t.expectEqualStrings("onyx", f.core.cfg.desk.speak_voice);
     _ = deskCall(&f, .POST, "settings", "", "{\"speak\":\"openai\"}");
     try t.expectEqualStrings("", f.core.cfg.desk.speak_voice);
+}
+
+test "a_second_switch_clears_by_what_was_written" {
+    var f: Fix = undefined;
+    try f.init("[desk]\nspeak = gemini\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    // what harness runs with is gemini; config.ini already says openai with
+    // OpenAI's voice (written by hand, or a switch whose reload waited
+    // while something ran)
+    var text = try mail_mod.setKey(a, f.core.readOr(a, p.config), "desk", "speak", "openai");
+    text = try mail_mod.setKey(a, text, "desk", "speak_voice", "nova");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = text });
+    try t.expectEqualStrings("gemini", f.core.cfg.desk.speak);
+    // switching to gemini is a change of kind from what was written
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"speak\":\"gemini\"}").body);
+    try t.expect(std.mem.indexOf(u8, f.core.readOr(a, p.config), "speak_voice") == null);
+    try t.expectEqualStrings("", f.core.cfg.desk.speak_voice);
+}
+
+test "a_settings_post_writes_only_the_key_it_names" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const p = f.core.paths;
+    const before = f.core.readOr(a, p.config);
+    for ([_][]const u8{
+        "{\"speak_model\":5,\"speak_voice\":\"Charon\"}",
+        "{\"speak\":\"off\",\"speak_voice\":\"x\"}",
+        "{\"speak_model\":\"a\",\"speak_voice\":\"b\"}",
+        "{\"avatar\":7,\"speak\":\"off\"}",
+        "{\"avatar\":7}",
+        "[\"speak\",\"off\"]",
+    }) |body| {
+        const got = deskCall(&f, .POST, "settings", "", body);
+        if (got.status != .bad_request) std.debug.print("{s}: {d}\n", .{ body, @backingInt(got.status) });
+        try t.expectEqual(std.http.Status.bad_request, got.status);
+    }
+    try t.expectEqualStrings(before, f.core.readOr(a, p.config));
+}
+
+test "desk_settings_written_one_at_a_time" {
+    var f: Fix = undefined;
+    try f.init("[desk]\nspeak = openai\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const W = struct {
+        fn run(c: *Core, key: []const u8, prefix: []const u8) void {
+            var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+            defer arena.deinit();
+            const al = arena.allocator();
+            for (0..20) |i| {
+                const body = std.fmt.allocPrint(al, "{{\"{s}\":\"{s}{d}\"}}", .{ key, prefix, i }) catch return;
+                const got = Core.deskApi(c, al, .{ .method = .POST, .path = "settings", .query = "", .body = body, .stop = &app_never_stops });
+                if (got.status != .ok) std.debug.print("{s}: {d} {s}\n", .{ body, @backingInt(got.status), got.body });
+            }
+        }
+    };
+    // as the page does when Voice is typed and the provider then changed:
+    // two settings at once, many times
+    const t1 = try std.Thread.spawn(.{}, W.run, .{ f.core, "speak_model", "m" });
+    const t2 = try std.Thread.spawn(.{}, W.run, .{ f.core, "speak_voice", "v" });
+    t1.join();
+    t2.join();
+    const text = f.core.readOr(a, f.core.paths.config);
+    try expectHas(text, "speak_model = m19");
+    try expectHas(text, "speak_voice = v19");
+    try t.expectEqualStrings("m19", f.core.cfg.desk.speak_model);
+    try t.expectEqualStrings("v19", f.core.cfg.desk.speak_voice);
 }
 
 test "desk_settings_list_every_speaker_with_its_defaults" {

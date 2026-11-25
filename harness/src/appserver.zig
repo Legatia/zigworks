@@ -39,6 +39,9 @@ pub const DeskOptions = struct {
     home: []const u8,
     /// DATA/state: `open-request` and `desk-code`.
     state: []const u8,
+    /// The folder harness's binary is in ("": unknown): the fit files are
+    /// looked for beside it too, and in an app bundle's Resources.
+    exe_dir: []const u8 = "",
 };
 
 /// One call of the desk's API (`/desk/api/PATH`), its session checked.
@@ -194,6 +197,8 @@ pub const Server = struct {
     /// the thread that answers `state/open-request`.
     desk_home: []u8 = &.{},
     desk_state: []u8 = &.{},
+    /// Where `/desk/assets/` comes from, in order (assetDirs).
+    asset_dirs: []const []const u8 = &.{},
     codes: deskwin.Codes = .{},
     sessions: deskwin.Sessions = .{},
     desk_thread: ?std.Thread = null,
@@ -225,7 +230,14 @@ pub const Server = struct {
         _ = std.base64.url_safe_no_pad.Encoder.encode(&s.shell_token, &raw);
         if (o.desk) |d| {
             s.desk_home = try gpa.dupe(u8, d.home);
+            errdefer gpa.free(s.desk_home);
             s.desk_state = try gpa.dupe(u8, d.state);
+            errdefer gpa.free(s.desk_state);
+            s.asset_dirs = try assetDirs(gpa, d.home, d.exe_dir);
+            errdefer {
+                for (s.asset_dirs) |x| gpa.free(x);
+                gpa.free(s.asset_dirs);
+            }
             s.desk_thread = try std.Thread.spawn(.{}, deskLoop, .{s});
         }
         if (s.log) |l| l.write(.app, false, .{ .event = "server started", .port = s.port }) catch {};
@@ -282,6 +294,8 @@ pub const Server = struct {
         s.gpa.free(s.version);
         s.gpa.free(s.desk_home);
         s.gpa.free(s.desk_state);
+        for (s.asset_dirs) |d| s.gpa.free(d);
+        s.gpa.free(s.asset_dirs);
         s.gpa.destroy(s);
     }
 
@@ -495,8 +509,9 @@ pub const Server = struct {
             return s.respond(req, .ok, body, contentType(rel), o, .desk, null);
         }
         if (std.mem.startsWith(u8, path, "/desk/apps/")) return s.deskApp(a, rq, path["/desk/apps/".len..]);
-        // the owner's avatars and the fit's files, from the data folder
-        var dir: []const u8 = "";
+        // the owner's avatars, from the data folder; the fit's files from
+        // the first place that has them (assetDirs)
+        var dirs: []const []const u8 = &.{};
         var rel: []const u8 = "";
         if (std.mem.startsWith(u8, path, "/desk/avatars/")) {
             const rest = path["/desk/avatars/".len..];
@@ -504,16 +519,19 @@ pub const Server = struct {
             const name = rest[0..slash];
             rel = rest[slash + 1 ..];
             if (!config.avatarName(name) or std.mem.indexOfScalar(u8, rel, '/') != null) return s.plain(req, .not_found, "No such file.", o, null);
-            dir = try std.fs.path.join(a, &.{ s.desk_home, "avatars", name });
+            dirs = try a.dupe([]const u8, &.{try std.fs.path.join(a, &.{ s.desk_home, "avatars", name })});
         } else if (std.mem.startsWith(u8, path, "/desk/assets/")) {
             rel = path["/desk/assets/".len..];
-            dir = try std.fs.path.join(a, &.{ s.desk_home, "desk-assets" });
+            dirs = s.asset_dirs;
         } else return s.plain(req, .not_found, "No such file.", o, null);
         if (!deskName(rel)) return s.plain(req, .not_found, "No such file.", o, null);
-        const body = readDeskFile(s.io, a, dir, rel) catch |e| switch (e) {
-            error.TooBig => return s.plain(req, .payload_too_large, "Files here are at most 20 MB.", o, null),
-            else => return e,
-        } orelse return s.plain(req, .not_found, "No such file.", o, null);
+        const body = for (dirs) |dir| {
+            const got = readDeskFile(s.io, a, dir, rel) catch |e| switch (e) {
+                error.TooBig => return s.plain(req, .payload_too_large, "Files here are at most 20 MB.", o, null),
+                else => return e,
+            };
+            if (got) |b| break b;
+        } else return s.plain(req, .not_found, "No such file.", o, null);
         const tag = deskwin.etag(body);
         const cache = "private, max-age=86400";
         if (std.mem.eql(u8, std.mem.trim(u8, rq.if_none, " "), &tag)) return s.respondEx(req, .not_modified, "", contentType(rel), o, .plain, null, .{ .cache = cache, .headers = &.{.{ .name = "etag", .value = &tag }} });
@@ -881,9 +899,53 @@ fn deskName(rel: []const u8) bool {
     return false;
 }
 
-/// `rel` in `dir` as `readFileIn` reads it, up to 20 MB (error.TooBig
-/// past it); null: not there, or not a file.
-fn readDeskFile(io: Io, a: std.mem.Allocator, dir: []const u8, rel: []const u8) !?[]const u8 {
+/// Where the fit's files (`/desk/assets/`) are looked for, in order: the
+/// data folder's `desk-assets/`, then, when harness's own folder is known,
+/// `desk-assets/` beside the binary and, when that folder is an app
+/// bundle's `Contents/MacOS`, `../Resources/desk-assets/`. In `a`.
+pub fn assetDirs(a: std.mem.Allocator, home: []const u8, exe_dir: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |d| a.free(d);
+        out.deinit(a);
+    }
+    try out.append(a, try std.fs.path.join(a, &.{ home, "desk-assets" }));
+    if (exe_dir.len > 0) {
+        try out.append(a, try std.fs.path.join(a, &.{ exe_dir, "desk-assets" }));
+        if (std.mem.eql(u8, std.fs.path.basename(exe_dir), "MacOS")) if (std.fs.path.dirname(exe_dir)) |up| {
+            if (std.mem.eql(u8, std.fs.path.basename(up), "Contents")) try out.append(a, try std.fs.path.join(a, &.{ up, "Resources", "desk-assets" }));
+        };
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// The files the fit needs (`tools/fetch-desk-assets.sh`'s and the base
+/// head), relative to a place of assetDirs.
+pub const fit_files = [_][]const u8{
+    "mediapipe/vision_bundle.mjs",
+    "mediapipe/wasm/vision_wasm_internal.js",
+    "mediapipe/wasm/vision_wasm_internal.wasm",
+    "mediapipe/wasm/vision_wasm_nosimd_internal.js",
+    "mediapipe/wasm/vision_wasm_nosimd_internal.wasm",
+    "mediapipe/face_landmarker.task",
+    "base-head.bin",
+};
+
+/// Whether every one of fit_files would be served: the first place that
+/// has each has it within 20 MB, as the desk serves it. Stats only.
+pub fn fitFilesThere(io: Io, a: std.mem.Allocator, dirs: []const []const u8) bool {
+    for (fit_files) |rel| {
+        const found = for (dirs) |dir| {
+            if (deskFileAt(io, a, dir, rel) catch null) |f| break f.size <= max_desk_file;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// `rel` in `dir` reached part by part with no link followed: its path
+/// and size when it is a file; null otherwise.
+fn deskFileAt(io: Io, a: std.mem.Allocator, dir: []const u8, rel: []const u8) !?struct { path: []const u8, size: u64 } {
     var path = dir;
     var parts = std.mem.splitScalar(u8, rel, '/');
     while (parts.next()) |part| {
@@ -892,9 +954,17 @@ fn readDeskFile(io: Io, a: std.mem.Allocator, dir: []const u8, rel: []const u8) 
         const last = parts.peek() == null;
         if (last and st.kind != .file) return null;
         if (!last and st.kind != .directory) return null;
-        if (last and st.size > max_desk_file) return error.TooBig;
+        if (last) return .{ .path = path, .size = st.size };
     }
-    return Io.Dir.cwd().readFileAlloc(io, path, a, .limited(max_desk_file)) catch |e| switch (e) {
+    return null;
+}
+
+/// `rel` in `dir` as `readFileIn` reads it, up to 20 MB (error.TooBig
+/// past it); null: not there, or not a file.
+fn readDeskFile(io: Io, a: std.mem.Allocator, dir: []const u8, rel: []const u8) !?[]const u8 {
+    const f = (try deskFileAt(io, a, dir, rel)) orelse return null;
+    if (f.size > max_desk_file) return error.TooBig;
+    return Io.Dir.cwd().readFileAlloc(io, f.path, a, .limited(max_desk_file)) catch |e| switch (e) {
         error.StreamTooLong => error.TooBig,
         else => null,
     };
@@ -1392,6 +1462,24 @@ fn withDesk(f: *Fix, fh: *FakeHost) !void {
     f.host = try std.fmt.allocPrint(f.a, "Host: 127.0.0.1:{d}\r\n", .{f.s.port});
 }
 
+/// As `withDesk`, with harness's binary in `ROOT/app/Contents/MacOS`
+/// (an app bundle): its `desk-assets/` beside it, and
+/// `app/Contents/Resources/desk-assets/`.
+fn withDeskBundle(f: *Fix, fh: *FakeHost) !void {
+    f.s.stop();
+    const root = try f.tmp.dir.realPathFileAlloc(t.io, ".", f.a);
+    try f.tmp.dir.createDirPath(t.io, "state");
+    try f.tmp.dir.createDirPath(t.io, "desk-assets");
+    try f.tmp.dir.createDirPath(t.io, "app/Contents/MacOS/desk-assets");
+    try f.tmp.dir.createDirPath(t.io, "app/Contents/Resources/desk-assets");
+    f.s = try Server.start(t.allocator, t.io, .{ .apps_dir = f.apps_dir, .state_dir = f.state_dir, .version = "0.3.0", .host = fh.host(), .desk = .{
+        .home = root,
+        .state = try std.fs.path.join(f.a, &.{ root, "state" }),
+        .exe_dir = try std.fs.path.join(f.a, &.{ root, "app", "Contents", "MacOS" }),
+    } });
+    f.host = try std.fmt.allocPrint(f.a, "Host: 127.0.0.1:{d}\r\n", .{f.s.port});
+}
+
 /// What the desk app does: asks for a code, reads it, enters; returns the
 /// code and the session's Cookie header line.
 fn enterDesk(f: *Fix) !struct { code: []const u8, cookie: []const u8, entered: Got } {
@@ -1711,6 +1799,145 @@ test "an_app_opens_from_the_desk_in_its_frame" {
     try expectHas(page.body, "<a href=\"/desk\">Desk</a>");
     try t.expectEqual(401, (try get(f.a, f.s.port, "/desk/apps/notes", f.host)).status);
     try t.expectEqual(404, (try get(f.a, f.s.port, "/desk/apps/nothing", with)).status);
+}
+
+test "desk_assets_come_from_the_first_place_that_has_them" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDeskBundle(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    const data = "desk-assets/";
+    const beside = "app/Contents/MacOS/desk-assets/";
+    const bundle = "app/Contents/Resources/desk-assets/";
+    for ([_][]const u8{ data, beside, bundle }) |p| try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}a.txt", .{p}), .data = p });
+    for ([_][]const u8{ beside, bundle }) |p| try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}b.txt", .{p}), .data = p });
+    try f.tmp.dir.createDirPath(t.io, bundle ++ "mediapipe/wasm");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = bundle ++ "mediapipe/wasm/c.wasm", .data = "\x00asm bundle" });
+    try t.expectEqualStrings(data, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
+    try t.expectEqualStrings(beside, (try get(a, f.s.port, "/desk/assets/b.txt", with)).body);
+    const c = try get(a, f.s.port, "/desk/assets/mediapipe/wasm/c.wasm", with);
+    try t.expectEqual(200, c.status);
+    try t.expectEqualStrings("\x00asm bundle", c.body);
+    try expectHas(c.head, "content-type: application/wasm");
+    try expectHas(c.head, "cache-control: private, max-age=86400");
+    const tag = deskwin.etag("\x00asm bundle");
+    try expectHas(c.head, try std.fmt.allocPrint(a, "etag: {s}", .{&tag}));
+    try t.expectEqual(304, (try get(a, f.s.port, "/desk/assets/mediapipe/wasm/c.wasm", try std.fmt.allocPrint(a, "{s}If-None-Match: {s}\r\n", .{ with, &tag }))).status);
+    // gone from the first place: the next one's
+    try f.tmp.dir.deleteFile(t.io, data ++ "a.txt");
+    try t.expectEqualStrings(beside, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
+    try t.expectEqual(404, (try get(a, f.s.port, "/desk/assets/none.txt", with)).status);
+    // avatars stay the data folder's alone
+    try f.tmp.dir.createDirPath(t.io, "app/Contents/MacOS/avatars/me");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "app/Contents/MacOS/avatars/me/avatar.ini", .data = "[avatar]\n" });
+    try t.expectEqual(404, (try get(a, f.s.port, "/desk/avatars/me/avatar.ini", with)).status);
+}
+
+test "desk_assets_without_a_binary_folder_are_the_data_folders" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try t.expectEqual(1, (try assetDirs(a, "/data", "")).len);
+    const dirs = try assetDirs(a, "/data", "/opt/x/Contents/MacOS");
+    try t.expectEqual(3, dirs.len);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), dirs[0]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents/MacOS", "desk-assets" }), dirs[1]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents", "Resources", "desk-assets" }), dirs[2]);
+    // a binary outside an app bundle: no Resources beside its folder
+    const plain = try assetDirs(a, "/data", "/usr/local/bin");
+    try t.expectEqual(2, plain.len);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/usr/local/bin", "desk-assets" }), plain[1]);
+}
+
+test "fit_files_are_judged_as_they_are_served" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const dirs = try assetDirs(a, try std.fs.path.join(a, &.{ root, "data" }), try std.fs.path.join(a, &.{ root, "bin" }));
+    for (fit_files) |rel| {
+        const p = try std.fs.path.join(a, &.{ dirs[1], rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try t.expect(fitFilesThere(t.io, a, dirs));
+    // an oversized copy in the first place answers 413, so it isn't there
+    const big = try a.alloc(u8, max_desk_file + 1);
+    @memset(big, 0);
+    try Io.Dir.cwd().createDirPath(t.io, dirs[0]);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ dirs[0], "base-head.bin" }), .data = big });
+    try t.expect(!fitFilesThere(t.io, a, dirs));
+}
+
+test "desk_assets_never_leave_their_places" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDeskBundle(&f, &fh);
+    const e = try enterDesk(&f);
+    const with = try std.fmt.allocPrint(a, "{s}{s}", .{ f.host, e.cookie });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "app/Contents/MacOS/secret.txt", .data = "binary's folder" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "app/Contents/Resources/secret.txt", .data = "resources" });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "config.ini", .data = "[model]\n" });
+    for ([_][]const u8{
+        "/desk/assets/../secret.txt",
+        "/desk/assets/../../MacOS/secret.txt",
+        "/desk/assets/%2e%2e/secret.txt",
+        "/desk/assets/..%2fsecret.txt",
+        "/desk/assets/mediapipe/../../secret.txt",
+        "/desk/assets//secret.txt",
+        "/desk/assets/\\..\\secret.txt",
+    }) |tr| {
+        const got = try get(a, f.s.port, tr, with);
+        if (got.status != 404 and got.status != 400) std.debug.print("{s}: {d}\n", .{ tr, got.status });
+        try t.expect(got.status == 404 or got.status == 400);
+        try t.expect(std.mem.indexOf(u8, got.body, "resources") == null and std.mem.indexOf(u8, got.body, "binary's") == null);
+    }
+    // a link in a later place: never followed (where links can be made)
+    if (f.tmp.dir.symLink(t.io, "../../../config.ini", "app/Contents/Resources/desk-assets/link.txt", .{})) {
+        try t.expectEqual(404, (try get(a, f.s.port, "/desk/assets/link.txt", with)).status);
+    } else |_| {}
+    if (f.tmp.dir.symLink(t.io, "..", "app/Contents/MacOS/desk-assets/up", .{})) {
+        try t.expectEqual(404, (try get(a, f.s.port, "/desk/assets/up/secret.txt", with)).status);
+    } else |_| {}
+    // past 20 MB in a later place: refused
+    const big = try a.alloc(u8, max_desk_file + 1);
+    @memset(big, 0);
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "app/Contents/MacOS/desk-assets/big.bin", .data = big });
+    try t.expectEqual(413, (try get(a, f.s.port, "/desk/assets/big.bin", with)).status);
+}
+
+test "the_desk_page_draws_an_empty_stage_and_says_when_the_fit_files_are_missing" {
+    const html = deskFile("index.html").?;
+    const js = deskFile("desk.js").?;
+    const css = deskFile("desk.css").?;
+    // no avatar: a head and shoulders drawn in the page, and the way to add one
+    const stage = std.mem.indexOf(u8, html, "id=\"emptyStage\"").?;
+    const stage_end = std.mem.indexOfPos(u8, html, stage, "</svg>").?;
+    try expectHas(html[stage..stage_end], "<svg class=\"bust\"");
+    try t.expect(std.mem.indexOf(u8, html[stage..stage_end], "<img") == null);
+    try expectHas(html, "id=\"addPortraitBtn\" class=\"btn cut-s\" hidden>Add a portrait</button>");
+    try expectHas(js, "$(\"addPortraitBtn\").addEventListener(\"click\"");
+    try expectHas(js, "(S.settings.avatars || []).includes(S.settings.avatar)");
+    // still under reduced motion
+    const reduced = std.mem.lastIndexOf(u8, css, "@media (prefers-reduced-motion: reduce)").?;
+    try expectHas(css[reduced..], ".bust");
+    // no fit files: said inline with the folder, the upload turned off
+    const line = std.mem.indexOf(u8, html, "The fit files aren't installed.").?;
+    const bubble_open = std.mem.lastIndexOf(u8, html[0..line], "class=\"bubble\"");
+    const bubble_close = std.mem.lastIndexOf(u8, html[0..line], "</span>");
+    try t.expect(bubble_open == null or (bubble_close != null and bubble_close.? > bubble_open.?));
+    try expectHas(html, "id=\"fitDir\"");
+    try expectHas(html, "<fieldset class=\"bare\" id=\"upControls\">");
+    try expectHas(js, "$(\"upControls\").disabled = !fit;");
 }
 
 test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {

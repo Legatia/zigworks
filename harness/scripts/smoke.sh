@@ -1033,6 +1033,49 @@ if [ $windows = 0 ]; then
 	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
 fi
 
+# the fit files (/desk/assets/) from the first place that has them: the
+# data folder's desk-assets/, then desk-assets/ beside harness's binary,
+# then the app bundle's Resources/desk-assets/ (the binary copied into a
+# bundle's layout); nothing outside them, links not followed
+FH="$T/fitdata"
+FA="$T/fitapp/Contents"
+mkdir -p "$FA/MacOS/desk-assets" "$FA/Resources/desk-assets/mediapipe"
+HB="$FA/MacOS/$(basename "$H")"
+cp "$H" "$HB"
+HARNESS_HOME="$FH" "$HB" init >/dev/null 2>&1
+FPORT=$(sed -n 's/^port = \([0-9]*\).*/\1/p' "$FH/config.ini")
+cat >"$FH/config.ini" <<EOF
+[model]
+url = $URL
+[search]
+url = $URL
+[chat]
+api = $URL
+[apps]
+port = $FPORT
+EOF
+chmod 600 "$FH/config.ini"
+mkdir -p "$FH/desk-assets"
+printf data >"$FH/desk-assets/a.txt"
+printf beside >"$FA/MacOS/desk-assets/a.txt"
+printf beside >"$FA/MacOS/desk-assets/b.txt"
+for f in a b c; do printf bundle >"$FA/Resources/desk-assets/$f.txt"; done
+printf 'bundle wasm' >"$FA/Resources/desk-assets/mediapipe/d.txt"
+printf 'outside' >"$FA/MacOS/outside.txt"
+[ $windows = 0 ] && ln -s "$FH/config.ini" "$FA/Resources/desk-assets/link.txt"
+HARNESS_HOME="$FH" "$HB" run >"$T/frun.out" 2>&1 &
+RPID=$!
+wait_for "$T/frun.out" "running on" 15
+"$F" --desk-get "$FH" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
+rm "$FH/desk-assets/a.txt"
+"$F" --desk-get "$FH" /desk/assets/a.txt >"$T/fit2.out" 2>&1
+check "the fit files come from the data folder first, then beside the binary, then the app bundle" 'grep -qxF "/desk/assets/a.txt 200 data" "$T/fit1.out" && grep -qxF "/desk/assets/b.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/c.txt 200 bundle" "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/d.txt 200 bundle wasm" "$T/fit1.out" && grep -qxF "/desk/assets/none.txt 404 No such file." "$T/fit1.out"'
+check "a fit file gone from the data folder is served from beside the binary" 'grep -qxF "/desk/assets/a.txt 200 beside" "$T/fit2.out"'
+check "no path leaves the fit files' folders, and a link there isn't followed" 'grep -qxF "/desk/assets/../outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/%2e%2e/outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/../../outside.txt 404 No such file." "$T/fit1.out" && { [ $windows = 1 ] || grep -qxF "/desk/assets/link.txt 404 No such file." "$T/fit1.out"; } && ! grep -qE " 200 (outside|\[model\])" "$T/fit1.out"'
+HARNESS_HOME="$FH" "$HB" stop >/dev/null 2>&1
+wait "$RPID" 2>/dev/null
+RPID=""
+
 # Coming from Hermes: harness import hermes against a Hermes home of its
 # own (a fake key in .env and in a memory entry), then harness skill
 # against harness-fake's stand-in for GitHub's codeload
@@ -1090,6 +1133,7 @@ if [ $fail = 0 ]; then echo "smoke: all ok"; else
 	[ -f "$T/crun.out" ] && { echo "--- the calendar's run output"; cat "$T/crun.out"; }
 	[ -f "$T/erun.out" ] && { echo "--- the errands' run output"; cat "$T/erun.out"; }
 	[ -f "$T/drun.out" ] && { echo "--- the desk's run output"; cat "$T/drun.out"; cat "$T/desk.out" 2>/dev/null; }
+	[ -f "$T/frun.out" ] && { echo "--- the fit files' run output"; cat "$T/frun.out"; cat "$T/fit1.out" "$T/fit2.out" 2>/dev/null; }
 	for x in bcheck1 bcheck2 bcheck3 bcheck4; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	for x in imp-dry imp-2 imp imp-mem skill skills; do [ -f "$T/$x.out" ] && { echo "--- $x"; cat "$T/$x.out"; }; done
 	echo "--- outbox"; cat "$OUT" 2>/dev/null

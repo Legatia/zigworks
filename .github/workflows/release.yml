@@ -8,6 +8,9 @@ name: Release
 # hold secrets and act in homes, so their safety checks stay on.
 # headdesk is Linux only: its tag builds the two Linux binaries and nothing else;
 # its package also holds its test client, headdesk-testclient.
+# harness's packages also hold desk-assets/ beside the binary: the fit files
+# the desk fits a portrait with (MediaPipe's, fetched in the job at pinned
+# hashes, and the base head), with their licence and notice.
 # harness's tag also builds the desk's macOS app on the macOS job:
 # harness-desk-<version>-macos.zip, harness-desk.app for Apple Silicon and Intel
 # Macs in one bundle, signed ad hoc (it opens through System Settings ›
@@ -71,6 +74,11 @@ jobs:
           zig build -Doptimize=$optimize -Dstrip=true $target_flag --prefix out
           pkg="$project-$version-${{ matrix.name }}"
           mkdir "$pkg"
+          # the desk's fit files beside the binary: MediaPipe's, fetched at
+          # their pinned SHA-256s, and the base head from the repository
+          # (scripts/pack-desk-assets.sh fails the job, with a line, when
+          # either is missing or a hash doesn't match)
+          if [ "$project" = harness ]; then sh scripts/pack-desk-assets.sh "$pkg/desk-assets"; fi
           if [ "${{ matrix.name }}" = x86_64-windows ]; then
             cp out/bin/"$project".exe README.md LICENSE "$pkg"/
             if [ "$project" = llmcheck ]; then cp out/bin/llmcheck-fake.exe "$pkg"/; fi

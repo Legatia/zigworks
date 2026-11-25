@@ -68,6 +68,14 @@ pub fn main(init: std.process.Init) u8 {
         };
         return 0;
     }
+    // the desk's files with a session: harness-fake --desk-get HOME PATH...
+    if (args.len >= 4 and std.mem.eql(u8, args[1], "--desk-get")) {
+        fake.deskGet(io, init.arena.allocator(), args[2], args[3..]) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
+    }
     // the injection demo's pages and calls, from the catalog
     if (args.len == 5 and std.mem.eql(u8, args[1], "inject")) {
         inject.writeDemo(io, init.arena.allocator(), args[2], args[3], args[4]) catch |e| {
