@@ -5,7 +5,8 @@
 //! stand-in, `--mcp --car` carcloud's (`--tesla` with a Tesla), `--mcp --slack|--jira|--github`
 //! the work morning's). `harness-fake discover URL`, `check FILE` and
 //! `FILE.ini` answer as homemcp and carcloud do, for /setup (and as calmcp
-//! does for a calendar file: fake_cal.zig). `harness-fake --browse URL` is the owner's browser for a
+//! does for a calendar file: fake_cal.zig). `harness-fake --desk HOME TEXT` is the desk app and
+//! its page, over HTTP. `harness-fake --browse URL` is the owner's browser for a
 //! sign-in: it opens URL, follows its redirect to 127.0.0.1, and prints the
 //! page's status and text. `harness-fake --ha URL TOKEN BODY` is Home
 //! Assistant's llama.cpp integration: it POSTs BODY to URL with TOKEN as
@@ -58,6 +59,14 @@ pub fn main(init: std.process.Init) u8 {
         const out = std.fmt.allocPrint(init.arena.allocator(), "{d}\n{s}\n", .{ page.status, page.body }) catch return 1;
         std.Io.File.stdout().writeStreamingAll(io, out) catch return 1;
         return if (page.status == 200) 0 else 1;
+    }
+    // the desk app and its page, over HTTP: harness-fake --desk HOME TEXT
+    if (args.len == 4 and std.mem.eql(u8, args[1], "--desk")) {
+        fake.deskClient(io, init.arena.allocator(), args[2], args[3]) catch |e| {
+            std.debug.print("harness-fake: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+        return 0;
     }
     // the injection demo's pages and calls, from the catalog
     if (args.len == 5 and std.mem.eql(u8, args[1], "inject")) {
