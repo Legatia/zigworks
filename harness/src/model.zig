@@ -65,6 +65,9 @@ pub const Error = error{
     /// the turn's deadline (told apart from a call that took too long by
     /// itself, whatever the clocks round to).
     TimeUp,
+    /// The provider speaks Gemini's format, which harness uses for speech
+    /// only: nothing is sent.
+    SpeechOnly,
 } || http.Error;
 
 // ---- providers ----
@@ -75,20 +78,44 @@ pub const Api = enum {
     anthropic,
     /// OpenAI Chat Completions: POST URL/chat/completions.
     openai,
+    /// Gemini's generateContent: POST URL/models/MODEL:generateContent.
+    /// For speech only for now (the desk's voice): a chat call refuses it.
+    gemini,
 };
 
-/// How a provider takes its key: `x-api-key: KEY`, `Authorization:
-/// Bearer KEY`, or not at all.
-pub const Auth = enum { x_api_key, bearer, none };
+/// How a provider takes its key: `x-api-key: KEY`, `x-goog-api-key:
+/// KEY` (Gemini's), `Authorization: Bearer KEY`, or not at all.
+pub const Auth = enum { x_api_key, x_goog_api_key, bearer, none };
 
 pub fn parseApi(w: []const u8) ?Api {
     if (std.mem.eql(u8, w, "anthropic")) return .anthropic;
     if (std.mem.eql(u8, w, "openai")) return .openai;
+    if (std.mem.eql(u8, w, "gemini")) return .gemini;
     return null;
+}
+
+/// The header a key goes in, for the ways that send it in one of its
+/// own; null for a bearer token or none.
+pub fn keyHeader(auth: Auth) ?[]const u8 {
+    return switch (auth) {
+        .x_api_key => "x-api-key",
+        .x_goog_api_key => "x-goog-api-key",
+        .bearer, .none => null,
+    };
+}
+
+/// How a new `[provider NAME]` of this format takes its key unless it says.
+pub fn defaultAuth(api: Api) Auth {
+    return switch (api) {
+        .anthropic => .x_api_key,
+        .openai => .bearer,
+        .gemini => .x_goog_api_key,
+    };
 }
 
 pub fn parseAuth(w: []const u8) ?Auth {
     if (std.mem.eql(u8, w, "x-api-key")) return .x_api_key;
+    if (std.mem.eql(u8, w, "x-goog-api-key")) return .x_goog_api_key;
     if (std.mem.eql(u8, w, "bearer")) return .bearer;
     if (std.mem.eql(u8, w, "none")) return .none;
     return null;
@@ -132,10 +159,18 @@ pub const presets = [_]Preset{
     .{ .name = "opencode", .api = .openai, .url = "https://opencode.ai/zen/v1", .auth = .bearer, .cache = false, .key = "opencode" },
     // OpenAI caches by itself, and refuses max_tokens for its reasoning models
     .{ .name = "openai", .api = .openai, .url = "https://api.openai.com/v1", .auth = .bearer, .cache = false, .key = "openai", .tokens_field = "max_completion_tokens" },
+    // the Gemini API, for the desk's voice only for now
+    .{ .name = "gemini", .api = .gemini, .url = "https://generativelanguage.googleapis.com/v1beta", .auth = .x_goog_api_key, .cache = false, .key = "gemini" },
 };
 
 pub fn isPreset(name: []const u8) bool {
     for (presets) |p| if (std.mem.eql(u8, p.name, name)) return true;
+    return false;
+}
+
+/// A preset a model can be called on (gemini's is for speech only).
+pub fn chatPreset(name: []const u8) bool {
+    for (presets) |p| if (std.mem.eql(u8, p.name, name)) return p.api != .gemini;
     return false;
 }
 
@@ -190,6 +225,7 @@ pub const Provider = struct {
         return switch (p.api) {
             .anthropic => "Anthropic Messages",
             .openai => "OpenAI Chat Completions",
+            .gemini => "Gemini, speech only",
         };
     }
 
@@ -249,7 +285,7 @@ pub const Providers = struct {
             if (isPreset(sec.name)) continue;
             // config.ini refuses a new provider without api and url
             const api = sec.api orelse continue;
-            var p: Provider = .{ .name = sec.name, .api = api, .url = "", .auth = if (api == .anthropic) .x_api_key else .bearer, .cache = api == .anthropic, .key_name = sec.name };
+            var p: Provider = .{ .name = sec.name, .api = api, .url = "", .auth = defaultAuth(api), .cache = api == .anthropic, .key_name = sec.name };
             p.override(sec);
             try list.append(arena, p);
         }
@@ -385,6 +421,8 @@ pub const Client = struct {
             .path = switch (p.api) {
                 .anthropic => "/messages",
                 .openai => "/chat/completions",
+                // never sent: a chat call on it is refused (SpeechOnly)
+                .gemini => "/models",
             },
             .tokens_field = p.tokens_field,
         };
@@ -417,6 +455,7 @@ pub const Client = struct {
             error.KeyRefused => try std.fmt.allocPrint(a, "Model calls are refused: {s} refused the key stored as {s}{s}{s}{s}; store the right key with harness secret add {s}.", .{
                 c.provider, c.key_name, if (msg.len > 0) " (" else "", msg, if (msg.len > 0) ")" else "", c.key_name,
             }),
+            error.SpeechOnly => try std.fmt.allocPrint(a, "Model calls are refused: {s} has api = gemini, which harness uses for speech only for now; use a provider with api = anthropic or openai for this model.", .{c.provider}),
             error.TimeUp => "Time limit reached for this turn.",
             error.Timeout => try std.fmt.allocPrint(a, "Model call failed{s}: Timeout {s}", .{ at, msg }),
             error.Rejected => try std.fmt.allocPrint(a, "The model API{s} refused the request: {s}", .{ at, msg }),
@@ -454,11 +493,13 @@ pub const Client = struct {
     }
 
     fn sendSystem(c: *Client, arena: std.mem.Allocator, system: System, messages: []const Message, tools: []const ToolDef, lim: Limits) Error!Reply {
+        if (c.api == .gemini) return error.SpeechOnly;
         if (c.http == null) return error.NoUrl;
         if (c.auth != .none and c.key.len == 0) return error.NoKey;
         const body = switch (c.api) {
             .anthropic => try anthropicBody(arena, c.model, c.max_tokens, system, messages, tools, c.cache),
             .openai => try openaiBody(arena, c.model, c.tokens_field, c.max_tokens, system, messages, tools, c.cache),
+            .gemini => unreachable,
         };
         var limited = false;
         var connect_retry = false;
@@ -485,6 +526,7 @@ pub const Client = struct {
                 200 => return switch (c.api) {
                     .anthropic => parseReply(arena, r.body),
                     .openai => parseOpenAIReply(arena, r.body),
+                    .gemini => unreachable,
                 } orelse error.BadReply,
                 401, 403 => {
                     c.note(r.body);
@@ -551,8 +593,8 @@ pub const Client = struct {
         // provider's own headers
         var hs: [max_headers + 2]Header = undefined;
         var n: usize = 0;
-        if (c.auth == .x_api_key) {
-            hs[n] = .{ .name = "x-api-key", .value = c.key };
+        if (keyHeader(c.auth)) |name| {
+            hs[n] = .{ .name = name, .value = c.key };
             n += 1;
         }
         if (c.api == .anthropic) {
@@ -1478,4 +1520,49 @@ test "each_status_maps_to_the_same_message_for_every_provider" {
             }
         }
     }
+}
+
+test "gemini_is_a_preset_for_speech_only" {
+    var e: TestEnv = undefined;
+    try e.init();
+    defer e.deinit();
+    const a = e.arena.allocator();
+    const tts: Section = .{ .name = "tts", .api = .gemini, .url = try std.fmt.allocPrint(a, "{s}/v1beta", .{try e.url()}) };
+    const set = try Providers.resolve(a, .{ .sections = &.{tts} }, .{ .get = geminiKeys });
+    const g = set.find("gemini").?;
+    try t.expectEqual(Api.gemini, g.api);
+    try t.expectEqualStrings("https://generativelanguage.googleapis.com/v1beta", g.url);
+    try t.expectEqual(Auth.x_goog_api_key, g.auth);
+    try t.expectEqualStrings("gemini", g.key_name);
+    try t.expect(!g.cache);
+    try t.expectEqualStrings("Gemini, speech only", g.apiName());
+    // a section of its own takes Gemini's key header and its own name's key
+    const s = set.find("tts").?;
+    try t.expectEqual(Auth.x_goog_api_key, s.auth);
+    try t.expectEqualStrings("tts", s.key_name);
+    try t.expectEqualStrings("gm-test-key-1", s.key);
+    try t.expect(!isPreset("tts") and isPreset("gemini"));
+    try t.expect(chatPreset("openai") and !chatPreset("gemini") and !chatPreset("tts"));
+    // a chat call on it: refused before anything is sent, in plain words
+    var c = try e.clientFor(s.*, "gemini-3.8-flash-lite-tts");
+    defer c.deinit();
+    try t.expectError(error.SpeechOnly, c.send(a, "sys", &.{.{ .role = .user, .blocks = &.{.{ .text = "hi" }} }}, &.{}));
+    try t.expectEqual(0, e.server.modelRequests());
+    try t.expectEqualStrings("Model calls are refused: tts has api = gemini, which harness uses for speech only for now; use a provider with api = anthropic or openai for this model.", try c.failure(a, error.SpeechOnly));
+}
+
+fn geminiKeys(_: ?*anyopaque, _: std.mem.Allocator, provider: []const u8, _: []const u8) ?[]const u8 {
+    return if (std.mem.eql(u8, provider, "tts")) "gm-test-key-1" else null;
+}
+
+test "key_headers_follow_auth" {
+    try t.expectEqualStrings("x-api-key", keyHeader(.x_api_key).?);
+    try t.expectEqualStrings("x-goog-api-key", keyHeader(.x_goog_api_key).?);
+    try t.expect(keyHeader(.bearer) == null);
+    try t.expect(keyHeader(.none) == null);
+    try t.expectEqual(Auth.x_goog_api_key, parseAuth("x-goog-api-key").?);
+    try t.expectEqual(Api.gemini, parseApi("gemini").?);
+    try t.expectEqual(Auth.x_api_key, defaultAuth(.anthropic));
+    try t.expectEqual(Auth.bearer, defaultAuth(.openai));
+    try t.expectEqual(Auth.x_goog_api_key, defaultAuth(.gemini));
 }

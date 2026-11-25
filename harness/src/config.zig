@@ -14,7 +14,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk, SpeechOnlyModel };
 
 pub const Config = struct {
     model: Model = .{},
@@ -364,11 +364,17 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
             if (std.mem.eql(u8, p.name, cfg.model.provider)) break;
         } else return error.UnknownProvider;
     }
+    // a provider of Gemini's format is for speech only: no model is called on it
+    if (providerApi(cfg, cfg.model.provider) == .gemini) return error.SpeechOnlyModel;
+    for ([_][]const u8{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model, cfg.memory.summary_model, cfg.triggers.check_model, cfg.voice_agent.model }) |value| {
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse continue;
+        if (providerApi(cfg, value[0..colon]) == .gemini) return error.SpeechOnlyModel;
+    }
     const va = cfg.voice_agent;
     if (!std.mem.eql(u8, va.listen, "off") and parseListen(va.listen) == null) return error.BadVoiceAgent;
     if (va.seconds < 5 or va.seconds > 60 or !secretName(va.token)) return error.BadVoiceAgent;
     if (cfg.voice.provider.len > 0) {
-        if (voiceApi(cfg, cfg.voice.provider) != .openai) return error.BadVoice;
+        if (providerApi(cfg, cfg.voice.provider) != .openai) return error.BadVoice;
         if (cfg.voice.model.len == 0) return error.BadVoice;
         const l = cfg.voice.language;
         if (l.len > 0) {
@@ -379,7 +385,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     const dk = cfg.desk;
     if (!avatarName(dk.avatar)) return error.BadDesk;
     if (!std.mem.eql(u8, dk.speak, "off") and !std.mem.eql(u8, dk.speak, "browser")) {
-        if (voiceApi(cfg, dk.speak) != .openai) return error.BadDesk;
+        if (providerApi(cfg, dk.speak) != .openai) return error.BadDesk;
         if (dk.speak_model.len == 0 or dk.speak_voice.len == 0) return error.BadDesk;
     }
     return cfg;
@@ -424,7 +430,7 @@ fn secretName(name: []const u8) bool {
 
 /// The format provider `name` speaks: its section's api, else its
 /// preset's; null when there is no such provider.
-fn voiceApi(cfg: Config, name: []const u8) ?model.Api {
+pub fn providerApi(cfg: Config, name: []const u8) ?model.Api {
     for (cfg.providers) |p| if (std.mem.eql(u8, p.name, name)) if (p.api) |api| return api;
     for (model.presets) |pr| if (std.mem.eql(u8, pr.name, name)) return pr.api;
     return null;
@@ -438,12 +444,13 @@ pub fn providerSettings(cfg: Config) model.Settings {
 /// What config.ini's errors beyond a bad line mean.
 pub fn reason(e: anyerror) ?[]const u8 {
     return switch (e) {
-        error.BadProvider => "a [provider NAME] section takes api = anthropic or openai, url = http(s)://..., auth = x-api-key, bearer or none, key = a stored secret's name, cache = on or off, and header = Name: value; NAME uses a-z, 0-9, - and _",
-        error.BadHeader => "header = Name: value, at most 8 a provider; not Authorization or x-api-key (the key is the stored secret key = names), nor Host, Connection, Content-Length, Content-Type, Transfer-Encoding or anthropic-version",
-        error.ProviderNeedsApiAndUrl => "a provider that is not a preset needs api = (anthropic or openai) and url =",
+        error.BadProvider => "a [provider NAME] section takes api = anthropic, openai or gemini (speech only), url = http(s)://..., auth = x-api-key, x-goog-api-key, bearer or none, key = a stored secret's name, cache = on or off, and header = Name: value; NAME uses a-z, 0-9, - and _",
+        error.BadHeader => "header = Name: value, at most 8 a provider; not Authorization, x-api-key or x-goog-api-key (the key is the stored secret key = names), nor Host, Connection, Content-Length, Content-Type, Transfer-Encoding or anthropic-version",
+        error.ProviderNeedsApiAndUrl => "a provider that is not a preset needs api = (anthropic, openai or gemini) and url =",
         error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
+        error.SpeechOnlyModel => "api = gemini is for speech only for now ([desk] speak); a model needs a provider with api = anthropic or openai",
         error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -), speak = off, browser, or a provider whose api is openai (with speak_model and speak_voice)",
         else => null,
     };
@@ -499,7 +506,7 @@ fn parseHeader(v: []const u8) error{BadHeader}!model.Header {
     if (name.len == 0 or value.len == 0) return error.BadHeader;
     for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_')) return error.BadHeader;
     for (value) |ch| if ((ch < 0x20 and ch != '\t') or ch == 0x7f) return error.BadHeader;
-    const refused = [_][]const u8{ "authorization", "x-api-key", "host", "connection", "content-length", "content-type", "transfer-encoding", "anthropic-version" };
+    const refused = [_][]const u8{ "authorization", "x-api-key", "x-goog-api-key", "host", "connection", "content-length", "content-type", "transfer-encoding", "anthropic-version" };
     for (refused) |r| if (std.ascii.eqlIgnoreCase(name, r)) return error.BadHeader;
     return .{ .name = name, .value = value };
 }
@@ -1381,6 +1388,49 @@ test "provider_sections_refuse_bad_values" {
     for (0..9) |i| try nine.print(a, "header = X-H{d}: v\n", .{i});
     try t.expectError(error.BadHeader, parse(a, nine.items));
     for ([_]anyerror{ error.BadProvider, error.BadHeader, error.ProviderNeedsApiAndUrl, error.UnknownProvider }) |e| try t.expect(reason(e) != null);
+}
+
+test "providers_take_api_gemini_and_its_key_header" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try parse(a, "[provider gem]\napi = gemini\nurl = https://proxy.example.com/v1beta\nauth = x-goog-api-key\n");
+    try t.expectEqual(model.Api.gemini, c.providers[0].api.?);
+    try t.expectEqual(model.Auth.x_goog_api_key, c.providers[0].auth.?);
+    try t.expectEqual(model.Api.gemini, providerApi(c, "gem").?);
+    try t.expectEqual(model.Api.gemini, providerApi(c, "gemini").?);
+    try t.expect(providerApi(c, "nowhere") == null);
+    // the key is a stored secret, never a header line
+    try t.expectError(error.BadHeader, parse(a, "[provider gem]\napi = gemini\nurl = https://p.example.com\nheader = x-goog-api-key: k\n"));
+    try t.expectError(error.BadHeader, parse(a, "[provider gem]\napi = gemini\nurl = https://p.example.com\nheader = X-Goog-Api-Key: k\n"));
+    try t.expect(std.mem.indexOf(u8, reason(error.BadProvider).?, "gemini") != null);
+    try t.expect(std.mem.indexOf(u8, reason(error.BadProvider).?, "x-goog-api-key") != null);
+    try t.expect(std.mem.indexOf(u8, reason(error.ProviderNeedsApiAndUrl).?, "gemini") != null);
+}
+
+test "a_chat_model_on_gemini_is_refused" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "[model]\nprovider = gemini\n",
+        "[model]\nmodel = gemini:gemini-3.8-flash\n",
+        "[model]\nworker_model = gemini:x\n",
+        "[model]\nmemory_model = gemini:x\n",
+        "[memory]\nsummary_model = gemini:x\n",
+        "[triggers]\ncheck_model = gemini:x\n",
+        "[voice_agent]\nmodel = gemini:x\n",
+        "[provider g]\napi = gemini\nurl = https://p.example.com/v1beta\n[model]\nmodel = g:x\n",
+        "[provider g]\napi = gemini\nurl = https://p.example.com/v1beta\n[model]\nprovider = g\n",
+    }) |text| try t.expectError(error.SpeechOnlyModel, parse(a, text));
+    // a model whose name only looks like it: the default provider's
+    _ = try parse(a, "[model]\nmodel = gemini-3.8-flash\n");
+    // named at its line, with why
+    const why = (try @import("core.zig").parseProblem(a, "config.ini", "[model]\nurl = https://o.example.com\nmodel = gemini:x\n", parse)).?;
+    if (!std.mem.startsWith(u8, why, "config.ini line 3 has an error: model = gemini:x (api = gemini is for speech only for now ([desk] speak); a model needs a provider with api = anthropic or openai)")) {
+        std.debug.print("got: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "old_task_and_brief_files_run_as_before" {
