@@ -130,6 +130,15 @@ probe() {
         PROBE=$(grep -F "\"probe\":{\"$1\"" "$T/log" | tail -1)
     fi
 }
+# desk_probe NAME JS: the same on the desk page, which has no post()
+desk_probe() {
+    before=$(count "$T/log" "\"probe\":{\"$1\"")
+    cmd "js window.webkit.messageHandlers.harness.postMessage(JSON.stringify({probe: {$1: $2}}))"
+    PROBE=
+    if wait_count "$T/log" "\"probe\":{\"$1\"" $((before + 1)) 10; then
+        PROBE=$(grep -F "\"probe\":{\"$1\"" "$T/log" | tail -1)
+    fi
+}
 expect_probe() {
     case $PROBE in *"$1"*) ok "$2" ;; *) not_ok "$2 (the page said: ${PROBE:-nothing})" ;; esac
 }
@@ -400,6 +409,37 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     if grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$T/log"; then ok "real harness: the desk page loads"; else in_log "finish http://127.0.0.1:" 15; grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$T/log" && ok "real harness: the desk page loads" || not_ok "real harness: the desk page loads"; fi
     [ "$("$OWN" config get model.provider --home "$REAL_HOME")" = other ] && [ "$("$OWN" config get "provider other.url" --home "$REAL_HOME")" = http://127.0.0.1:9/v1 ] && ok "real harness: config.ini has them" || not_ok "real harness: config.ini has them"
     if [ -e "$HARNESS_STORE/other" ]; then ok "real harness: the key is in its store (the smoke's own folder)"; else not_ok "real harness: the key is in its store (the smoke's own folder)"; fi
+    # the conversation at its tallest: the message field is still inside the
+    # window, at the size the app opens at and at its smallest
+    tries=0
+    while :; do
+        desk_probe drawn "document.getElementById('log').children.length"
+        case "$PROBE" in *'"drawn":0'* | '') ;; *) break ;; esac
+        tries=$((tries + 1))
+        [ "$tries" -ge 20 ] && break
+        sleep 0.5
+    done
+    sleep 1
+    cmd "js var l = document.getElementById('log'); for (var k = 0; k < 12; k++) { var li = document.createElement('li'); li.className = 'msg harness'; li.textContent = 'line ' + k; l.appendChild(li); } l.scrollTop = l.scrollHeight;"
+    fits="(function () { var c = document.getElementById('compose').getBoundingClientRect(); return [document.getElementById('log').children.length >= 12 && Math.round(c.bottom) <= window.innerHeight ? 'inside' : 'outside', Math.round(c.bottom), window.innerHeight, window.innerWidth].join(' '); })()"
+    desk_probe opens "$fits"
+    expect_probe '"inside ' "real harness: a long conversation leaves the message field inside the window"
+    cmd "frame 100 100 1024 728"
+    sleep 1
+    desk_probe smallest "$fits"
+    expect_probe '"inside ' "real harness: and inside the smallest window"
+    desk_probe newest "(function () { var l = document.getElementById('log'); return [l.children.length >= 12 && l.scrollHeight - l.scrollTop - l.clientHeight < 2 ? 'shown' : 'hidden', l.scrollHeight, l.scrollTop, l.clientHeight].join(' '); })()"
+    expect_probe '"shown ' "real harness: and the newest message is still the one shown"
+    # the sound button says which way it is by its drawing, not only its colour
+    sound="(function () { var b = document.getElementById('muteBtn'), d = function (id) { var e = document.getElementById(id); return e ? getComputedStyle(e).display : 'missing'; }; return [b.getAttribute('aria-pressed') === 'true' ? 'muted' : 'sounding', 'waves', d('muteWaves') === 'none' ? 'off' : 'on', 'cross', d('muteCross') === 'none' || d('muteCross') === 'missing' ? 'off' : 'on'].join(' '); })()"
+    desk_probe sounding "$sound"
+    expect_probe '"sounding waves on cross off"' "real harness: the sound button draws sound waves while replies may be spoken"
+    cmd "js document.getElementById('muteBtn').click()"
+    desk_probe muted "$sound"
+    expect_probe '"muted waves off cross on"' "real harness: and a cross in their place once muted"
+    cmd "js document.getElementById('muteBtn').click()"
+    desk_probe unmuted "$sound"
+    expect_probe '"sounding waves on cross off"' "real harness: and the waves again once unmuted"
     cmd "menu provider"
     expect_log "read ok=1" "real harness: Provider and key… reads the values in use"
     wait_page 3
