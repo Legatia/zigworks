@@ -44,6 +44,162 @@ Both run against the same pages and entry. What changed for you with the
 `platform/desk` defines the exact paths. Pull it when it lands, or build
 against the spec and adjust.
 
+### Status, 2026-11-25 (Mac session)
+
+| Branch | What | State |
+|---|---|---|
+| `platform/desk-mac` | harness-desk for macOS | merged into harness-logins (d252816): reviewed, unit 61/61, window smoke 46/46 |
+| `platform/desk` | harness's side and the desk page | building; lands next |
+| `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | building; lands next |
+
+### The desk app's code is yours to extend
+
+It's all in `harness/desk-app/`, with its own `build.zig`, so harness's own
+build stays std only and cross-builds as before.
+
+**What's shared and what's macOS's own:**
+
+- **Shared, pure Zig:** `src/controller.zig` makes every decision: a
+  state machine, with events in and effects out. These modules feed it:
+
+  | Module | What it does |
+  |---|---|
+  | `deskjson.zig` | reads `state/desk.json` |
+  | `entry.zig` | the one-time code |
+  | `alive.zig` | `GET /alive` |
+  | `policy.zig` | which navigations stay, and the microphone |
+  | `bridge.zig` | the page's messages |
+  | `commands.zig` | runs `harness run`, `stop` and `autostart` |
+  | `pages.zig` | the built-in "isn't running" and "Connecting…" pages |
+  | `home.zig` | the data folder |
+  | `args.zig` | `--home DIR` |
+
+- **macOS only:** `src/mac/desk.m`, `desk.h` (Cocoa, WKWebView and its
+  delegates), `plist.zig` and `icon.zig`.
+- **Yours to add:**
+  - `src/windows/`: WebView2, `WebView2Loader.dll` loaded at run time,
+    `WebView2.h`'s C interfaces from Zig;
+  - `src/linux/`: GTK 3 and WebKitGTK 4.1.
+
+  Each one draws the window and forwards events to the controller, and
+  the controller tells it what to do.
+
+**Three POSIX spots to port for Windows** (the pure modules already compile
+for Linux):
+
+1. `alive.zig`'s socket. It uses libc sockets, because std's connect
+   timeout panics in 0.17.1.
+2. `commands.zig`'s spawnDetached process group: `harness run` has to
+   outlive the window.
+3. `entry.zig`'s 0600 file mode. On Windows, `%LOCALAPPDATA%`'s own ACL
+   covers it.
+
+**The stand-in harness:** `test/fake_harness.py` (Python 3, chosen so your
+apps can reuse it). It:
+
+- answers `/alive`;
+- writes a `desk-code` after an `open-request`;
+- serves `/enter` and a test page that posts the bridge messages.
+
+`scripts/smoke.sh` drives the macOS app against it. Write the same smoke
+for yours.
+
+### The contract both apps keep
+
+**Names:**
+
+- the bridge handler is named **`harness`**:
+  `window.webkit.messageHandlers.harness` on macOS. On WebView2 it's
+  `window.chrome.webview.postMessage`, and the built-in page's script
+  already posts there too.
+- the macOS bundle is `harness-desk.app`, shown as "harness" in the Dock.
+
+**`state/desk.json`:**
+
+- its fields are `{binary, port, home, version}`, plus an optional `path`
+  that the app passes as PATH to the commands it runs;
+- only `port` is required, and unknown fields are ignored;
+- the folder it was read from is the data folder for requests and
+  `--home`.
+
+**Getting in:**
+
+1. Write `state/open-request`. It holds `pid N`, and a stale `desk-code`
+   is deleted first.
+2. Wait up to 30 s for `state/desk-code`, checking every 100 ms. An empty
+   file means "not written yet".
+3. Read the code and delete the file.
+4. Load `/enter?code=…`. It answers 303 to `/desk`, or 403.
+
+**Staying in:**
+
+- Liveness is a 200 from `/alive` within 3 s, checked every 5 s, and also
+  while the desk is shown. Two misses show "harness isn't running".
+- A 401 or 403 on a desk page enters again, at most every 5 s.
+- harness found on another port also enters again.
+
+**Navigation:**
+
+- Only `http://127.0.0.1:PORT` (and about:blank) stays in the window.
+- http, https and mailto from the main frame or a new window go to the
+  system browser.
+- Other schemes, downloads, and `blob:` or `data:` navigations are
+  cancelled.
+- The microphone is granted only to the main frame on harness's origin;
+  the camera is always denied.
+
+**The bridge's messages:**
+
+- `{"badge": N}` sets the count: cap 99999, and 0 clears it;
+- `{"attention": "urgent"}` asks for attention once;
+- `{"reenter": true}` enters again.
+
+**Closing the window** keeps the app running with its badge; the taskbar
+or Dock icon reopens it.
+
+**The menu:**
+
+- Start harness and Stop harness (`harness stop`);
+- Open at login: `harness autostart on|off`. With no argument, it prints
+  `on` or `off` as its first word, which drives the check mark;
+- Reload, and Quit.
+
+**harness's side, from `platform/desk`, guarantees:**
+
+- desk.json stays when harness stops;
+- desk.json and desk-code are written whole (a temp file, then rename);
+- an open-request is answered within 30 s.
+
+### The desk page and the avatar need
+
+- **WebGL 2 on.** WebView2 has it by default. WebKitGTK needs
+  `enable-webgl` and its hardware acceleration policy set to always.
+  Check WSLg's frame rate: the head should hold 30 fps when resting.
+- **Media and speech play without a click.** Urgent alerts are spoken at
+  once.
+- **No video,** so Linux needs no GStreamer MP4 plugins.
+
+### CI and release, as the macOS app set them up
+
+- **CI job `desk-app-macos`** (macos-15, working directory
+  `harness/desk-app`), in this order:
+  1. `zig build test` in Debug and ReleaseSafe;
+  2. `scripts/package-macos.sh`, which builds both slices, lipo-checks
+     them, lints the plist and signs ad hoc;
+  3. `zig build smoke`, which prints SKIP unless the runner has an Aqua
+     session. It hasn't run on CI yet; the first push tells.
+
+  Add `desk-app-windows` and `desk-app-linux` jobs the same way. The
+  spec's smoke runs under Xvfb on Linux.
+- **Release:** the "Desk app (macOS)" step runs on the aarch64-macos job
+  for `harness-v*` tags. It writes `harness-desk-VERSION-macos.zip` and
+  its `.sha256`. Yours ship as the spec's Release table says:
+  - Windows: `harness-desk.exe` with `WebView2Loader.dll` beside it,
+    pinned by version and SHA-256;
+  - Linux x86_64: a dynamically linked binary.
+
+The README's "Desk app (macOS)" section is the model for yours.
+
 ## For you: the owner answered question 3 (2026-11-24)
 
 > "Move money with a budget. Sandbox on priority"
