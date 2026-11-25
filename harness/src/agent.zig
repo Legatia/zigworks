@@ -4186,6 +4186,8 @@ fn unattendedMoney(r: *Run, a: std.mem.Allocator, m: *const McpTool, input_json:
     const amount = amountOf(a, input_json, field) orelse
         return std.fmt.allocPrint(a, "no amount in the field \"{s}\", so the budget cannot be checked", .{field}) catch "no amount";
     if (amount < 0 or std.math.isNan(amount) or std.math.isInf(amount)) return "the amount is not a positive number";
+    // a server may read 0 as "all": never unasked
+    if (amount == 0) return "an amount of 0 is never paid unattended (a server may read it as all)";
     const per_call = m.max_per_call orelse r.money.max_per_call;
     const per_day = m.max_per_day orelse r.money.max_per_day;
     if (per_call > 0 and amount > @as(f64, @floatFromInt(per_call)))
@@ -5793,6 +5795,22 @@ test "outside_text_doesnt_spend_but_the_servers_own_results_do" {
     freeResult(&f.run, r);
     try t.expect(std.mem.indexOf(u8, try f.e.request(5), "refused by the gate: it read outside text first (page blog.example), and outside text doesn't spend") != null);
     try t.expectEqual(@as(f64, 5), f.ledger.sum());
+}
+
+test "an_amount_of_0_is_never_paid_unattended" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    unattendedRun(&f, .{ .budget_per_day = 30 });
+    // a server may read 0 as "all"
+    try f.e.script(1, model.toolReply("tu_1", "fake__echo", "{\"text\":\"x\",\"amount\":0}"));
+    try f.e.script(2, model.textReply("no"));
+    const r = try f.say("buy");
+    freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "refused by the gate: an amount of 0 is never paid unattended (a server may read it as all)") != null);
+    try t.expect(std.mem.indexOf(u8, try f.e.request(2), "home=") == null);
 }
 
 test "paused_automation_spends_nothing" {

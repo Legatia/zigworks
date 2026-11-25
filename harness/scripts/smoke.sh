@@ -395,7 +395,7 @@ wait_for "$OUT" "Dry run is off: approved money calls are made."
 say "/money"
 check "/money says no budget for routines is set" 'wait_for "$OUT" "Budget for routines: none, so they spend nothing without asking you."'
 say "/money budget 30 a day"
-check "/money budget writes [money] and reloads" 'wait_for "$OUT" "Routines may spend up to 30 a day without asking you." && grep -q "^budget_per_day = 30" "$HARNESS_HOME/config.ini"'
+check "/money budget writes [money] and reloads" 'wait_for "$OUT" "Routines may spend up to 30 a day at each money server without asking you." && grep -q "^budget_per_day = 30" "$HARNESS_HOME/config.ini"'
 say "/money pause"
 check "/money pause is kept in state" 'wait_for "$OUT" "spending is paused: each payment they try waits for you" && [ -f "$HARNESS_HOME/state/money-paused" ]'
 say "/money resume"

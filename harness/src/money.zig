@@ -55,11 +55,15 @@ pub fn budgetFor(money: anytype, day: ?u32, month: ?u32) Budget {
     return .{ .day = day orelse money.budget_per_day, .month = month orelse money.budget_per_month };
 }
 
-/// An amount as the owner reads it: whole, or with two decimals ("40",
-/// "12.50").
+/// An amount as the owner reads it: whole, with two decimals from 1 up
+/// ("40", "12.50"), and below 1 as it is, up to 8 decimals ("0.0015"), so
+/// a coin's fraction never reads as 0.
 pub fn amountText(a: Allocator, x: f64) ![]const u8 {
     if (x == @floor(x) and @abs(x) < 1e15) return std.fmt.allocPrint(a, "{d}", .{@as(i64, @intFromFloat(x))});
-    return std.fmt.allocPrint(a, "{d:.2}", .{x});
+    if (@abs(x) >= 1) return std.fmt.allocPrint(a, "{d:.2}", .{x});
+    const full = try std.fmt.allocPrint(a, "{d:.8}", .{x});
+    const trimmed = std.mem.trimEnd(u8, full, "0");
+    return if (std.mem.endsWith(u8, trimmed, ".")) full else trimmed;
 }
 
 /// One automated spend, as the owner is told of it.
@@ -122,7 +126,16 @@ pub fn parseBudget(words: []const u8) ?BudgetWords {
 /// What the first start after budgets writes for an install that spent
 /// before: config.ini and mcp.ini as they become (null: unchanged), and
 /// the line said once in main.
-pub const Upgraded = struct { config: ?[]const u8 = null, mcp: ?[]const u8 = null, line: []const u8 };
+pub const Upgraded = struct {
+    config: ?[]const u8 = null,
+    mcp: ?[]const u8 = null,
+    line: []const u8,
+    /// What config.ini's [money] gets: its budget a day, and its trigger
+    /// and workflow switches written off (they were off without a line).
+    budget_per_day: ?u32 = null,
+    triggers_off: bool = false,
+    workflows_off: bool = false,
+};
 
 /// An install spent unattended before budgets when config.ini's own
 /// `[money]` says `scheduled = on` (not the default, which is on now) and
@@ -134,43 +147,87 @@ pub fn upgradeTexts(a: Allocator, config_text: []const u8, mcp_text: []const u8)
     var scheduled = false;
     var budgeted = false;
     var day_cap: u32 = 0;
+    var call_cap: u32 = 0;
+    var has_triggers = false;
+    var has_workflows = false;
     for (cl) |l| {
         if (!std.mem.eql(u8, l.section, "money")) continue;
         if (std.mem.eql(u8, l.key, "scheduled")) scheduled = config.parseBool(l.value) orelse false;
         if (std.mem.eql(u8, l.key, "budget_per_day") or std.mem.eql(u8, l.key, "budget_per_month")) budgeted = true;
         if (std.mem.eql(u8, l.key, "max_per_day")) day_cap = std.fmt.parseInt(u32, l.value, 10) catch 0;
+        if (std.mem.eql(u8, l.key, "max_per_call")) call_cap = std.fmt.parseInt(u32, l.value, 10) catch 0;
+        if (std.mem.eql(u8, l.key, "triggers")) has_triggers = true;
+        if (std.mem.eql(u8, l.key, "workflows")) has_workflows = true;
     }
     if (!scheduled or budgeted) return null;
     var out: Upgraded = .{ .line = "" };
+    var conf: []const u8 = config_text;
     var set: std.ArrayList(u8) = .empty;
     if (day_cap > 0) {
-        out.config = try mail_mod.setKey(a, config_text, "money", "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{day_cap}));
+        conf = try mail_mod.setKey(a, conf, "money", "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{day_cap}));
+        out.budget_per_day = day_cap;
         try set.print(a, "{d} in config.ini's [money]", .{day_cap});
     }
-    // each money server's own day cap, where it says no budget
+    // before budgets a missing line was off: kept off, not the new default
+    if (!has_triggers) {
+        conf = try mail_mod.setKey(a, conf, "money", "triggers", "off");
+        out.triggers_off = true;
+    }
+    if (!has_workflows) {
+        conf = try mail_mod.setKey(a, conf, "money", "workflows", "off");
+        out.workflows_off = true;
+    }
+    if (conf.ptr != config_text.ptr) out.config = conf;
+    // each money server that says no budget: its own day cap becomes its
+    // budget; one whose caps were all off (its own `none`, and [money]'s
+    // none) never spent unattended, so nothing spends there
     const ml = config.lines(a, mcp_text) catch &.{};
     var mcp_new: []const u8 = mcp_text;
+    var none: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < ml.len) {
         const sec = ml[i].section;
         var money = false;
         var own_budget = false;
-        var cap: u32 = 0;
+        var day: ?u32 = null;
+        var call: ?u32 = null;
         while (i < ml.len and std.mem.eql(u8, ml[i].section, sec)) : (i += 1) {
             const l = ml[i];
             if (std.mem.eql(u8, l.key, "money") and l.value.len > 0) money = true;
             if (std.mem.eql(u8, l.key, "budget_per_day") or std.mem.eql(u8, l.key, "budget_per_month")) own_budget = true;
-            if (std.mem.eql(u8, l.key, "max_per_day")) cap = std.fmt.parseInt(u32, l.value, 10) catch 0;
+            // `none` (no cap there): 0
+            if (std.mem.eql(u8, l.key, "max_per_day")) day = std.fmt.parseInt(u32, l.value, 10) catch 0;
+            if (std.mem.eql(u8, l.key, "max_per_call")) call = std.fmt.parseInt(u32, l.value, 10) catch 0;
         }
-        if (!money or own_budget or cap == 0 or sec.len == 0) continue;
-        mcp_new = try mail_mod.setKey(a, mcp_new, sec, "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{cap}));
-        try set.print(a, "{s}{d} for {s} in mcp.ini", .{ if (set.items.len > 0) ", " else "", cap, sec });
+        if (!money or own_budget or sec.len == 0) continue;
+        if (day) |n| if (n > 0) {
+            mcp_new = try mail_mod.setKey(a, mcp_new, sec, "budget_per_day", try std.fmt.allocPrint(a, "{d}", .{n}));
+            try set.print(a, "{s}{d} for {s} in mcp.ini", .{ if (set.items.len > 0) ", " else "", n, sec });
+            continue;
+        };
+        if ((day orelse day_cap) == 0 and (call orelse call_cap) == 0) {
+            mcp_new = try mail_mod.setKey(a, mcp_new, sec, "budget_per_day", "none");
+            try none.print(a, "{s}{s}", .{ if (none.items.len > 0) ", " else "", sec });
+        }
     }
     if (mcp_new.ptr != mcp_text.ptr) out.mcp = mcp_new;
-    out.line = if (set.items.len > 0)
-        try std.fmt.allocPrint(a, "Routines now spend within a budget of their own. So what they spent before goes on, budget_per_day is set from max_per_day: {s}. /money shows it; /money pause stops it.", .{set.items})
+    var line: std.ArrayList(u8) = .empty;
+    if (set.items.len > 0)
+        try line.print(a, "Routines now spend within a budget of their own, and what they spent before goes on: budget_per_day is set from max_per_day ({s}).", .{set.items})
     else
-        "Routines now spend only within a budget of their own, and none is set (no max_per_day to take it from): they spend nothing without asking you until /money budget N a day sets one.";
+        try line.appendSlice(a, "Routines now spend only within a budget of their own, and none is set (no max_per_day to take it from): they spend nothing without asking you until /money budget N a day sets one at each money server.");
+    if (none.items.len > 0) try line.print(a, " {s} had no cap, so routines spend nothing there (budget_per_day = none in mcp.ini).", .{none.items});
+    if (out.triggers_off or out.workflows_off) {
+        const both = out.triggers_off and out.workflows_off;
+        try line.print(a, " {s} {s} off, as {s} ([money] {s} in config.ini).", .{
+            if (both) "Triggers and workflows" else if (out.triggers_off) "Triggers" else "Workflows",
+            if (both) "stay" else "stays",
+            if (both) "they were" else "it was",
+            if (both) "triggers = off, workflows = off" else if (out.triggers_off) "triggers = off" else "workflows = off",
+        });
+    }
+    if (set.items.len > 0) try line.appendSlice(a, " /money shows it; /money pause stops it.");
+    out.line = line.items;
     return out;
 }
 
@@ -193,7 +250,10 @@ test "amounts_read_plainly" {
     const a = arena.allocator();
     try t.expectEqualStrings("40", try amountText(a, 40));
     try t.expectEqualStrings("12.50", try amountText(a, 12.5));
-    try t.expectEqualStrings("0.10", try amountText(a, 0.1));
+    // below 1: the amount as it is (a coin's fractions), up to 8 decimals
+    try t.expectEqualStrings("0.1", try amountText(a, 0.1));
+    try t.expectEqualStrings("0.0015", try amountText(a, 0.0015));
+    try t.expectEqualStrings("0.00000001", try amountText(a, 0.00000001));
     try t.expectEqualStrings("0", try amountText(a, 0));
 }
 
@@ -227,18 +287,24 @@ test "upgrade_texts_set_the_budget_where_the_cap_is" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const mcp_ini = "[frisco]\r\ncommand = x\r\nmoney = shop_order\r\namount = shop_order:total\r\nmax_per_day = 20   ; its own\r\n[broker]\r\ncommand = y\r\nmoney = buy\r\nmax_per_day = none\r\n[other]\r\ncommand = z\r\nmoney = pay\r\nmax_per_day = 9\r\nbudget_per_month = 30\r\n";
+    const mcp_ini = "[frisco]\r\ncommand = x\r\nmoney = shop_order\r\namount = shop_order:total\r\nmax_per_day = 20   ; its own\r\n[broker]\r\ncommand = y\r\nmoney = buy\r\namount = notional_usd\r\nmax_per_day = none\r\n[other]\r\ncommand = z\r\nmoney = pay\r\nmax_per_day = 9\r\nbudget_per_month = 30\r\n[plain]\r\ncommand = w\r\nmoney = pay\r\namount = sum\r\n[tools]\r\ncommand = v\r\n";
     // spent before: scheduled on (the file's own line) and a day cap
     const u = (try upgradeTexts(a, "[chat]\napi = x\n[money]\nmax_per_day = 50\nscheduled = on   ; mine\n", mcp_ini)).?;
-    try t.expectEqualStrings("[chat]\napi = x\n[money]\nmax_per_day = 50\nscheduled = on   ; mine\nbudget_per_day = 50\n", u.config.?);
-    // a server's own day cap: its own budget (CRLF kept); none, or a budget already there: left
-    try t.expectEqualStrings("[frisco]\r\ncommand = x\r\nmoney = shop_order\r\namount = shop_order:total\r\nmax_per_day = 20   ; its own\r\nbudget_per_day = 20\r\n[broker]\r\ncommand = y\r\nmoney = buy\r\nmax_per_day = none\r\n[other]\r\ncommand = z\r\nmoney = pay\r\nmax_per_day = 9\r\nbudget_per_month = 30\r\n", u.mcp.?);
-    try t.expectEqualStrings("Routines now spend within a budget of their own. So what they spent before goes on, budget_per_day is set from max_per_day: 50 in config.ini's [money], 20 for frisco in mcp.ini. /money shows it; /money pause stops it.", u.line);
+    // triggers and workflows were off when their lines were missing: kept so
+    try t.expectEqualStrings("[chat]\napi = x\n[money]\nmax_per_day = 50\nscheduled = on   ; mine\nbudget_per_day = 50\ntriggers = off\nworkflows = off\n", u.config.?);
+    try t.expectEqual(50, u.budget_per_day.?);
+    try t.expect(u.triggers_off and u.workflows_off);
+    // a server's own day cap: its own budget (CRLF kept); one with no cap
+    // at all (none, and no cap a call) couldn't spend unattended: none
+    // there; its own budget, or [money]'s cap to go by: left
+    try t.expectEqualStrings("[frisco]\r\ncommand = x\r\nmoney = shop_order\r\namount = shop_order:total\r\nmax_per_day = 20   ; its own\r\nbudget_per_day = 20\r\n[broker]\r\ncommand = y\r\nmoney = buy\r\namount = notional_usd\r\nmax_per_day = none\r\nbudget_per_day = none\r\n[other]\r\ncommand = z\r\nmoney = pay\r\nmax_per_day = 9\r\nbudget_per_month = 30\r\n[plain]\r\ncommand = w\r\nmoney = pay\r\namount = sum\r\n[tools]\r\ncommand = v\r\n", u.mcp.?);
+    try t.expectEqualStrings("Routines now spend within a budget of their own, and what they spent before goes on: budget_per_day is set from max_per_day (50 in config.ini's [money], 20 for frisco in mcp.ini). broker had no cap, so routines spend nothing there (budget_per_day = none in mcp.ini). Triggers and workflows stay off, as they were ([money] triggers = off, workflows = off in config.ini). /money shows it; /money pause stops it.", u.line);
     // only a per-call cap: nothing to take a day's budget from
-    const v = (try upgradeTexts(a, "[money]\nmax_per_call = 10\nscheduled = yes\n", "")).?;
+    const v = (try upgradeTexts(a, "[money]\nmax_per_call = 10\nscheduled = yes\ntriggers = on\nworkflows = on\n", "")).?;
     try t.expectEqual(null, v.config);
     try t.expectEqual(null, v.mcp);
-    try t.expectEqualStrings("Routines now spend only within a budget of their own, and none is set (no max_per_day to take it from): they spend nothing without asking you until /money budget N a day sets one.", v.line);
+    try t.expect(!v.triggers_off and !v.workflows_off);
+    try t.expectEqualStrings("Routines now spend only within a budget of their own, and none is set (no max_per_day to take it from): they spend nothing without asking you until /money budget N a day sets one at each money server.", v.line);
     // never spent: no line scheduled = on, or off, or a budget already set
     try t.expectEqual(null, try upgradeTexts(a, "[money]\nmax_per_day = 50\n", mcp_ini));
     try t.expectEqual(null, try upgradeTexts(a, "[money]\nmax_per_day = 50\nscheduled = off\n", mcp_ini));

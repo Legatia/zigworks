@@ -1526,7 +1526,9 @@ Butler:  Ordered from Frisco: 3 items, 64.20 PLN; off shopping. The shop says: O
   what was ordered off the list. Over it, with no budget, or while
   spending is paused, it proposes the order as below, saying why it
   wasn't ordered on its own. `/setup reorder` asks once how much routines
-  may spend: None, Set an amount, or Like this: 30 a day, 200 a month.
+  may spend at that shop (None, Set an amount, or Like this: 30 a day, 200
+  a month), written as the shop's own `budget_per_day` and
+  `budget_per_month` in mcp.ini.
 - **Otherwise bought only on your tap.** The proposal is one item in your
   inbox, the whole order in it; the exact call it would make is kept in
   `state/errands` under the item's number. Only your **Order it** makes
@@ -2607,6 +2609,9 @@ budget_per_month = 200
 - **Off until you set one.** Routines spend only while a budget is above
   0, and each one above 0 limits its own period. None is set by default.
   `/money budget 30 a day` (or `a month`) writes it.
+- **At each money server.** A budget counts what routines spend at one
+  money server, in that server's amount units: `[money]`'s is each
+  server's budget, not one total across them.
 - **Per server**, for more than one currency: a money server's section in
   mcp.ini may say `budget_per_day` and `budget_per_month`, over `[money]`'s
   key by key. `none` there: routines spend nothing at that server; `0` is
@@ -2624,12 +2629,16 @@ budget_per_month = 200
   such decision is logged with the budget's numbers.
 - **Never from a routine, whatever the budget:** a money tool that names no
   amount (`home_guarded`'s door unlock and water main, the calendar's
-  changes), and `mail_send`.
+  changes), an amount of 0 (a server may read it as all), and
+  `mail_send`.
 - **Outside text doesn't spend.** A routine that read a page, a feed, mail,
   the calendar, another server, a forwarded message or history makes no
   money call. The paying server's own results are the one exception, so
   a routine can price and then buy; what that server's own text steers
-  at that same server is bounded by the budget.
+  at that same server is bounded by the budget. The rule goes by the
+  outside-text mark, and shell output, files read from disk and file
+  triggers carry none: text a routine reads that way can steer a payment
+  within the budget.
 - **Anything else is refused**, and waits in your inbox as a skipped item
   with the whole call, its amount and why, and **Make this payment**. Your
   tap makes exactly that call as your own, through the caps and the rules
@@ -2649,8 +2658,11 @@ budget_per_month = 200
   budget, gets `budget_per_day` set from `max_per_day` (`[money]`'s, and a
   money server's own in mcp.ini) at the first start, and is told once in
   main; with only `max_per_call`, it's told that routines spend nothing
-  until a budget is set. A config.ini an older harness wrote with
-  `scheduled = off` keeps it: `/money budget` says so.
+  until a budget is set. A money server that had no cap at all (so it
+  never spent unattended) gets `budget_per_day = none`, and missing
+  `triggers` and `workflows` lines are written `off`, as they were. A
+  config.ini an older harness wrote with `scheduled = off` keeps it:
+  `/money budget` says so.
 
 In mcp.ini, `amount =` and the caps need a `money =` line in the same
 section, a per-tool `amount` names only tools listed there, and `none` is
