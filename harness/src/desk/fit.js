@@ -418,21 +418,39 @@ export function judgeClosed(f) {
 
 // ---------- in the browser ----------
 
-/** An image as a canvas of its pixels as the browser shows it (a phone
- *  photo's EXIF orientation applied). src: a Blob or File, a URL, an
- *  image element, an ImageBitmap or a canvas. The avatar decodes its
- *  still the same way, so the fit and the drawing agree. */
-export async function loadImage(src) {
+/** SHA-256 of some bytes, as lowercase hex: the still's fingerprint in
+ *  the head, so a head isn't drawn over another photo of the same size. */
+export async function sha256Hex(buf) {
+  const d = await crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** An image's pixels as the browser shows it (a phone photo's EXIF
+ *  orientation applied) in a canvas, and its bytes when it came as a URL or
+ *  a Blob. src: a Blob or File, a URL, an image element, an ImageBitmap or
+ *  a canvas. A URL is fetched with no-cache (a cheap revalidation), so a
+ *  file changed on disk is seen at once. The avatar decodes its still the
+ *  same way, so the fit and the drawing agree. */
+export async function readImage(src) {
+  let bytes = null, blob = null;
+  if (typeof src === 'string') {
+    const r = await fetch(src, { cache: 'no-cache' });
+    if (!r.ok) throw new Error("the image didn't load");
+    bytes = await r.arrayBuffer();
+    blob = new Blob([bytes], { type: r.headers.get('Content-Type') || '' });
+  } else if (typeof Blob !== 'undefined' && src instanceof Blob) {
+    blob = src;
+    bytes = await src.arrayBuffer();
+  }
   let source = src;
-  let revoke = null;
-  if (typeof src === 'string' || (typeof Blob !== 'undefined' && src instanceof Blob)) {
-    const url = typeof src === 'string' ? src : (revoke = URL.createObjectURL(src));
+  if (blob) {
+    const url = URL.createObjectURL(blob);
     source = new Image();
     source.decoding = 'async';
     try {
       await new Promise((ok, no) => { source.onload = ok; source.onerror = () => no(new Error("the image didn't load")); source.src = url; });
       if (source.decode) await source.decode().catch(() => {});
-    } finally { if (revoke) URL.revokeObjectURL(revoke); }
+    } finally { URL.revokeObjectURL(url); }
   } else if (src && src.complete === false) {
     await new Promise((ok, no) => { src.onload = ok; src.onerror = () => no(new Error("the image didn't load")); });
   }
@@ -441,7 +459,12 @@ export async function loadImage(src) {
   const c = document.createElement('canvas');
   c.width = w; c.height = h;
   c.getContext('2d').drawImage(source, 0, 0, w, h);
-  return c;
+  return { canvas: c, bytes };
+}
+
+/** readImage's canvas alone. */
+export async function loadImage(src) {
+  return (await readImage(src)).canvas;
 }
 
 const ASSETS = '/desk/assets/';
@@ -654,9 +677,10 @@ export async function fit(photo, closedPhoto, options = {}) {
   const t0 = performance.now();
   const result = { ok: false, warnings: [], faceWidth: null, closedUsed: false, files: null, report: null };
   const refuse = (code, message, extra) => Object.assign(result, { ok: false, code, message }, extra);
-  let still, closed;
+  let still, closed, stillBytes;
   try {
-    [still, closed] = await Promise.all([loadImage(photo), closedPhoto ? loadImage(closedPhoto) : null]);
+    const [s0, c0] = await Promise.all([readImage(photo), closedPhoto ? readImage(closedPhoto) : null]);
+    still = s0.canvas; stillBytes = s0.bytes; closed = c0 && c0.canvas;
   } catch (e) {
     return refuse('image', "The photo didn't open. Use a JPEG or PNG.");
   }
@@ -696,6 +720,8 @@ export async function fit(photo, closedPhoto, options = {}) {
     lidTones(still, g.meta);
     const maskCanvas = eyeMask(W, H, g.meta);
     g.meta.photo = { expression: scores(res), turned: +facts.turned.toFixed(1), faceWidth: result.faceWidth };
+    // the still's fingerprint: the pack's still must be these very bytes
+    if (stillBytes) g.meta.still = { bytes: stillBytes.byteLength, sha256: await sha256Hex(stillBytes) };
     const head = packHead(g.meta, g.arrays);
     const [eyes, eyemask] = await Promise.all([toBlob(eyesCanvas), toBlob(maskCanvas)]);
     result.report = {

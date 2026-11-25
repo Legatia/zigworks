@@ -15,7 +15,7 @@
 // packs). A pack with only a still, a head that doesn't load, or no
 // WebGL 2: the still, breathing (avatar.mode === 'still').
 import * as THREE from './vendor/three.module.min.js';
-import { readHead, loadImage, fit } from './fit.js';
+import { readHead, readImage, loadImage, fit, sha256Hex } from './fit.js';
 
 export { readHead, fit };
 
@@ -189,22 +189,24 @@ function nodCurve(d) {
 // ---------- the pack ----------
 
 async function loadPack(base) {
-  const r = await fetch(base + 'avatar.ini').catch(() => null);
+  // no-cache: the desk serves packs cacheable for a day, and a refit must show at once
+  const r = await fetch(base + 'avatar.ini', { cache: 'no-cache' }).catch(() => null);
   if (!r || !r.ok) throw new Error("The avatar didn't load: there's no avatar.ini at " + base);
   const files = parseIni(await r.text());
   if (!files.still) throw new Error("The avatar didn't load: its avatar.ini names no still.");
-  const still = await loadImage(base + files.still).catch(() => { throw new Error("The avatar didn't load: its still " + files.still + " didn't load."); });
+  const { canvas: still, bytes: stillBytes } = await readImage(base + files.still).catch(() => { throw new Error("The avatar didn't load: its still " + files.still + " didn't load."); });
   const pack = { files, still, head: null, eyes: null, mask: null, closed: null, problem: null };
   if (files.head && files.eyes && files.eyemask) {
     try {
       const [buf, eyes, mask] = await Promise.all([
-        fetch(base + files.head).then((x) => { if (!x.ok) throw new Error(files.head + ' ' + x.status); return x.arrayBuffer(); }),
+        fetch(base + files.head, { cache: 'no-cache' }).then((x) => { if (!x.ok) throw new Error(files.head + ' ' + x.status); return x.arrayBuffer(); }),
         loadImage(base + files.eyes), loadImage(base + files.eyemask),
       ]);
       const head = readHead(buf);
       if (head.meta.kind !== 'head') throw new Error(files.head + ' is not a fitted head');
       const [W, H] = head.meta.image || [];
       if (W !== still.width || H !== still.height) throw new Error(`it was fitted to a ${W}×${H} photo and the still is ${still.width}×${still.height}`);
+      if (head.meta.still && head.meta.still.sha256 && stillBytes && (await sha256Hex(stillBytes)) !== head.meta.still.sha256) throw new Error('it was fitted to another photo');
       pack.head = head; pack.eyes = eyes; pack.mask = mask;
       pack.closed = files.closed ? await loadImage(base + files.closed).catch(() => null) : null;
       if (pack.closed && (pack.closed.width !== W || pack.closed.height !== H)) pack.closed = null;
@@ -1054,7 +1056,7 @@ export async function createAvatar(element, packUrl, options = {}) {
   avatar.inspect = () => ({
     drawn, state: S.state, pose: { ...S.pose }, closed: S.closed, talking: !!(S.talk && S.talk.playing),
     tau: S.talk && S.talk.playing ? S.talk.clock() : null, filter: canvas.style.filter || (stillCanvas && stillCanvas.style.filter) || '',
-    audio: audioCtx ? audioCtx.state : null,
+    audio: audioCtx ? audioCtx.state : null, still: [pack.still.width, pack.still.height],
   });
   if (!head) showStill();
   else {

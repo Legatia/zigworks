@@ -368,5 +368,12 @@ check('the_tiny_head_fixture_is_what_the_packer_writes', () => {
   eq(Buffer.compare(Buffer.from(have), Buffer.from(buf)), 0, 'bytes');
 });
 
+// the still's fingerprint (crypto.subtle, async)
+try {
+  const hex = await fit.sha256Hex(new TextEncoder().encode('abc').buffer);
+  eq(hex, 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  n++; console.log('ok ' + n + ' the_still_is_fingerprinted_by_sha256');
+} catch (e) { failed++; console.log('FAIL the_still_is_fingerprinted_by_sha256\n  ' + (e && e.stack || e)); }
+
 console.log(failed ? `${failed} failed, ${n} passed` : `all ${n} passed`);
 process.exit(failed ? 1 : 0);

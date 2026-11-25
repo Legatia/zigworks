@@ -57,6 +57,9 @@ pub const HeadInfo = struct {
     vertices: u32,
     shapes: usize,
     image: [2]u32,
+    /// the SHA-256 (lowercase hex) of the still it was fitted to, when the
+    /// fit knew the still's bytes
+    still_sha256: ?[64]u8 = null,
 };
 
 pub const Report = struct {
@@ -215,6 +218,7 @@ pub fn check(io: Io, a: std.mem.Allocator, dir: []const u8) !Report {
         try problems.append(a, try std.fmt.allocPrint(a, "head, eyes and eyemask go together; avatar.ini names only {s}", .{try std.mem.join(a, " and ", named.items)}));
 
     var still_size: ?[2]u32 = null;
+    var still_sha256: ?[64]u8 = null;
     var head: ?HeadInfo = null;
     for (keys, 0..) |key, slot| {
         const name = ini.files[slot] orelse continue;
@@ -259,7 +263,12 @@ pub fn check(io: Io, a: std.mem.Allocator, dir: []const u8) !Report {
         } else if (imageSize(bytes)) |wh| {
             f.width = wh[0];
             f.height = wh[1];
-            if (std.mem.eql(u8, key, "still")) still_size = wh;
+            if (std.mem.eql(u8, key, "still")) {
+                still_size = wh;
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                still_sha256 = std.fmt.bytesToHex(digest, .lower);
+            }
         } else try problems.append(a, try std.fmt.allocPrint(a, "{s}: the size of {s} can't be read", .{ key, name }));
         try files.append(a, f);
     }
@@ -267,8 +276,10 @@ pub fn check(io: Io, a: std.mem.Allocator, dir: []const u8) !Report {
     if (still_size) |ss| {
         for (files.items) |f| if (std.mem.eql(u8, f.key, "closed") and f.width > 0 and (f.width != ss[0] or f.height != ss[1]))
             try problems.append(a, try std.fmt.allocPrint(a, "{s} is {d}x{d}; the still is {d}x{d}", .{ f.name, f.width, f.height, ss[0], ss[1] }));
-        if (head) |h| if (h.image[0] != ss[0] or h.image[1] != ss[1])
+        if (head) |h| if (h.image[0] != ss[0] or h.image[1] != ss[1]) {
             try problems.append(a, try std.fmt.allocPrint(a, "{s} was fitted to a {d}x{d} photo; the still is {d}x{d}", .{ ini.get("head").?, h.image[0], h.image[1], ss[0], ss[1] }));
+        } else if (h.still_sha256) |want| if (still_sha256) |got| if (!std.mem.eql(u8, &want, &got))
+            try problems.append(a, try std.fmt.allocPrint(a, "{s} was fitted to another photo (the still's SHA-256 isn't the one it was fitted to)", .{ini.get("head").?}));
     }
     return .{ .files = files.items, .head = head, .problems = problems.items, .fitted = named.items.len == 3 and head != null };
 }
@@ -457,7 +468,22 @@ pub fn readHeader(a: std.mem.Allocator, bytes: []const u8, why: *[]const u8) !He
             if (v >= pair[1]) return fail(why, "head.bin's array {s} points past its {d} vertices", .{ iname, pair[1] }, a);
         }
     }
-    return .{ .version = version, .vertices = n, .shapes = shapes.len, .image = image };
+    // the still it was fitted to, when the fit knew its bytes
+    var still_sha256: ?[64]u8 = null;
+    if (field(root, "still")) |st| {
+        const hex = switch (field(st, "sha256") orelse .null) {
+            .string => |x| x,
+            else => "",
+        };
+        if (hex.len != 64) return fail(why, "head.bin's header has no still.sha256 of 64 hex digits", .{}, a);
+        var h: [64]u8 = undefined;
+        for (hex, 0..) |ch, i| {
+            if (!std.ascii.isHex(ch)) return fail(why, "head.bin's header has no still.sha256 of 64 hex digits", .{}, a);
+            h[i] = std.ascii.toLower(ch);
+        }
+        still_sha256 = h;
+    }
+    return .{ .version = version, .vertices = n, .shapes = shapes.len, .image = image, .still_sha256 = still_sha256 };
 }
 
 fn describe(v: std.json.Value) ?Arr {
@@ -571,6 +597,8 @@ const TestHead = struct {
     misalign: bool = false,
     past_end: bool = false,
     outline_points: u32 = 16,
+    /// the still's SHA-256 (hex) the head says it was fitted to
+    still_sha256: ?[]const u8 = null,
 };
 
 const test_shapes = shape_names;
@@ -634,8 +662,8 @@ fn testHead(a: std.mem.Allocator, o: TestHead) ![]u8 {
         \\{{"kind":"{s}","vertices":{d},"image":[{d},{d}],"shapes":[{s}],"shapeScale":[{s}],
         \\"face":{{"noseTip":[32,14],"chin":[32,28],"forehead":[32,2],"left":[20,12],"right":[44,12]}},
         \\"mouth":{{"center":[32,20],"left":[26,20],"right":[38,20],"inner":[{s}],"outer":[{s}],"jaw":[0,-3,-2]}},
-        \\"eyes":[{s},{s}],"eyeCrop":[10,4,44,12],"photo":{{}},"arrays":{{{s}}}}}
-    , .{ o.kind, n, o.image[0], o.image[1], shapes_json.items, scale_json.items, lip.items, lip.items, eye, eye, desc.items });
+        \\"eyes":[{s},{s}],"eyeCrop":[10,4,44,12],"photo":{{}}{s},"arrays":{{{s}}}}}
+    , .{ o.kind, n, o.image[0], o.image[1], shapes_json.items, scale_json.items, lip.items, lip.items, eye, eye, if (o.still_sha256) |h| try std.fmt.allocPrint(a, ",\"still\":{{\"bytes\":1,\"sha256\":\"{s}\"}}", .{h}) else "", desc.items });
     var hdr: std.ArrayList(u8) = .empty;
     try hdr.appendSlice(a, header);
     while (hdr.items.len % 4 != 0) try hdr.append(a, ' ');
@@ -962,4 +990,26 @@ test "a_segment_of_the_largest_length_is_skipped" {
     const rest = try jpeg(a, 640, 480, 0xc0, false);
     try out.appendSlice(a, rest[2..]);
     try t.expectEqual([2]u32{ 640, 480 }, imageSize(out.items).?);
+}
+
+fn sha256Hex(a: std.mem.Allocator, data: []const u8) ![]const u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &d, .{});
+    return std.fmt.allocPrint(a, "{x}", .{&d});
+}
+
+test "a_head_fitted_to_another_photo_of_the_same_size_is_a_problem" {
+    var p: Pack = undefined;
+    try p.init();
+    defer p.deinit();
+    try p.fitted();
+    const fitted_to = try jpeg(p.a(), 64, 32, 0xc0, true); // same size, other bytes
+    try p.put("head.bin", try testHead(p.a(), .{ .still_sha256 = try sha256Hex(p.a(), fitted_to) }));
+    try expectHas(try problemsText(p.a(), try p.check()), "head.bin was fitted to another photo (the still's SHA-256 isn't the one it was fitted to)");
+    // the still it was fitted to: good
+    try p.put("still.jpg", fitted_to);
+    try t.expectEqualStrings("", try problemsText(p.a(), try p.check()));
+    // a header whose fingerprint isn't one
+    try p.put("head.bin", try testHead(p.a(), .{ .still_sha256 = "abc" }));
+    try expectHas(try problemsText(p.a(), try p.check()), "head.bin's header has no still.sha256 of 64 hex digits");
 }

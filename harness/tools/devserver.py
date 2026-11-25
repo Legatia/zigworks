@@ -1,6 +1,6 @@
 """A 127.0.0.1 server with the desk's URL layout, for the avatar's dev pages.
 
-usage: python3 -I tools/devserver.py PORT DATA [--csp POLICY | --no-csp]
+usage: python3 -I tools/devserver.py PORT DATA [--csp POLICY | --no-csp] [--cache]
 
   GET  /desk/static/FILE   -> harness/src/desk/FILE (avatar.js, fit.js, vendor/)
   GET  /desk/avatars/PATH  -> DATA/avatars/PATH
@@ -19,10 +19,15 @@ and a POST's Origin must be this server. /csp-report takes only the
 browser's own report type (application/csp-report), which a page can't
 send to another origin without a preflight either.
 
+--cache serves /desk/avatars/ as the desk does: Cache-Control: private,
+max-age=86400 and an ETag (304 on If-None-Match), so pages are checked
+against a browser cache that holds the files.
+
 Every response carries a Content-Security-Policy (the default below, which
 reports to /csp-report), so the pages run under the rules the desk has.
 Dev only: harness serves the desk itself.
 """
+import hashlib
 import hmac
 import os
 import secrets
@@ -71,6 +76,7 @@ def main():
         csp = None
     if "--csp" in args:
         csp = args[args.index("--csp") + 1]
+    cache = "--cache" in args
     token = secrets.token_urlsafe(32)
     hosts = {"127.0.0.1:%d" % port, "localhost:%d" % port}
     origins = {"http://" + h for h in hosts}
@@ -82,11 +88,15 @@ def main():
     }
 
     class H(BaseHTTPRequestHandler):
-        def head(self, code, ctype, n):
+        def head(self, code, ctype, n, etag=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(n))
-            self.send_header("Cache-Control", "no-store")
+            if etag:
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.send_header("ETag", etag)
+            else:
+                self.send_header("Cache-Control", "no-store")
             if csp:
                 self.send_header("Content-Security-Policy", csp)
             self.end_headers()
@@ -114,7 +124,13 @@ def main():
                             body = f.read()
                     except Exception:
                         break
-                    self.head(200, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), len(body))
+                    etag = None
+                    if cache and prefix == "desk/avatars":
+                        etag = '"%s"' % hashlib.sha256(body).hexdigest()[:32]
+                        if self.headers.get("If-None-Match") == etag:
+                            self.head(304, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), 0, etag)
+                            return
+                    self.head(200, TYPES.get(os.path.splitext(p)[1].lower(), "application/octet-stream"), len(body), etag)
                     self.wfile.write(body)
                     return
             self.answer(404, "not found")
