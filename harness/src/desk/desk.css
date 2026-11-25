@@ -160,13 +160,13 @@ body[data-state="resting"] .card .dot, body[data-state="quiet"] .card .dot { ani
 .item .body { font-size: 14px; color: var(--soft); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 12em; overflow-y: auto; }
 .item .meta { font: 12px var(--mono); color: var(--muted); }
 .item .meta.urgent { color: var(--alert); }
-.item .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-.item .choices button { height: 44px; padding: 0 18px; border: 1px solid var(--line-hi); background: transparent; font-size: 14px; }
-.item .choices button.first { border: 0; background: var(--magenta); color: var(--bg); font-weight: 700; }
+.item .choices, .msg > .choices { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.item .choices button, .msg > .choices button { height: 44px; padding: 0 18px; border: 1px solid var(--line-hi); background: transparent; font-size: 14px; }
+.item .choices button.first, .msg > .choices button.first { border: 0; background: var(--magenta); color: var(--bg); font-weight: 700; }
 .item.urgent .choices button.first { background: var(--alert); }
 .item .answer { display: flex; gap: 8px; width: 100%; }
 .item .answer input { flex: 1; min-width: 0; height: 44px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line-hi); }
-.item .said { font-size: 13px; color: var(--soft); }
+.item .said, .msg > .said { font-size: 13px; color: var(--soft); }
 
 .topics { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .topics button { width: 100%; text-align: left; display: flex; align-items: flex-start; gap: 12px; padding: 10px; min-height: 44px; background: transparent; border: 1px solid transparent; }

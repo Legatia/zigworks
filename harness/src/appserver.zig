@@ -1964,6 +1964,9 @@ test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
     try expectHas(js, "$(\"speakFree\").hidden = !(S.settings.speakers || []).some((x) => x.api === \"gemini\");");
     // targets of 44 px, the "i" too
     try expectHas(deskFile("desk.css").?, ".info > button { width: 44px; height: 44px;");
+    // a chat message's own buttons (a quick reply) are styled as an item's are
+    try expectHas(deskFile("desk.css").?, ".item .choices button, .msg > .choices button { height: 44px;");
+    try expectHas(deskFile("desk.css").?, ".item .choices button.first, .msg > .choices button.first {");
     // the apps, from the side panel
     try expectHas(deskFile("index.html").?, "id=\"apps\"");
     try expectHas(js, "\"/desk/apps/\"");

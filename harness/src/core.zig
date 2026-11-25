@@ -36701,7 +36701,7 @@ test "a_desk_turn_goes_to_its_conversation_with_telegrams_echo" {
     // [desk] echo = off: none
     const p = f.core.paths;
     try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p.config, .data = try std.fmt.allocPrint(a, "{s}\n[desk]\necho = off\n", .{f.core.readOr(a, p.config)}) });
-    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try expectHas(try reloadIdle(&f), "Settings reloaded.");
     try f.e.script(3, model.textReply("ok two"));
     _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"second\"}");
     try f.rec.waitFor("ok two");
