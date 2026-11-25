@@ -5525,7 +5525,7 @@ pub const Core = struct {
                 .port = port,
                 .log = &c.log,
                 .version = @import("build_options").version,
-                .desk = .{ .home = c.paths.home, .state = c.paths.state },
+                .desk = .{ .home = c.paths.home, .state = c.paths.state, .exe_dir = c.exe_dir },
             }) catch |e| switch (e) {
                 error.AddressInUse, error.AccessDenied => if (i + 1 < tries) continue else return e,
                 else => return e,
@@ -15256,22 +15256,35 @@ pub const Core = struct {
             try util.jsonString(out, a, if (c.providers.find(name)) |p| p.key_name else name);
             try out.append(a, '}');
         }
-        try out.print(a, "],\"echo\":{s},\"voice\":{s}}}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+        try out.print(a, "],\"echo\":{s},\"voice\":{s}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+        // the fit's files: all there in one place or another, and the
+        // folder they go in (the data folder's)
+        const dirs = try appserver.assetDirs(a, c.paths.home, c.exe_dir);
+        try out.print(a, ",\"fit_files\":{s},\"fit_dir\":", .{if (appserver.fitFilesThere(c.io, a, dirs)) "true" else "false"});
+        try util.jsonString(out, a, dirs[0]);
+        try out.append(a, '}');
     }
 
-    /// The avatars there are: `avatars/`'s folders, butler first.
+    /// The avatars there are: `avatars/`'s folders, butler first (its pack
+    /// is held until its portraits are cleared, so it's listed only when
+    /// placed by hand).
     fn deskAvatars(c: *Core, a: std.mem.Allocator) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
-        try out.append(a, "butler");
         const dir = try std.fs.path.join(a, &.{ c.paths.home, "avatars" });
         var d = Io.Dir.cwd().openDir(c.io, dir, .{ .iterate = true }) catch return out.items;
         defer d.close(c.io);
+        var butler_there = false;
         var it = d.iterate();
         while (it.next(c.io) catch null) |e| {
-            if (e.kind != .directory or !config.avatarName(e.name) or std.mem.eql(u8, e.name, "butler")) continue;
+            if (e.kind != .directory or !config.avatarName(e.name)) continue;
+            if (std.mem.eql(u8, e.name, "butler")) {
+                butler_there = true;
+                continue;
+            }
             try out.append(a, try a.dupe(u8, e.name));
         }
-        std.mem.sort([]const u8, out.items[1..], {}, struct {
+        if (butler_there) try out.insert(a, 0, "butler");
+        std.mem.sort([]const u8, out.items[@intFromBool(butler_there)..], {}, struct {
             fn lt(_: void, x: []const u8, y: []const u8) bool {
                 return std.mem.lessThan(u8, x, y);
             }
@@ -36586,7 +36599,72 @@ test "desk_settings_write_and_reload" {
     try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"avatar\":\"me\"}").body);
     try t.expectEqualStrings("me", f.core.cfg.desk.avatar);
     const st = deskCall(&f, .GET, "state", "", "").body;
-    try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"butler\",\"me\"]");
+    try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"me\"]");
+}
+
+test "desk_state_says_whether_the_fit_files_are_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const data = try std.fs.path.join(a, &.{ f.home, "desk-assets" });
+    const bin = try std.fs.path.join(a, &.{ f.e.dir, "bin" });
+    f.core.exe_dir = bin;
+    const fitOf = struct {
+        fn of(fx: *Fix, al: std.mem.Allocator) !struct { there: bool, dir: []const u8 } {
+            const v = jv.parse(al, deskCall(fx, .GET, "state", "", "").body) orelse return error.TestUnexpectedResult;
+            return .{ .there = jv.boolean(jv.at(v, &.{ "settings", "fit_files" })) orelse return error.TestUnexpectedResult, .dir = jv.str(jv.at(v, &.{ "settings", "fit_dir" })) orelse return error.TestUnexpectedResult };
+        }
+    }.of;
+    // none: said, with the data folder's desk-assets/ as where they go
+    const none = try fitOf(&f, a);
+    try t.expect(!none.there);
+    try t.expectEqualStrings(data, none.dir);
+    for (appserver.fit_files) |rel| {
+        const p = try std.fs.path.join(a, &.{ data, rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try t.expect((try fitOf(&f, a)).there);
+    // the base head beside the binary instead: still all there
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ bin, "desk-assets" }));
+    try Io.Dir.cwd().rename(try std.fs.path.join(a, &.{ data, "base-head.bin" }), Io.Dir.cwd(), try std.fs.path.join(a, &.{ bin, "desk-assets", "base-head.bin" }), t.io);
+    try t.expect((try fitOf(&f, a)).there);
+}
+
+test "fit_files_are_there_only_when_all_are" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const data = try std.fs.path.join(a, &.{ f.home, "desk-assets" });
+    // MediaPipe's files without the base head, then all but one wasm
+    for (appserver.fit_files) |rel| {
+        if (std.mem.eql(u8, rel, "base-head.bin")) continue;
+        const p = try std.fs.path.join(a, &.{ data, rel });
+        try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
+        try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
+    }
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":false");
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = try std.fs.path.join(a, &.{ data, "base-head.bin" }), .data = "x" });
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":true");
+    try Io.Dir.cwd().deleteFile(t.io, try std.fs.path.join(a, &.{ data, "mediapipe", "wasm", "vision_wasm_nosimd_internal.wasm" }));
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"fit_files\":false");
+}
+
+test "the_avatars_listed_are_the_packs_there" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // a fresh install: the default butler isn't there, so nothing is listed
+    try t.expectEqualStrings("butler", f.core.cfg.desk.avatar);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"avatar\":\"butler\",\"avatars\":[]");
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "settings", "", "{\"avatar\":\"butler\"}").status);
+    // its pack placed: listed, and chosen
+    try Io.Dir.cwd().createDirPath(t.io, try std.fs.path.join(a, &.{ f.home, "avatars", "butler" }));
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"avatars\":[\"butler\"]");
+    try t.expectEqualStrings("{\"ok\":true}", deskCall(&f, .POST, "settings", "", "{\"avatar\":\"butler\"}").body);
 }
 
 test "desk_voice_is_transcribed_then_a_turn" {

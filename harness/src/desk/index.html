@@ -30,6 +30,13 @@
       <section class="stage" aria-label="Avatar">
         <div class="frame">
           <div class="avatar" id="avatar"></div>
+          <div class="empty-stage" id="emptyStage">
+            <button type="button" id="addPortraitBtn" class="btn cut-s" hidden>Add a portrait</button>
+            <svg class="bust" viewBox="0 0 400 400" preserveAspectRatio="xMidYMax meet" aria-hidden="true" focusable="false">
+              <ellipse cx="200" cy="148" rx="64" ry="80"></ellipse>
+              <path d="M174 222V252C174 274 166 286 146 290C84 300 40 336 36 400M226 222V252C226 274 234 286 254 290C316 300 360 336 364 400"></path>
+            </svg>
+          </div>
           <div class="glow" aria-hidden="true"></div>
           <span class="br tl" aria-hidden="true"></span><span class="br tr" aria-hidden="true"></span><span class="br bl" aria-hidden="true"></span><span class="br bk" aria-hidden="true"></span>
           <div class="sweep" aria-hidden="true"></div>
@@ -101,10 +108,27 @@
     <fieldset>
       <legend>Avatar</legend>
       <div id="avatarChoices" role="radiogroup" aria-label="Avatar"></div>
+      <p class="fine" id="avatarNone" hidden>No avatars yet.</p>
     </fieldset>
 
-    <fieldset>
+    <fieldset id="ownAvatar">
       <legend>Your own avatar</legend>
+      <div class="missing" id="fitMissing" tabindex="-1" hidden>
+        <p class="missing-line">
+          The fit files aren't installed.
+          <span class="info">
+            <button type="button" aria-expanded="false" aria-controls="fitInfo" aria-label="About the fit files">i</button>
+            <span class="bubble" id="fitInfo" hidden>
+              <ul>
+                <li>They fit a photo onto the 3D head: MediaPipe's face landmarker (about 23 MB) and the base head.</li>
+                <li>harness's release archive has them in desk-assets/ beside the harness binary, and the desk app carries them; harness finds them there too.</li>
+                <li>Built from source: sh tools/fetch-desk-assets.sh with this folder, and desk-assets/base-head.bin from the repository copied into it.</li>
+              </ul>
+            </span>
+          </span>
+        </p>
+        <p class="fine">They go in <span class="mono" id="fitDir">desk-assets/</span></p>
+      </div>
       <h3>
         Upload a photo
         <span class="info">
@@ -125,6 +149,7 @@
         <li>Works best without glasses.</li>
         <li>JPEG or PNG, up to 10 MB.</li>
       </ul>
+      <fieldset class="bare" id="upControls">
       <div class="row">
         <label class="sr" for="upName">Name</label>
         <input type="text" id="upName" placeholder="Name (a-z, 0-9, -)" maxlength="32" autocomplete="off" spellcheck="false">
@@ -137,6 +162,7 @@
         <button type="button" id="upBtn" class="btn cut-s" disabled>Upload</button>
         <button type="button" id="fitBtn" class="btn cut-s" hidden>Fit it</button>
       </div>
+      </fieldset>
       <p class="outcome" id="upOutcome" role="status" hidden></p>
 
       <h3>
@@ -153,11 +179,13 @@
         </span>
       </h3>
       <p class="fine">Recommended: the avatar rests with its eyes closed.</p>
+      <fieldset class="bare" id="closedControls">
       <div class="row">
         <label class="sr" for="closedFile">Eyes-closed photo</label>
         <input type="file" id="closedFile" accept="image/jpeg,image/png">
         <button type="button" id="closedBtn" class="btn cut-s" disabled>Add it</button>
       </div>
+      </fieldset>
       <p class="outcome" id="fitOutcome" role="status" hidden></p>
     </fieldset>
 

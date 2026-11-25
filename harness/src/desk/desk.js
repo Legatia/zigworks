@@ -22,7 +22,7 @@ const S = {
   alerts: 0,
   runs: [],
   quiet: { now: false, hours: "" },
-  settings: { avatar: "butler", avatars: ["butler"], speak: "off", speak_choices: ["off"], voice: false },
+  settings: { avatar: "", avatars: [], speak: "off", speak_choices: ["off"], voice: false },
   offset: 0,
   speaking: false,
   speakQueue: [],
@@ -32,7 +32,7 @@ const S = {
   lastBadge: -1,
   lastAlerts: 0,
   avatar: null,
-  avatarName: "",
+  avatarName: null,
   reentered: false,
 };
 
@@ -510,19 +510,39 @@ $("micBtn").addEventListener("click", async () => {
 
 // ---- the avatar ----
 
+/**
+ * The chosen avatar when its pack is there; otherwise (none chosen, its
+ * folder gone, or it won't load) the empty stage: an outline and the way
+ * to add a portrait. Tried once per name; runFit asks again.
+ */
 async function ensureAvatar() {
-  const name = S.settings.avatar || "butler";
-  if (S.avatar && S.avatarName === name) return;
-  if (S.avatar) S.avatar.destroy && S.avatar.destroy();
+  const name = (S.settings.avatars || []).includes(S.settings.avatar) ? S.settings.avatar : "";
+  if (S.avatarName === name) return;
+  if (S.avatar) S.avatar.dispose && S.avatar.dispose();
   S.avatar = null;
   S.avatarName = name;
   $("avatar").textContent = "";
+  emptyStage(!name);
+  if (!name) return;
   try {
-    S.avatar = await createAvatar($("avatar"), "/desk/avatars/" + encodeURIComponent(name) + "/", { reducedMotion });
+    const av = await createAvatar($("avatar"), "/desk/avatars/" + encodeURIComponent(name) + "/", { reducedMotion });
+    // another was chosen meanwhile
+    if (S.avatarName !== name) return av.dispose && av.dispose();
+    S.avatar = av;
     S.avatar.setState(stateNow());
+    $("emptyStage").hidden = true;
   } catch (_) {
+    if (S.avatarName !== name) return;
     S.avatar = null;
+    $("avatar").textContent = "";
+    emptyStage(true);
   }
+}
+
+/** The outline shows until an avatar draws; the button once there is none. */
+function emptyStage(none) {
+  $("emptyStage").hidden = false;
+  $("addPortraitBtn").hidden = !none;
 }
 
 // ---- loading and the long-poll ----
@@ -636,7 +656,8 @@ const AVATAR_NAME = /^[a-z0-9-]{1,32}$/;
 function renderSettings() {
   const box = $("avatarChoices");
   box.textContent = "";
-  for (const name of S.settings.avatars || ["butler"]) {
+  $("avatarNone").hidden = (S.settings.avatars || []).length > 0;
+  for (const name of S.settings.avatars || []) {
     const lab = el("label", "choice");
     const r = el("input");
     r.type = "radio";
@@ -656,7 +677,17 @@ function renderSettings() {
     sel.append(o);
   }
   speakWhere();
+  fitFiles();
   gateUploads();
+}
+
+/** Without the fit files a photo can't be fitted: said, with their folder, and the upload off. */
+function fitFiles() {
+  const fit = S.settings.fit_files !== false;
+  $("fitMissing").hidden = fit;
+  $("fitDir").textContent = S.settings.fit_dir || "desk-assets/";
+  $("upControls").disabled = !fit;
+  $("closedControls").disabled = !fit;
 }
 
 /**
@@ -779,7 +810,7 @@ async function runFit(name) {
   lines.push(closed ? "An eyes-closed version is in use." : "No eyes-closed version: closed eyes are drawn.");
   note("fitOutcome", lines.join(" "), warns.length > 0);
   await setSetting({ avatar: name }, "upOutcome");
-  S.avatarName = "";
+  S.avatarName = null;
   ensureAvatar();
 }
 
@@ -839,9 +870,20 @@ for (const b of document.querySelectorAll(".info > button")) {
   });
 }
 
-$("settingsBtn").addEventListener("click", () => {
+function openSettings() {
   renderSettings();
-  $("settings").showModal();
+  if (!$("settings").open) $("settings").showModal();
+}
+
+$("settingsBtn").addEventListener("click", openSettings);
+
+// the avatar part of Settings, ready for a photo (or saying what's missing)
+$("addPortraitBtn").addEventListener("click", () => {
+  openSettings();
+  const fit = S.settings.fit_files !== false;
+  const at = fit ? $("ownAvatar") : $("fitMissing");
+  at.scrollIntoView({ block: "start", behavior: reducedMotion ? "auto" : "smooth" });
+  (fit ? $("upName") : $("fitMissing")).focus({ preventScroll: true });
 });
 $("settingsClose").addEventListener("click", () => $("settings").close());
 
