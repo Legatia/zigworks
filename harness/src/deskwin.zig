@@ -236,6 +236,12 @@ pub const Msg = struct {
     urgent: bool = false,
     /// Where the owner wrote it ("desk", "telegram", "terminal"); "": harness's.
     via: []const u8 = "",
+    /// The channel's id of the message (the desk alone's own); 0: none.
+    /// Never sent to the page.
+    chan: i64 = 0,
+    /// Its buttons (label, data) when the desk is the only way in; the page
+    /// gets the labels, a press names one by its place.
+    buttons: []const [2][]const u8 = &.{},
 };
 
 /// The last 50 messages of each conversation, in memory only: a private
@@ -273,6 +279,15 @@ pub const History = struct {
     fn freeMsg(h: *History, m: Msg) void {
         h.gpa.free(m.text);
         h.gpa.free(m.via);
+        freeButtons(h.gpa, m.buttons);
+    }
+
+    fn freeButtons(gpa: std.mem.Allocator, bs: []const [2][]const u8) void {
+        for (bs) |b| {
+            gpa.free(b[0]);
+            gpa.free(b[1]);
+        }
+        gpa.free(bs);
     }
 
     /// Adds `m` to `conv` (its texts copied); returns its id.
@@ -285,6 +300,8 @@ pub const History = struct {
         errdefer h.gpa.free(own.text);
         own.via = try h.gpa.dupe(u8, m.via);
         errdefer h.gpa.free(own.via);
+        own.buttons = try dupeButtons(h.gpa, m.buttons);
+        errdefer freeButtons(h.gpa, own.buttons);
         own.id = h.next_id;
         if (c.msgs.items.len == per_conv) h.freeMsg(c.msgs.orderedRemove(0));
         try c.msgs.append(h.gpa, own);
@@ -332,11 +349,52 @@ pub const History = struct {
         return null;
     }
 
+    /// The message the channel knows as `chan` (not 0): its text `text`
+    /// when given, its buttons gone (pressed, or answered elsewhere);
+    /// returned with its conversation, copied into `a`. Null: not kept.
+    pub fn edit(h: *History, a: std.mem.Allocator, chan: i64, text: ?[]const u8) !?Found {
+        if (chan == 0) return null;
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        for (h.convs.items) |c| for (c.msgs.items) |*m| if (m.chan == chan) {
+            if (text) |x| {
+                const own = try h.gpa.dupe(u8, util.cut(x, max_text));
+                h.gpa.free(m.text);
+                m.text = own;
+            }
+            freeButtons(h.gpa, m.buttons);
+            m.buttons = &.{};
+            return .{ .conv = try a.dupe(u8, c.name), .msg = try copyMsg(a, m.*) };
+        };
+        return null;
+    }
+
     fn copyMsg(a: std.mem.Allocator, m: Msg) !Msg {
         var o = m;
         o.text = try a.dupe(u8, m.text);
         o.via = try a.dupe(u8, m.via);
+        o.buttons = try dupeButtons(a, m.buttons);
         return o;
+    }
+
+    fn dupeButtons(a: std.mem.Allocator, bs: []const [2][]const u8) ![]const [2][]const u8 {
+        if (bs.len == 0) return &.{};
+        const out = try a.alloc([2][]const u8, bs.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |b| {
+                a.free(b[0]);
+                a.free(b[1]);
+            }
+            a.free(out);
+        }
+        for (bs, out) |b, *o| {
+            const label = try a.dupe(u8, b[0]);
+            errdefer a.free(label);
+            o.* = .{ label, try a.dupe(u8, b[1]) };
+            n += 1;
+        }
+        return out;
     }
 };
 
@@ -351,6 +409,14 @@ pub fn msgJson(out: *std.ArrayList(u8), a: std.mem.Allocator, m: Msg) !void {
     if (m.via.len > 0) {
         try out.appendSlice(a, ",\"via\":");
         try util.jsonString(out, a, m.via);
+    }
+    if (m.buttons.len > 0) {
+        try out.appendSlice(a, ",\"buttons\":[");
+        for (m.buttons, 0..) |b, i| {
+            if (i > 0) try out.append(a, ',');
+            try util.jsonString(out, a, b[0]);
+        }
+        try out.append(a, ']');
     }
     if (m.from == .harness) {
         try out.appendSlice(a, ",\"say\":");
@@ -743,4 +809,36 @@ test "pack_files_are_checked_by_magic" {
     try t.expectEqual('"', e1[33]);
     try t.expectEqualStrings(&e1, &etag("abc"));
     try t.expect(!std.mem.eql(u8, &e1, &etag("abd")));
+}
+
+test "buttons_are_kept_labels_shown_and_an_edit_drops_them" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h: History = .init(t.allocator, t.io);
+    defer h.deinit();
+    const id = try h.add("main", .{ .from = .harness, .text = "Vitamin D at 08:00.", .at = 100, .chan = 900, .buttons = &.{.{ "Taken", "mtok:taken" }} });
+    var out: std.ArrayList(u8) = .empty;
+    try msgJson(&out, a, (try h.list(a, "main"))[0]);
+    try t.expect(std.mem.indexOf(u8, out.items, "\"buttons\":[\"Taken\"]") != null);
+    try t.expect(std.mem.indexOf(u8, out.items, "mtok") == null);
+    try t.expect(std.mem.indexOf(u8, out.items, "900") == null);
+    const found = (try h.find(a, id)).?;
+    try t.expectEqual(900, found.msg.chan);
+    try t.expectEqualStrings("mtok:taken", found.msg.buttons[0][1]);
+    const edited = (try h.edit(a, 900, "Taken at 08:01.")).?;
+    try t.expectEqualStrings("main", edited.conv);
+    try t.expectEqual(id, edited.msg.id);
+    const again = (try h.list(a, "main"))[0];
+    try t.expectEqualStrings("Taken at 08:01.", again.text);
+    try t.expectEqual(0, again.buttons.len);
+    out.clearRetainingCapacity();
+    try msgJson(&out, a, again);
+    try t.expect(std.mem.indexOf(u8, out.items, "\"buttons\"") == null);
+    // a clear keeps the text
+    _ = try h.add("main", .{ .from = .harness, .text = "Pick one.", .at = 101, .chan = 901, .buttons = &.{.{ "Yes", "r1-x:1" }} });
+    _ = (try h.edit(a, 901, null)).?;
+    try t.expectEqualStrings("Pick one.", (try h.list(a, "main"))[1].text);
+    try t.expectEqual(null, try h.edit(a, 902, null));
+    try t.expectEqual(null, try h.edit(a, 0, null));
 }
