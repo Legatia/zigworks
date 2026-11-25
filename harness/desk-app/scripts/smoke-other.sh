@@ -185,6 +185,15 @@ probe() {
         PROBE=$(grep -F "\"probe\":{\"$1\"" "$TP/log" | tail -1)
     fi
 }
+# desk_probe NAME JS: the same on the desk page, which has no post()
+desk_probe() {
+    before=$(count "$TP/log" "\"probe\":{\"$1\"")
+    cmd "js (function (m) { var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness; if (w) w.postMessage(m); else window.chrome.webview.postMessage(m); })({probe: {$1: $2}})"
+    PROBE=
+    if wait_count "$TP/log" "\"probe\":{\"$1\"" $((before + 1)) 10; then
+        PROBE=$(grep -F "\"probe\":{\"$1\"" "$TP/log" | tail -1)
+    fi
+}
 expect_probe() {
     case $PROBE in *"$1"*) ok "$2" ;; *) not_ok "$2 (the page said: ${PROBE:-nothing})" ;; esac
 }
@@ -475,6 +484,38 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     if grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$TP/log"; then ok "real harness: the desk page loads"; else not_ok "real harness: the desk page loads"; fi
     if [ "$("$OWNP" config get model.provider --home "$REAL_HOME" | tr -d '\r')" = other ] && [ "$("$OWNP" config get "provider other.url" --home "$REAL_HOME" | tr -d '\r')" = http://127.0.0.1:9/v1 ]; then ok "real harness: config.ini has them"; else not_ok "real harness: config.ini has them"; fi
     if [ -e "$D/store/other" ]; then ok "real harness: the key is in its store (the smoke's own folder)"; else not_ok "real harness: the key is in its store (the smoke's own folder)"; fi
+    # the conversation at its tallest: the message field is still inside the
+    # window, at the size the app opens at and at its smallest
+    tries=0
+    while :; do
+        desk_probe drawn "document.getElementById('log').children.length"
+        case "$PROBE" in *'"drawn":0'* | '') ;; *) break ;; esac
+        tries=$((tries + 1))
+        [ "$tries" -ge 20 ] && break
+        sleep 0.5
+    done
+    sleep 1
+    cmd "js var l = document.getElementById('log'); for (var k = 0; k < 12; k++) { var li = document.createElement('li'); li.className = 'msg harness'; li.textContent = 'line ' + k; l.appendChild(li); } l.scrollTop = l.scrollHeight;"
+    fits="(function () { var c = document.getElementById('compose').getBoundingClientRect(); return [document.getElementById('log').children.length >= 12 && Math.round(c.bottom) <= window.innerHeight ? 'inside' : 'outside', Math.round(c.bottom), window.innerHeight, window.innerWidth].join(' '); })()"
+    desk_probe opens "$fits"
+    expect_probe '"inside ' "real harness: a long conversation leaves the message field inside the window"
+    # (the smallest frame the window takes, as the app said it at its start)
+    cmd "frame 100 100 $(grep "^screen " "$TP/log" | head -1 | cut -d' ' -f7-8)"
+    sleep 1
+    desk_probe smallest "$fits"
+    expect_probe '"inside ' "real harness: and inside the smallest window"
+    desk_probe newest "(function () { var l = document.getElementById('log'); return [l.children.length >= 12 && l.scrollHeight - l.scrollTop - l.clientHeight < 2 ? 'shown' : 'hidden', l.scrollHeight, l.scrollTop, l.clientHeight].join(' '); })()"
+    expect_probe '"shown ' "real harness: and the newest message is still the one shown"
+    # the sound button says which way it is by its drawing, not only its colour
+    sound="(function () { var b = document.getElementById('muteBtn'), d = function (id) { var e = document.getElementById(id); return e ? getComputedStyle(e).display : 'missing'; }; return [b.getAttribute('aria-pressed') === 'true' ? 'muted' : 'sounding', 'waves', d('muteWaves') === 'none' ? 'off' : 'on', 'cross', d('muteCross') === 'none' || d('muteCross') === 'missing' ? 'off' : 'on'].join(' '); })()"
+    desk_probe sounding "$sound"
+    expect_probe '"sounding waves on cross off"' "real harness: the sound button draws sound waves while replies may be spoken"
+    cmd "js document.getElementById('muteBtn').click()"
+    desk_probe muted "$sound"
+    expect_probe '"muted waves off cross on"' "real harness: and a cross in their place once muted"
+    cmd "js document.getElementById('muteBtn').click()"
+    desk_probe unmuted "$sound"
+    expect_probe '"sounding waves on cross off"' "real harness: and the waves again once unmuted"
     cmd "menu provider"
     expect_log "read ok=1" "real harness: Provider and key… reads the values in use"
     wait_page 3

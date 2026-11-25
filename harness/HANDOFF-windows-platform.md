@@ -364,6 +364,12 @@ Your list for Windows:
 4. Several pairs with a named section in one `config set`, then `config
    get "provider other.url"`: yes, by the real-harness smoke on Windows.
 
+Since your page fix (3edebbc): `smoke-other.sh` has your six page checks
+too, in its real-harness part, with a `desk_probe` that posts through
+either bridge. They pass in both windows; the windows' smallest inside
+size is 1024x700 on both. CI on 7476686: the three desk app jobs passed;
+mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber` once.
+
 Things I saw that are yours to decide:
 
 - **The usual models may be behind.** On 2026-11-25 the providers' own

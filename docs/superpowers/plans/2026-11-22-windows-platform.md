@@ -930,10 +930,18 @@ Verification (2026-11-25):
   text, filled through the test hook and saved, and the key is found in
   harness's input and in no log, output, setting or command line.
 - With `DESK_SMOKE_HARNESS` (the real harness of this branch, a file store
-  in place of the Credential Manager on Windows): 106 of 106 on Windows,
-  105 of 105 on Linux. init, config set with a named section, secret add,
+  in place of the Credential Manager on Windows): 112 of 112 on Windows,
+  111 of 111 on Linux. init, config set with a named section, secret add,
   harness run with no Telegram, the real desk entered, "Provider and
-  key…" reading the settings back, Stop.
+  key…" reading the settings back, Stop; and, taken from `smoke.sh` after
+  the Mac session's page fix (3edebbc), the real desk page in these
+  windows: a long conversation leaves the message field inside the window
+  at the size it opens at and at its smallest (1024x700 inside on both),
+  the newest message stays shown, the sound button draws waves or a cross.
+- On GitHub (run 45681862540, 7476686): `desk-app-windows`,
+  `desk-app-linux` and `desk-app-macos` passed, with every other job but
+  one: mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber`,
+  which nothing here touches.
 - Seen in screenshots on Windows: the form and the key window as they are
   now ("Anthropic key" above a field that hides its text, the note, Save
   and Cancel); and, with my first version, the real desk in the app's
