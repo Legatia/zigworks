@@ -994,7 +994,7 @@ const Fix = struct {
     host: []const u8,
 
     fn init(f: *Fix) !void {
-        f.tmp = t.tmpDir(.{});
+        f.tmp = t.tmpDir(.{ .iterate = true });
         f.arena_state = .init(t.allocator);
         f.a = f.arena_state.allocator();
         try f.tmp.dir.createDirPath(t.io, "apps/notes/js");
