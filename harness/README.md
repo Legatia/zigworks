@@ -2267,8 +2267,9 @@ For the desk apps (harness's side, on the app server's port):
 - `GET /alive`: 200 while harness runs.
 - `GET /enter?code=CODE`: 303 to `/desk` with the session cookie, or 403.
 - `/desk` (the page), `/desk/static/F` (its files, in the binary),
-  `/desk/avatars/NAME/F` (`avatars/`), `/desk/assets/P` (`desk-assets/`,
-  the fit's files), `/desk/apps/NAME` (an app in its frame); the files of
+  `/desk/avatars/NAME/F` (`avatars/`), `/desk/assets/P` (the fit's
+  files, from the first `desk-assets/` that has P: see Fitting),
+  `/desk/apps/NAME` (an app in its frame); the files of
   `avatars/` and `desk-assets/` up to 20 MB, kept by the web view for a
   day.
 - `/desk/api/…`, the session's only and never a framed app's: `GET state`,
@@ -3762,11 +3763,28 @@ and warns without refusing: a face under 500 px wide ("This will look
 soft. A larger photo looks sharper."), a photo taller than wide ("A photo
 wider than tall fills the window; this one leaves bands at the sides.").
 
-The fit needs its files in the data folder's `desk-assets/`: MediaPipe
-tasks-vision 0.10.14 and its face landmarker model (Apache 2.0), and the
-base head, `base-head.bin`. For local use, `sh tools/fetch-desk-assets.sh
-DATA/desk-assets` fetches MediaPipe's files and checks each by SHA-256;
-the base head is made with `tools/make-base-head.html` (tools/README).
+The fit needs its files: MediaPipe tasks-vision 0.10.14 and its face
+landmarker model (Apache 2.0), and the base head, `base-head.bin`.
+harness's release archives hold them in `desk-assets/` beside the
+binary, with MediaPipe's licence (`LICENSE-mediapipe.txt`) and a
+`NOTICE.txt` naming each file; the desk app carries them in its bundle.
+harness serves each file from the first of these that has it:
+
+1. the data folder's `desk-assets/`;
+2. `desk-assets/` beside harness's binary;
+3. `../Resources/desk-assets/` from the binary (a macOS app bundle).
+
+Without them the desk's Settings says "The fit files aren't installed.",
+names the data folder's `desk-assets/`, and turns the upload off. Built
+from source, `sh tools/fetch-desk-assets.sh DATA/desk-assets` fetches
+MediaPipe's files and checks each by SHA-256; copy
+`desk-assets/base-head.bin` from the repository beside them.
+`sh scripts/pack-desk-assets.sh DEST` makes the release's folder (the
+release job runs it).
+
+With no avatar chosen, or its pack not there, the desk's stage shows the
+outline of a head and shoulders and Add a portrait, which opens Settings
+at the avatar part.
 
 ### What the desk's page needs
 
