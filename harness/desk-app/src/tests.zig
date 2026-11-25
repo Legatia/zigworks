@@ -5,4 +5,6 @@ test {
     _ = @import("deskjson.zig");
     _ = @import("entry.zig");
     _ = @import("alive.zig");
+    _ = @import("policy.zig");
+    _ = @import("bridge.zig");
 }
