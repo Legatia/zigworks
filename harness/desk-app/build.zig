@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     switch (target.result.os.tag) {
         .macos => {},
         .windows => return addWindows(b, target, optimize, strip, version),
+        .linux => return addLinux(b, target, optimize, strip, version),
         else => return,
     }
 
@@ -138,6 +139,43 @@ fn addWindows(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         } else {
             v[2].dependOn(&built.step);
             v[2].dependOn(&dll.step);
+            b.getInstallStep().dependOn(v[2]);
+        }
+    }
+}
+
+/// Linux: `harness-desk/harness-desk`, linked against the system's GTK 3
+/// and WebKitGTK 4.1 (found with pkg-config: libgtk-3-dev and
+/// libwebkit2gtk-4.1-dev), and the same under `smoke/` with test hooks.
+fn addLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, version: []const u8) void {
+    const app = b.step("app", "Build zig-out/harness-desk/harness-desk");
+    const smoke = b.step("smoke", "Run the app against the stand-in harness (needs a display, or xvfb-run)");
+    inline for (.{ .{ "harness-desk", false, app }, .{ "smoke", true, smoke } }) |v| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = if (v[1]) false else strip,
+            .link_libc = true,
+        });
+        // (GTK 3 marks much of itself as deprecated: not this file's to fix)
+        mod.addCSourceFile(.{ .file = b.path("src/linux/desk.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations" } });
+        mod.linkSystemLibrary("gtk+-3.0", .{});
+        mod.linkSystemLibrary("webkit2gtk-4.1", .{});
+        const options = b.addOptions();
+        options.addOption([]const u8, "version", version);
+        options.addOption(bool, "test_hooks", v[1]);
+        mod.addOptions("build_options", options);
+        const exe = b.addExecutable(.{ .name = "harness-desk", .root_module = mod });
+        const built = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = v[0] } } });
+        if (v[1]) {
+            const run = b.addSystemCommand(&.{ "sh", "scripts/smoke-other.sh" });
+            run.addFileArg(.{ .relative = .{ .base = .install_prefix, .sub_path = "smoke/harness-desk" } });
+            run.has_side_effects = true;
+            run.step.dependOn(&built.step);
+            v[2].dependOn(&run.step);
+        } else {
+            v[2].dependOn(&built.step);
             b.getInstallStep().dependOn(v[2]);
         }
     }
