@@ -18,6 +18,14 @@ const agent = @import("agent.zig");
 const brief = @import("brief.zig");
 const scrub = @import("scrub.zig");
 const util = @import("util.zig");
+const zones = @import("zones.zig");
+
+/// The computer's offset from UTC now, in minutes east; null when it
+/// can't be read (a variable so the tests can be in any zone).
+pub var local_reader: *const fn (io: Io, a: std.mem.Allocator, now_s: i64) ?i32 = zones.localNow;
+
+/// Said once at start when `utc_offset = auto` and the zone can't be read.
+pub const zone_unread_line = "The computer's time zone can't be read, so times are in UTC. [chat] utc_offset = +HH:MM in config.ini sets them.";
 const logins = @import("logins.zig");
 const store_mod = @import("store.zig");
 const masks = @import("masks.zig");
@@ -811,6 +819,10 @@ pub const Core = struct {
     /// Tests: an instance's job stops there, as if harness stopped.
     wf_test_stop: WfStop = .none,
     told_settings_changed: bool = false,
+    /// `utc_offset = auto` and the computer's zone couldn't be read (UTC
+    /// is used); when the offset was last read.
+    zone_unread: bool = false,
+    local_checked_s: i64 = 0,
     secrets: Secrets,
     /// The stored secrets read at open. What every tool's output is
     /// masked against is `masks`: these and the values added since.
@@ -1091,6 +1103,8 @@ pub const Core = struct {
         c.gpa = gpa;
         c.io = io;
         c.convs_ready = false;
+        c.zone_unread = false;
+        c.local_checked_s = 0;
         c.settings_arena = .init(gpa);
         errdefer c.settings_arena.deinit();
         const sa = c.settings_arena.allocator();
@@ -1372,7 +1386,24 @@ pub const Core = struct {
         c.mcp_warn = "";
         c.browser = "";
         c.store = null;
+        if (c.zone_unread) c.sayAtStart(zone_unread_line);
         return c;
+    }
+
+    /// `utc_offset = auto`: `cfg.chat.utc_offset` is the computer's offset
+    /// at `now_s` (daylight saving included), read here so every use of it
+    /// sees the current one; UTC when it can't be read. +HH:MM: as written.
+    fn refreshLocalTime(c: *Core, now_s: i64) void {
+        c.local_checked_s = now_s;
+        if (!c.cfg.utc_auto) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        if (local_reader(c.io, arena.allocator(), now_s)) |off| {
+            c.cfg.chat.utc_offset = off;
+        } else {
+            c.cfg.chat.utc_offset = 0;
+            c.zone_unread = true;
+        }
     }
 
     pub fn close(c: *Core) void {
@@ -1530,6 +1561,7 @@ pub const Core = struct {
         }
         const texts = try c.readSettingsFiles(a);
         c.cfg = config.parse(a, texts[0]) catch return error.BadSettings;
+        c.refreshLocalTime(util.nowSeconds(c.io));
         c.rule_list = rules.parse(a, texts[1]) catch return error.BadSettings;
         c.briefs = config.parseBriefs(a, texts[2]) catch return error.BadSettings;
         const tasks = config.parseTasks(a, texts[3]) catch return error.BadSettings;
@@ -6903,6 +6935,8 @@ pub const Core = struct {
         if (c.poller_on) Evening.due(c, now_s);
         c.settings_mutex.lockUncancelable(c.io);
         defer c.settings_mutex.unlock(c.io);
+        // the computer's zone, read again each minute (the clocks change)
+        if (now_s - c.local_checked_s >= 60 or now_s < c.local_checked_s) c.refreshLocalTime(now_s);
         c.noteUrgent();
         // posts that did not get through go again when their wait is over
         c.resendDue(now_s);
@@ -13129,6 +13163,7 @@ pub const Core = struct {
     /// Opens topic `name` in the owner's chat with the bot and keeps it as
     /// a conversation; returns what to tell the owner.
     fn openTopic(c: *Core, a: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (c.alone) return "Conversations other than main are Telegram topics, and Telegram is off.";
         const owner = c.owner orelse return "Pair an account first (harness pair).";
         const ch = c.chan orelse return "There is no chat to open a topic in.";
         const open_fn = ch.open_topic orelse return "Topics are Telegram's: send /conversation new there.";
@@ -37335,4 +37370,61 @@ test "a_kept_file_name_stays_in_its_folder" {
     try t.expectEqualStrings("file", try safeFileName(x, ".."));
     try t.expectEqualStrings("file", try safeFileName(x, ""));
     try t.expectEqualStrings("a_b.txt", try safeFileName(x, "a b.txt"));
+}
+
+var test_offset: ?i32 = 60;
+fn testZone(_: Io, _: std.mem.Allocator, _: i64) ?i32 {
+    return test_offset;
+}
+
+test "auto_offset_follows_the_zone_at_each_refresh" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    try t.expectEqual(60, f.core.cfg.chat.utc_offset);
+    // the clocks change: within the minute, every use sees it
+    test_offset = 120;
+    const now_s = util.nowSeconds(t.io);
+    f.core.fixed_now = now_s + 61;
+    f.core.tick();
+    try t.expectEqual(120, f.core.cfg.chat.utc_offset);
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"utc_offset\":120");
+    // and after /reload
+    test_offset = 60;
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    try t.expectEqual(60, f.core.cfg.chat.utc_offset);
+    // +HH:MM is that, whatever the zone
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(f.e.arena.allocator(), "[model]\nurl = {s}\n[search]\nurl = {s}\n[chat]\nutc_offset = -05:00\n", .{ try f.e.url(), try f.e.url() }) });
+    try expectHas(try f.core.reload(), "Settings reloaded.");
+    test_offset = 120;
+    f.core.fixed_now = now_s + 200;
+    f.core.tick();
+    try t.expectEqual(-300, f.core.cfg.chat.utc_offset);
+}
+
+test "an_unreadable_zone_is_utc_and_said_once_at_start" {
+    local_reader = testZone;
+    defer local_reader = zones.localNow;
+    test_offset = null;
+    defer test_offset = 60;
+    var f: Fix = undefined;
+    try f.init("[chat]\nutc_offset = auto\n", "", "");
+    defer f.deinit();
+    try t.expect(f.core.zone_unread);
+    try t.expectEqual(0, f.core.cfg.chat.utc_offset);
+    try f.rec.waitFor(zone_unread_line);
+    _ = try f.core.reload();
+    f.core.fixed_now = util.nowSeconds(t.io) + 61;
+    f.core.tick();
+    try t.expectEqual(1, f.rec.count(zone_unread_line));
+}
+
+test "desk_alone_a_new_conversation_says_why_there_is_none" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    try t.expectEqualStrings("Conversations other than main are Telegram topics, and Telegram is off.", try f.core.command(f.e.arena.allocator(), "/conversation new trips"));
 }

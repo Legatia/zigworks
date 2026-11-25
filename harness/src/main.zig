@@ -333,6 +333,7 @@ const App = struct {
             c.exe_dir = d;
         } else |_| {}
         c.writeStatus() catch {};
+        if (c.zone_unread) complain("note: {s}", .{core_mod.zone_unread_line});
         // Ctrl-C and kill end it the way /stop and close do (from here on,
         // so a slow start of the MCP servers can be ended too)
         catchSignals();
@@ -2150,7 +2151,10 @@ fn logCmd(app: *App, args: []const []const u8) !Exit {
         // dates in the owner's time, as config.ini says (UTC without it)
         const offset: i32 = blk: {
             const text = Io.Dir.cwd().readFileAlloc(app.io, p.config, app.arena, .limited(1 << 20)) catch break :blk 0;
-            break :blk (config.parse(app.arena, text) catch break :blk 0).chat.utc_offset;
+            const cfg = config.parse(app.arena, text) catch break :blk 0;
+            // utc_offset = auto: the computer's zone now
+            if (cfg.utc_auto) break :blk core_mod.local_reader(app.io, app.arena, util.nowSeconds(app.io)) orelse 0;
+            break :blk cfg.chat.utc_offset;
         };
         const shown = history_mod.searchText(app.arena, app.io, p.log, args[1..], offset) catch |e| {
             complain("can't read {s}: {s}", .{ p.log, @errorName(e) });

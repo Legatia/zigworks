@@ -1,9 +1,9 @@
 //! An IANA time zone's offset from UTC at a moment, from the system's
 //! zone files (TZif, RFC 8536) and, past their last change, the POSIX TZ
-//! rule they end with. harness itself keeps one fixed `utc_offset`; the
-//! Hermes import uses this to take a job's time in the job's own zone on
-//! the day of the import. Windows has no zone files: there the answer is
-//! null and the caller says so.
+//! rule they end with. The Hermes import uses this to take a job's time in
+//! the job's own zone on the day of the import; `[chat] utc_offset = auto`
+//! the computer's own zone (`localNow`). Windows has no zone files: a named
+//! zone is null there, and the computer's comes from GetTimeZoneInformation.
 const std = @import("std");
 const builtin = @import("builtin");
 const util = @import("util.zig");
@@ -30,6 +30,46 @@ pub fn offsetAt(io: Io, a: std.mem.Allocator, dirs: []const []const u8, zone: []
     }
     return null;
 }
+
+/// The computer's offset from UTC at `now_s`, in minutes east, daylight
+/// saving included: its zone file (/etc/localtime) on macOS and Linux,
+/// GetTimeZoneInformation on Windows (the offset now); null when it can't
+/// be read.
+pub fn localNow(io: Io, a: std.mem.Allocator, now_s: i64) ?i32 {
+    if (builtin.os.tag == .windows) {
+        var tz: win.TimeZoneInformation = undefined;
+        const r = win.GetTimeZoneInformation(&tz);
+        return windowsOffset(r, tz.Bias, tz.StandardBias, tz.DaylightBias);
+    }
+    return offsetAt(io, a, &.{}, "", now_s);
+}
+
+/// What GetTimeZoneInformation's answer `ret` and biases (minutes west:
+/// UTC = local + bias) make the offset now, in minutes east: 0 no daylight
+/// saving in the zone, 1 standard time, 2 daylight time; null for an error.
+pub fn windowsOffset(ret: u32, bias: i32, std_bias: i32, dst_bias: i32) ?i32 {
+    return switch (ret) {
+        0 => -bias,
+        1 => -(bias + std_bias),
+        2 => -(bias + dst_bias),
+        else => null,
+    };
+}
+
+/// kernel32's time zone call, declared here (std has none).
+const win = struct {
+    const SystemTime = extern struct { year: u16, month: u16, day_of_week: u16, day: u16, hour: u16, minute: u16, second: u16, ms: u16 };
+    const TimeZoneInformation = extern struct {
+        Bias: i32,
+        StandardName: [32]u16,
+        StandardDate: SystemTime,
+        StandardBias: i32,
+        DaylightName: [32]u16,
+        DaylightDate: SystemTime,
+        DaylightBias: i32,
+    };
+    extern "kernel32" fn GetTimeZoneInformation(info: *TimeZoneInformation) callconv(.winapi) u32;
+};
 
 /// A zone's name as the zone files have it: parts of letters, digits,
 /// `_`, `-` and `+`, separated by `/`; nothing that leaves the folder.
@@ -338,4 +378,25 @@ test "the_systems_zone_files_read" {
     try t.expectEqual(@as(?i32, 120), offsetAt(t.io, a, &default_dirs, "Europe/Warsaw", at(2026, 7, 1, 12, 0)));
     try t.expectEqual(@as(?i32, 330), offsetAt(t.io, a, &default_dirs, "Asia/Kolkata", at(2026, 7, 1, 12, 0)));
     try t.expectEqual(@as(?i32, -300), offsetAt(t.io, a, &default_dirs, "America/New_York", at(2026, 11, 24, 12, 0)));
+}
+
+test "windows_says_the_offset_now_from_its_biases" {
+    // Warsaw: bias -60, standard 0, daylight -60
+    try t.expectEqual(@as(?i32, 120), windowsOffset(2, -60, 0, -60));
+    try t.expectEqual(@as(?i32, 60), windowsOffset(1, -60, 0, -60));
+    // a zone with no daylight saving: the bias alone
+    try t.expectEqual(@as(?i32, -300), windowsOffset(0, 300, 0, -60));
+    // New York in summer
+    try t.expectEqual(@as(?i32, -240), windowsOffset(2, 300, 0, -60));
+    try t.expectEqual(@as(?i32, null), windowsOffset(0xFFFFFFFF, -60, 0, -60));
+}
+
+test "the_computers_zone_reads_where_there_are_zone_files" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    // whatever it is, it is what /etc/localtime says (or nothing to read)
+    const got = localNow(t.io, arena.allocator(), 1_780_000_000);
+    try t.expectEqual(offsetAt(t.io, arena.allocator(), &.{}, "", 1_780_000_000), got);
+    if (got) |o| try t.expect(o >= -14 * 60 and o <= 14 * 60);
 }

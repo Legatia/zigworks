@@ -107,16 +107,29 @@ its own stand-in IMAP and SMTP server.** See [Limits](#limits).
 ```
 harness init                      # writes ~/.local/share/harness
 harness secret add omnigate       # your omnigate key (typed, not shown); another provider's: harness secret add NAME
-harness secret add telegram       # the bot token from @BotFather
-harness secret add search         # optional: a Brave Search API key
 harness run                       # keep this running
-harness pair                      # then send the printed /pair CODE to your bot
+harness open                      # the desk
 ```
 
 Set omnigate's address (there is none by default) and route names in
 `config.ini` first, or pick another provider (see
 [Models and providers](#models-and-providers)); until the address and the
-key are there, commands say so and model calls are refused. The first Telegram account to send a valid
+key are there, commands say so and model calls are refused.
+`harness config set SECTION.KEY VALUE` writes one setting (see
+[Settings from the command line](#settings-from-the-command-line)).
+
+Telegram is optional, for your phone. With no bot token stored, or
+`[chat] telegram = off`, `harness run` runs with the desk as the only way
+in, says so at start, and everything meant for you goes to the desk. To
+add it:
+
+```
+harness secret add telegram       # the bot token from @BotFather
+harness run                       # restarted
+harness pair                      # then send the printed /pair CODE to your bot
+```
+
+The first Telegram account to send a valid
 pairing code (valid 10 minutes) becomes the owner; messages from anyone
 else are dropped and logged, and a pairing attempt from another account is
 answered. To move the bot to another account, run `harness pair` again and
@@ -263,6 +276,34 @@ price.
   limit (429) says to try again later, nothing is sent twice.
 
 Spoken replies come later.
+
+### Settings from the command line
+
+```
+harness config set chat.utc_offset +02:00
+harness config set provider local.url https://llm.example/v1
+harness config get model.model
+```
+
+`config set SECTION.KEY VALUE` writes one setting in `config.ini`: the line
+in use is changed where it is, with its comment; a key the section lacks
+goes under it, a section the file lacks at its end. A named section is
+`provider NAME.KEY`, as one quoted argument or two words. The
+result is read first: a change that doesn't read is refused with one line,
+exit 1, and the file stays as it was. Several `KEY VALUE` pairs in one call
+go in together, for settings that only read together (a new provider's
+`api` and `url`). A setting that names a secret (`model.key`,
+`chat.token`) takes the secret's name; the secret itself goes in with
+`harness secret add`. When harness is running, it says whether the change
+waits for `/reload` or a restart (`chat.telegram`, `chat.token`,
+`apps.on`, `apps.port`). `config get SECTION.KEY` prints the value in use,
+harness's default when the file doesn't set it.
+
+**Local time.** `[chat] utc_offset = auto` (what `harness init` writes)
+is this computer's time zone, daylight saving included, read again each
+minute; `+HH:MM` is that offset always. When the zone can't be read, times
+are UTC and harness says so once at start. A file without the line is UTC,
+as before.
 
 ## The data folder
 
@@ -2075,7 +2116,12 @@ after `/env rm`.
 
 ## Desk
 
-The desk is harness's own window on this computer: the avatar takes most
+The desk is harness's own window on this computer, and with no Telegram
+bot the only way in: replies, briefs, task results, items, urgent alerts
+and the digest all reach it, and a message's own buttons (quick replies,
+Undo, Taken, I'm on it) are pressed there; files a post carries are kept in
+`state/desk-files/` and named on the desk. Posts to a group or a member's
+chat aren't sent while Telegram is off. The avatar takes most
 of it, the chat runs along the bottom, and the side panel holds Needs you,
 Topics and Lately. It's a small app of its own, `harness-desk`, that shows
 harness's pages in the system's web view (WKWebView, WebView2, WebKitGTK);
