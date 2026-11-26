@@ -15,16 +15,18 @@ jobs:
         # macos-15: Zig 0.15.1 couldn't link against the macOS 26 SDK on macos-latest.
         # Not tried again with Zig 0.17.1.
         os: [ubuntu-latest, macos-15]
-        project: [trigrep, headterm, headsight, headsound, llmcheck, keygate, harness, homemcp, carcloud, mailmcp, calmcp]
+        project: [trigrep, headterm, headsight, headsound, llmcheck, keygate, harness, homemcp, carcloud, mailmcp, calmcp, paymcp]
         # GitHub gives this account few macOS runners at once, and jobs that
         # wait ~15 min for one are cancelled: homemcp, carcloud, mailmcp and
         # calmcp (checked on a Mac by hand; their macOS code is the libc link)
-        # run on Linux and Windows only, leaving the macOS runners to the rest
+        # run on Linux and Windows only, leaving the macOS runners to the rest.
+        # paymcp too (not yet run on a Mac; the same libc link)
         exclude:
           - { os: macos-15, project: homemcp }
           - { os: macos-15, project: carcloud }
           - { os: macos-15, project: mailmcp }
           - { os: macos-15, project: calmcp }
+          - { os: macos-15, project: paymcp }
         include:
           # Windows: everything but headsight (headsound's file commands, for
           # GoldWave users; headterm on ConPTY)
@@ -41,6 +43,7 @@ jobs:
           - { os: windows-latest, project: carcloud }
           - { os: windows-latest, project: mailmcp }
           - { os: windows-latest, project: calmcp }
+          - { os: windows-latest, project: paymcp }
           # Linux only: SocketCAN
           - { os: ubuntu-latest, project: canmcp }
     runs-on: ${{ matrix.os }}
