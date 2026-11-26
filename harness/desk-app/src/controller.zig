@@ -18,6 +18,8 @@ pub const fast_check_every_ms = 1000;
 pub const fast_for_ms = 15_000;
 /// A 401 or 403 while in enters again, at most this often.
 pub const reenter_every_ms = 5000;
+/// How often the desk page's own asking (enter again, bounce) is acted on.
+pub const page_ask_every_ms = 5000;
 /// `harness run` ending with a failure within this long is said.
 pub const early_exit_ms = 10_000;
 
@@ -25,7 +27,10 @@ pub const State = enum { setup, down, connecting, in };
 
 /// `no_config`: the data folder has no config.ini (harness was never set
 /// up there); checked before desk.json.
-pub const CheckResult = union(enum) { no_config, no_desk, bad_desk, dead: Desk, alive: Desk };
+/// `bad_config`: there is one and it can't be read. `undone`: the check
+/// couldn't be made (no thread or memory for it): nothing is known, and
+/// the next one is made as usual.
+pub const CheckResult = union(enum) { undone, no_config, bad_config, no_desk, bad_desk, dead: Desk, alive: Desk };
 
 pub const MenuItem = enum { start, stop, autostart, reload, provider };
 
@@ -135,6 +140,8 @@ pub const Controller = struct {
     /// Enter once the next check finds harness, keeping the page shown.
     reentering: bool = false,
     last_enter_ms: i64 = std.math.minInt(i32),
+    last_asked_ms: i64 = std.math.minInt(i32),
+    last_attention_ms: i64 = std.math.minInt(i32),
 
     started_ms: ?i64 = null,
     autostart: ?bool = null,
@@ -208,8 +215,22 @@ pub const Controller = struct {
             .message => |m| switch (m.source) {
                 .desk => {
                     if (m.msg.badge) |n| try fx.add(.{ .badge = n });
-                    if (m.msg.attention) try fx.add(.attention);
-                    if (m.msg.reenter) try c.reenter(now, &fx);
+                    // a page that keeps asking gets one of each in
+                    // `page_ask_every_ms`: no check, entry and reload, and
+                    // no bounce, for every message
+                    if (m.msg.attention and now - c.last_attention_ms >= page_ask_every_ms) {
+                        c.last_attention_ms = now;
+                        try fx.add(.attention);
+                    }
+                    if (m.msg.reenter) {
+                        if (now - c.last_asked_ms >= page_ask_every_ms) {
+                            c.last_asked_ms = now;
+                            try c.reenter(now, &fx);
+                        } else if (!c.entering) {
+                            // the next regular check enters again
+                            c.reentering = true;
+                        }
+                    }
                 },
                 .builtin => {
                     if (m.msg.start) try c.startHarness(now, &fx);
@@ -294,6 +315,7 @@ pub const Controller = struct {
     }
 
     fn onChecked(c: *Controller, now: i64, result: CheckResult, fx: *Fx) !void {
+        if (result == .undone) return;
         defer c.askAutostart(fx) catch {};
         if (c.form != null) {
             // the form stays until it is done or cancelled
@@ -304,7 +326,8 @@ pub const Controller = struct {
             return;
         }
         switch (result) {
-            .no_config, .no_desk, .bad_desk => {
+            .undone => unreachable,
+            .no_config, .bad_config, .no_desk, .bad_desk => {
                 // harness may be rewriting it: the desk page stays one check
                 if (c.state == .in) {
                     c.misses +|= 1;
@@ -323,7 +346,11 @@ pub const Controller = struct {
                 // harness started from the app hasn't written desk.json yet
                 if (result == .no_desk and c.starting(now) and c.state != .in) return;
                 c.state = .down;
-                try c.show(.down, if (result == .bad_desk) "Its state/desk.json can't be read." else "", fx);
+                try c.show(.down, switch (result) {
+                    .bad_desk => "Its state/desk.json can't be read.",
+                    .bad_config => "Its config.ini can't be read.",
+                    else => "",
+                }, fx);
             },
             .dead => |d| {
                 try c.setDesk(d, fx);
@@ -401,11 +428,13 @@ pub const Controller = struct {
         try fx.add(.{ .show = .{ .screen = s, .note = note } });
     }
 
-    /// The harness the commands run: the one desk.json names, else the
-    /// app's own copy beside its program.
+    /// The harness the commands run: the app's own copy beside its program.
+    /// desk.json is a file in the data folder, and what it names is run
+    /// only by an app that carries no harness (a build without one).
     fn binary(c: *const Controller) ?[]const u8 {
+        if (c.own.len > 0) return c.own;
         if (c.desk) |d| if (d.binary.len > 0) return d.binary;
-        return if (c.own.len > 0) c.own else null;
+        return null;
     }
 
     /// The PATH the commands get: harness's own, when desk.json says it.
@@ -648,12 +677,15 @@ fn firstLine(text: []const u8) []const u8 {
 }
 
 /// Whether [Continue] asks for the key: always at the first setup; later
-/// when the owner chose to replace it, or the provider's key is another
-/// secret than the one in use.
+/// when the owner chose to replace it, the provider's key is another
+/// secret than the one in use, or the address names another host than the
+/// one the stored key was sent to (it isn't sent on to a new one unasked).
 fn needKey(f: Form) bool {
     if (f.mode == .first or f.form.replace) return true;
     const before = f.before orelse return true;
-    return !std.mem.eql(u8, setup.keyName(f.form, before), setup.keyName(setup.formOf(before), before));
+    if (!std.mem.eql(u8, setup.keyName(f.form, before), setup.keyName(setup.formOf(before), before))) return true;
+    if (!setup.entry(f.form.provider).address or std.mem.eql(u8, before.auth, "none")) return false;
+    return !setup.sameHost(f.form.url, setup.formOf(before).url);
 }
 
 /// The "Set up" screen's state.
@@ -770,8 +802,18 @@ test "no_desk_json_shows_down" {
     r.wait(5000);
     const g2 = try Rig.checkGen(try r.ev(.tick));
     const bad = try r.ev(.{ .checked = .{ .gen = g2, .result = .bad_desk } });
-    for (bad) |f| if (f == .show) try t.expect(f.show.note.len > 0);
+    for (bad) |f| if (f == .show) try t.expect(std.mem.indexOf(u8, f.show.note, "desk.json") != null);
     try t.expectEqual(Screen.down, shown(bad).?);
+
+    // a config.ini that can't be read: that file is the one named
+    r.wait(5000);
+    const g3 = try Rig.checkGen(try r.ev(.tick));
+    const cfg = try r.ev(.{ .checked = .{ .gen = g3, .result = .bad_config } });
+    try t.expectEqual(Screen.down, shown(cfg).?);
+    for (cfg) |f| if (f == .show) {
+        try t.expect(std.mem.indexOf(u8, f.show.note, "config.ini") != null);
+        try t.expect(std.mem.indexOf(u8, f.show.note, "desk.json") == null);
+    };
 }
 
 test "desk_json_appearing_is_noticed" {
@@ -864,8 +906,46 @@ test "reenter_checks_then_enters_without_a_screen" {
     const in = try r.ev(.{ .entered = .{ .gen = e, .code = "c2" } });
     try t.expectEqualStrings("http://127.0.0.1:41234/enter?code=c2", loaded(in).?);
     // harness gone instead: the page says so
+    r.wait(page_ask_every_ms);
     const g2 = try Rig.checkGen(try r.ev(.{ .message = .{ .msg = .{ .reenter = true }, .source = .desk } }));
     try t.expectEqual(Screen.down, shown(try r.ev(.{ .checked = .{ .gen = g2, .result = .{ .dead = d1 } } })).?);
+}
+
+test "a_page_that_keeps_asking_gets_one_entry_and_one_bounce_in_five_seconds" {
+    var r: Rig = .init();
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    const g = try Rig.checkGen(try r.ev(.{ .message = .{ .msg = .{ .reenter = true, .attention = true }, .source = .desk } }));
+    const e = try Rig.enterGen(try r.ev(.{ .checked = .{ .gen = g, .result = .{ .alive = d1 } } }));
+    _ = try r.ev(.{ .entered = .{ .gen = e, .code = "c2" } });
+    // the page asks again and again: no check, no entry, no bounce for each
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        r.wait(10);
+        const fx = try r.ev(.{ .message = .{ .msg = .{ .reenter = true, .attention = true }, .source = .desk } });
+        try t.expectEqual(@as(usize, 0), count(fx, .check) + count(fx, .enter) + count(fx, .attention));
+    }
+    // it isn't lost: the next regular check enters again
+    r.wait(check_every_ms);
+    const g2 = try Rig.checkGen(try r.ev(.tick));
+    _ = try Rig.enterGen(try r.ev(.{ .checked = .{ .gen = g2, .result = .{ .alive = d1 } } }));
+    // and after five seconds a bounce is given again
+    try t.expectEqual(@as(usize, 1), count(try r.ev(.{ .message = .{ .msg = .{ .attention = true }, .source = .desk } }), .attention));
+}
+
+test "a_check_that_couldnt_be_done_changes_nothing" {
+    var r: Rig = .init();
+    defer r.deinit();
+    try r.getIn(d1, "c1");
+    r.wait(check_every_ms);
+    const g = try Rig.checkGen(try r.ev(.tick));
+    const fx = try r.ev(.{ .checked = .{ .gen = g, .result = .undone } });
+    try t.expectEqual(@as(usize, 0), fx.len);
+    try t.expectEqual(State.in, r.c.state);
+    try t.expectEqual(@as(?u16, d1.port), r.c.port());
+    // and the next one is asked for as usual
+    r.wait(check_every_ms);
+    _ = try Rig.checkGen(try r.ev(.tick));
 }
 
 test "reenter_during_an_entry_is_ignored" {
@@ -1384,7 +1464,7 @@ fn toChange(r: *Rig, in_use: setup.InUse) ![]const Effect {
     for (m) |f| if (f == .read_config) {
         rc = f.read_config;
     };
-    try t.expectEqualStrings("/usr/local/bin/harness", rc.?.binary);
+    try t.expectEqualStrings(own_bin, rc.?.binary);
     return r.ev(.{ .read = .{ .gen = rc.?.gen, .ok = true, .in_use = in_use } });
 }
 
@@ -1424,7 +1504,7 @@ test "a_change_while_harness_runs_says_config_sets_line_and_enters_again" {
     _ = try toChange(&r, .{ .provider = "openai", .model = "gpt-5" });
     const s = stepOf(try builtin(&r, .{ .setup = .{ .provider = .openai, .model = "gpt-5-mini" } })).?;
     // config.ini is there: no init; the same provider: the helpers stay
-    try expectWords(&.{ "/usr/local/bin/harness", "config", "set", "model.provider", "openai", "model.model", "gpt-5-mini", "--home", "/data/harness" }, s.argv);
+    try expectWords(&.{ own_bin, "config", "set", "model.provider", "openai", "model.model", "gpt-5-mini", "--home", "/data/harness" }, s.argv);
     try t.expectEqualStrings("/opt/homebrew/bin:/usr/bin", s.path);
     const fx = try r.ev(.{ .stepped = .{ .gen = s.gen, .ok = true, .out = "harness is running: send /reload to use it." } });
     try t.expect(askOf(fx) == null);
@@ -1467,6 +1547,31 @@ test "the_key_is_asked_again_only_when_chosen_or_new" {
             // "Provider and key…" never marks the folder unfinished
             try t.expect(markOf(done) == null);
         } else try t.expect(storeOf(fx) == null and alertOf(fx) != null);
+    }
+}
+
+test "an_address_on_another_host_asks_for_the_key_again" {
+    const other: setup.InUse = .{ .provider = "local", .model = "m", .api = "openai", .section_url = "https://a.example/v1" };
+    const keyless: setup.InUse = .{ .provider = "local", .model = "m", .api = "openai", .section_url = "https://a.example/v1", .auth = "none" };
+    const gate: setup.InUse = .{ .provider = "", .model = "m", .url = "https://gate.example" };
+    for ([_]struct { setup.InUse, setup.Form, bool }{
+        .{ other, .{ .provider = .other, .model = "m", .url = "https://a.example/v1" }, false },
+        .{ other, .{ .provider = .other, .model = "m", .url = "https://A.example:8443/v2" }, false },
+        // the stored key was the other host's: it isn't sent on unasked
+        .{ other, .{ .provider = .other, .model = "m", .url = "https://b.example/v1" }, true },
+        .{ other, .{ .provider = .other, .model = "m", .url = "https://a.example.b.example/v1" }, true },
+        .{ gate, .{ .provider = .omnigate, .model = "m", .url = "https://gate.example/x" }, false },
+        .{ gate, .{ .provider = .omnigate, .model = "m", .url = "https://elsewhere.example" }, true },
+        // no key in use: none to send
+        .{ keyless, .{ .provider = .other, .model = "m", .url = "https://b.example/v1" }, false },
+    }) |case| {
+        var r: Rig = .initOwn(own_bin);
+        defer r.deinit();
+        _ = try toChange(&r, case[0]);
+        const fx = try builtin(&r, .{ .setup = case[1] });
+        try t.expectEqual(case[2], askOf(fx) != null);
+        // nothing is written before the key is given
+        if (case[2]) try t.expect(stepOf(fx) == null);
     }
 }
 
@@ -1532,12 +1637,21 @@ test "the_own_copy_runs_when_desk_json_names_none" {
     const run = runOfFx(try r.ev(.{ .menu = .start })).?;
     try t.expectEqualStrings(own_bin, run.binary);
     try t.expectEqualStrings("", run.path);
-    // desk.json naming a binary: that one
+    // desk.json naming another program: still the app's own (a file in the
+    // data folder doesn't choose what the app runs)
     var r2: Rig = .initOwn(own_bin);
     defer r2.deinit();
     const g2 = try Rig.checkGen(try r2.ev(.start));
-    _ = try r2.ev(.{ .checked = .{ .gen = g2, .result = .{ .dead = d1 } } });
-    try t.expectEqualStrings("/usr/local/bin/harness", runOfFx(try r2.ev(.{ .menu = .start })).?.binary);
+    const dead = try r2.ev(.{ .checked = .{ .gen = g2, .result = .{ .dead = d1 } } });
+    try t.expectEqualStrings(own_bin, runOfFx(dead).?.binary);
+    try t.expectEqual(Command.autostart_query, runOfFx(dead).?.cmd);
+    try t.expectEqualStrings(own_bin, runOfFx(try r2.ev(.{ .menu = .start })).?.binary);
+    // an app that carries none (a build without one) runs the one desk.json names
+    var r5: Rig = .init();
+    defer r5.deinit();
+    const g5 = try Rig.checkGen(try r5.ev(.start));
+    _ = try r5.ev(.{ .checked = .{ .gen = g5, .result = .{ .dead = d1 } } });
+    try t.expectEqualStrings("/usr/local/bin/harness", runOfFx(try r5.ev(.{ .menu = .start })).?.binary);
     // naming none: the own copy again
     var r3: Rig = .initOwn(own_bin);
     defer r3.deinit();

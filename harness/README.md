@@ -2157,7 +2157,8 @@ key's `harness` value; each runs `harness --home DIR run` at login.
 an install with `port = 0` gets one at its next start. If it's taken at a
 start, harness tries the next ten, writes the one it used and says so. At
 each start `state/desk.json` names the binary, the port, the data folder
-and the version, which is how the app finds harness.
+and the version, which is how the app finds harness's port. (The app runs
+its own copy of harness, not the binary named there.)
 
 **Getting in.** The app writes `state/open-request`; harness answers with a
 one-time code in `state/desk-code`, good for 60 s and once, readable only
@@ -2171,6 +2172,10 @@ A limit: a program running as you on this computer could read the code
 file within its 60 s, or talk to harness the way the app does. That's the
 same as for any local app. harness's own commands run sandboxed when
 unattended, and on the host only with your approval.
+
+The data folder is trusted: its `config.ini` decides what harness runs,
+and the app runs harness with the PATH recorded in `state/desk.json`.
+Don't open a folder someone else prepared with `--home`.
 
 **What it shows.** The avatar's state comes from harness's facts, never
 from what the model wrote:
@@ -2187,7 +2192,9 @@ from what the model wrote:
 A run that ends with a reply gives a brief smile; one that ends in an
 error, a look of concern. The status card says what harness knows: the run
 going (your message's first line, or "Routine: NAME"), its helpers and how
-long; how many items wait; the next thing coming.
+long; how many items are open ("2 open items", "1 urgent item"); the next
+thing coming. When the chosen avatar can't be loaded or drawn, the stage
+says why.
 
 **The chat** is main or a topic, the same conversations as Telegram.
 What you type there is your turn, as if typed in Telegram; Telegram gets a
@@ -2196,8 +2203,9 @@ quiet "You, on the desk: …" first, so the phone's thread reads right
 do. The desk keeps each conversation's last 50 messages in memory, filled
 from the log at start; a private conversation's are never on disk, so
 after a restart its history starts empty and the desk says so. The
-microphone shows when `[voice]` is set: what you say is transcribed, shown
-in quotes, and taken as typed.
+microphone ("Record a message") shows when `[voice]` is set: what you say
+is transcribed, shown in quotes, and taken as typed. Under it the desk
+names where recordings go: the `[voice]` provider and its host.
 
 **Needs you** lists every open item, urgent ones first; **Topics** has a
 dot for news since you last opened a topic on the desk
@@ -2324,7 +2332,7 @@ Google's reason when it gave one).
 
 For the desk apps (harness's side, on the app server's port):
 
-- `GET /alive`: 200 while harness runs.
+- `GET /alive`: 200 and the word `harness` while harness runs.
 - `GET /enter?code=CODE`: 303 to `/desk` with the session cookie, or 403.
 - `/desk` (the page), `/desk/static/F` (its files, in the binary),
   `/desk/avatars/NAME/F` (`avatars/`), `/desk/assets/P` (the fit's
@@ -3836,10 +3844,13 @@ head's notice (`base-head-NOTICE.txt`) and a `NOTICE.txt` naming each
 file. harness serves each file from the first
 of these that has it:
 
-1. the data folder's `desk-assets/`;
-2. `desk-assets/` beside harness's binary;
-3. `../Resources/desk-assets/` from the binary, when it is in an app
-   bundle's `Contents/MacOS/`.
+1. `desk-assets/` beside harness's binary;
+2. `../Resources/desk-assets/` from the binary, when it is in an app
+   bundle's `Contents/MacOS/`;
+3. the data folder's `desk-assets/`.
+
+What harness ships comes first: the fit's script runs in the desk's own
+page, so a file put in the data folder never stands in for a shipped one.
 
 Without them the desk's Settings says "The fit files aren't installed.",
 names the data folder's `desk-assets/`, and turns the upload off. Built
@@ -4062,12 +4073,14 @@ line about harness, and confirm; after that it opens normally. (On macOS
 14 and earlier, Control-click the app › Open does the same.) The first
 time you talk to the desk, macOS asks to let harness use the microphone.
 
-**Opening it.** `harness open` starts it, or brings it to the front, on
-your data folder. Opened from the Dock or Launchpad it uses the default
-one (`~/.local/share/harness`, or `$XDG_DATA_HOME/harness`). It reads
-`state/desk.json`, which harness writes at each start, for harness's port
-and program; when there is none, or the program it names is gone, it uses
-its own copy of harness:
+**Opening it.** `harness open` starts it, or brings its window to the
+front, on your data folder. Opened from the Dock or Launchpad it uses the
+default one (`~/.local/share/harness`, or `$XDG_DATA_HOME/harness`). One
+window a data folder: a second start shows the first, and a start on
+another folder (`harness --home DIR open`) is a window of its own, with
+its own Dock icon. It reads
+`state/desk.json`, which harness writes at each start, for harness's
+port, and runs its own copy of harness:
 
 - no `config.ini` in the data folder: "Set up" (below);
 - while nothing answers on harness's port: "harness isn't running", with
@@ -4110,7 +4123,9 @@ nothing on disk: no cookie, cache or storage outlives the app. When harness
 restarts, the app enters again by itself.
 
 **The window.** Links on harness's own address (`http://127.0.0.1:PORT`)
-open in the window; other links open in your browser. Sound and speech
+open in the window; a link to anywhere else opens in your browser when
+you click it, and a page can't send the window or your browser elsewhere
+by itself. Sound and speech
 play without a click. Only the desk page itself may use the microphone,
 not an app shown inside it; the camera is never allowed. The window
 remembers its size and place. Closing it keeps the app running with its
@@ -4123,13 +4138,13 @@ badge; click the Dock icon to bring the window back.
 | Start harness | runs `harness run` in the background; it keeps running after you quit the app |
 | Stop harness | runs `harness stop`: harness exits cleanly on its next tick |
 | Open at login | runs `harness autostart on` or `off`; checked when harness starts at login (the app itself doesn't) |
-| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key or pick a provider whose key is stored under another name. While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
+| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key, pick a provider whose key is stored under another name, or change the Address to another host (a new port or path on the same host doesn't ask). While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
 | Reload (⌘R) | loads the desk again |
 | Quit harness (⌘Q) | quits the app; harness keeps running |
 
-The commands run the program `state/desk.json` names (else the app's own
-copy), with `--home` set to the data folder and the PATH harness itself
-started with.
+The commands run the app's own copy of harness, with `--home` set to the
+data folder and the PATH harness itself started with. (An app built
+without a harness inside runs the one `state/desk.json` names.)
 
 **Building it.** It's built apart from harness, in `desk-app/`, with Xcode's
 command line tools, since it links Cocoa and WebKit and harness links

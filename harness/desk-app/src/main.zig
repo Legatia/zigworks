@@ -42,6 +42,7 @@ const sys = struct {
     extern fn hdesk_menu_state(start: c_int, stop: c_int, autostart_enabled: c_int, autostart_on: c_int, provider: c_int) void;
     extern fn hdesk_ask_key(title: [*:0]const u8, note: [*:0]const u8) void;
     extern fn hdesk_test_key(action: c_int) c_int;
+    extern fn hdesk_test_click(id: [*:0]const u8) void;
     extern fn hdesk_alert(title: [*:0]const u8, text: [*:0]const u8) void;
     extern fn hdesk_post_main(f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
     extern fn hdesk_every(seconds: f64, f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
@@ -68,6 +69,8 @@ const App = struct {
     /// The key just typed in the secure field, until `store_key` takes it
     /// (or the turn ends without it): then zeroed and freed.
     pending_key: ?[]u8 = null,
+    /// Whether the main frame holds a built-in page.
+    doc: policy.Doc = .{},
 };
 
 var app: App = undefined;
@@ -148,10 +151,12 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
         .show => |s| {
             log("show {t}", .{s.screen});
             const html = pages.html(a, s.screen, s.note, app.home, s.view) catch return;
+            app.doc.showing();
             sys.hdesk_show_html(z(a, html));
         },
         .load => |url| {
             log("load {s}", .{url});
+            app.doc.loading();
             sys.hdesk_load(z(a, url));
         },
         .reload => {
@@ -159,7 +164,10 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
             sys.hdesk_reload();
         },
         .check => |gen| startJob(CheckJob, .{ .gen = gen }),
-        .enter => |gen| startJob(EnterJob, .{ .gen = gen }),
+        .enter => |gen| {
+            entering.store(gen, .release);
+            startJob(EnterJob, .{ .gen = gen });
+        },
         .run => |r| startRun(r, a),
         .badge => |n| {
             var buf: [16]u8 = undefined;
@@ -189,14 +197,15 @@ fn perform(fx: Effect, a: std.mem.Allocator) void {
         },
         .step => |st| {
             log("step {s}", .{std.mem.join(a, " ", st.argv) catch ""});
-            startStep(st.gen, st.argv, st.path, null);
+            startStep(st.gen, st.argv, st.path, null, false);
         },
         .store_key => |st| {
             // the key itself is never logged: only the command it goes to
             log("store {s}", .{std.mem.join(a, " ", st.argv) catch ""});
-            const key = app.pending_key orelse return;
+            // with no key held the step still answers (as not started)
+            const key = app.pending_key;
             app.pending_key = null;
-            startStep(st.gen, st.argv, st.path, key);
+            startStep(st.gen, st.argv, st.path, key, true);
         },
         .read_config => |rc| {
             log("read config", .{});
@@ -233,26 +242,85 @@ fn dropKey(key: []u8) void {
 // ---- work off the main thread ----
 
 /// A job runs `work` on a thread of its own, then `deliver` on the main
-/// thread, which hands the controller its event and frees the job.
+/// thread, which hands the controller its event and frees the job. One
+/// that can't be run (no memory for it, or no thread) answers the same
+/// way with its failure (`refuse`, then `deliver`): the controller is not
+/// left waiting for it, and nothing that may take long runs on the main
+/// thread in its place.
 fn startJob(comptime J: type, init: J) void {
-    const job = app.gpa.create(J) catch return;
+    launch(J, make(J, init) orelse return);
+}
+
+/// What a command that couldn't be started says.
+const not_started = "It couldn't be started: the system had no memory or no thread for it.";
+
+/// One job of each kind kept for when there is no memory for a new one:
+/// it carries the failure back. Main thread only.
+fn Spare(comptime J: type) type {
+    return struct {
+        var job: J = undefined;
+        var busy: bool = false;
+    };
+}
+
+/// Test builds: how many of the next jobs get no thread (`nothreads N`),
+/// or no memory (`nomemory N`).
+var no_threads: u32 = 0;
+var no_memory: u32 = 0;
+
+fn make(comptime J: type, init: J) ?*J {
+    const S = Spare(J);
+    const short = hooks_on and no_memory > 0;
+    if (short) no_memory -= 1;
+    const got: ?*J = if (short) null else app.gpa.create(J) catch null;
+    const job = got orelse spare: {
+        log("no memory for a job", .{});
+        if (S.busy) {
+            // twice before the first was delivered: this one's failure
+            // goes unsaid, and what it holds is let go
+            var lost = init;
+            lost.arena = .init(app.gpa);
+            lost.refuse();
+            return null;
+        }
+        S.busy = true;
+        break :spare &S.job;
+    };
     job.* = init;
     job.arena = .init(app.gpa);
-    const th = std.Thread.spawn(.{}, J.work, .{job}) catch {
-        J.work(job); // no thread: do it here, as a failure would
-        return;
-    };
+    return job;
+}
+
+fn launch(comptime J: type, job: *J) void {
+    // with no memory for the job itself there is none for its work
+    if (job == &Spare(J).job) return refused(J, job);
+    const th = thread(J.work, job) catch return refused(J, job);
     th.detach();
+}
+
+fn refused(comptime J: type, job: *J) void {
+    job.refuse();
+    post(J, job);
+}
+
+fn thread(comptime work: anytype, job: anytype) !std.Thread {
+    if (hooks_on and no_threads > 0) {
+        no_threads -= 1;
+        return error.SystemResources;
+    }
+    return std.Thread.spawn(.{}, work, .{job});
+}
+
+fn free(comptime J: type, job: *J) void {
+    job.arena.deinit();
+    if (job == &Spare(J).job) Spare(J).busy = false else app.gpa.destroy(job);
 }
 
 fn post(comptime J: type, job: *J) void {
     sys.hdesk_post_main(struct {
         fn f(p: ?*anyopaque) callconv(.c) void {
             const j: *J = @ptrCast(@alignCast(p.?));
-            defer {
-                j.arena.deinit();
-                app.gpa.destroy(j);
-            }
+            defer free(J, j);
             j.deliver();
         }
     }.f, job);
@@ -281,15 +349,23 @@ const CheckJob = struct {
                 break :r if (alive.check(d.port, alive_timeout_ms)) .{ .alive = d } else .{ .dead = d };
             } else |_| .bad_desk;
         } else |e| {
-            j.result = if (e == error.FileNotFound) .no_config else .bad_desk;
+            j.result = if (e == error.FileNotFound) .no_config else .bad_config;
         }
         post(CheckJob, j);
+    }
+
+    fn refuse(j: *CheckJob) void {
+        j.result = .undone;
     }
 
     fn deliver(j: *CheckJob) void {
         dispatch(.{ .checked = .{ .gen = j.gen, .result = j.result } });
     }
 };
+
+/// The entry the app still waits for (the controller's number for it): an
+/// earlier one's thread sees it isn't that one and ends.
+var entering: std.atomic.Value(u32) = .init(0);
 
 const EnterJob = struct {
     gen: u32,
@@ -298,10 +374,19 @@ const EnterJob = struct {
 
     fn work(j: *EnterJob) void {
         const a = j.arena.allocator();
+        const turn: entry.Turn = .{ .current = &entering, .mine = j.gen };
+        if (turn.over()) return post(EnterJob, j);
         if (entry.request(app.io, app.home)) |_| {
-            j.code = entry.wait(app.io, a, app.home, code_timeout_ms, code_poll_ms) catch null;
+            j.code = entry.wait(app.io, a, app.home, code_timeout_ms, code_poll_ms, turn) catch null;
+            // no code came: the request isn't left for a later harness to answer
+            if (j.code == null and !turn.over()) entry.withdraw(app.io, app.home);
         } else |_| {}
         post(EnterJob, j);
+    }
+
+    /// No code: the controller's own words for that.
+    fn refuse(j: *EnterJob) void {
+        j.code = null;
     }
 
     fn deliver(j: *EnterJob) void {
@@ -347,6 +432,11 @@ const RunJob = struct {
         post(RunJob, j);
     }
 
+    fn refuse(j: *RunJob) void {
+        j.ok = false;
+        j.text = not_started;
+    }
+
     fn deliver(j: *RunJob) void {
         if (j.exit_code) |c| {
             log("exit {d} run", .{c});
@@ -367,6 +457,8 @@ const StepJob = struct {
     argv: []const []const u8 = &.{},
     env: ?std.process.Environ.Map = null,
     key: ?[]u8 = null,
+    /// The step that stores the key (`secret add`): answered as `stored`.
+    store: bool = false,
     ok: bool = false,
     text: []const u8 = "",
     out: []const u8 = "",
@@ -389,30 +481,31 @@ const StepJob = struct {
         post(StepJob, j);
     }
 
+    fn refuse(j: *StepJob) void {
+        if (j.key) |k| {
+            dropKey(k);
+            j.key = null;
+        }
+        j.ok = false;
+        j.text = not_started;
+    }
+
     fn deliver(j: *StepJob) void {
         log("stepped ok={d} {s}", .{ @intFromBool(j.ok), j.text });
-        if (j.argv.len > 2 and std.mem.eql(u8, j.argv[1], "secret")) {
+        if (j.store) {
             dispatch(.{ .stored = .{ .gen = j.gen, .ok = j.ok, .text = j.text } });
         } else dispatch(.{ .stepped = .{ .gen = j.gen, .ok = j.ok, .text = j.text, .out = j.out } });
     }
 };
 
-fn startStep(gen: u32, argv: []const []const u8, path: []const u8, key: ?[]u8) void {
-    const job = app.gpa.create(StepJob) catch {
-        if (key) |k| dropKey(k);
-        return;
-    };
-    job.* = .{ .gen = gen, .arena = .init(app.gpa), .key = key };
+fn startStep(gen: u32, argv: []const []const u8, path: []const u8, key: ?[]u8, store: bool) void {
+    const job = make(StepJob, .{ .gen = gen, .key = key, .store = store }) orelse return;
     const a = job.arena.allocator();
-    var copy: std.ArrayList([]const u8) = .empty;
-    for (argv) |w| copy.append(a, a.dupe(u8, w) catch "") catch {};
-    job.argv = copy.items;
-    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch null;
-    const th = std.Thread.spawn(.{}, StepJob.work, .{job}) catch {
-        StepJob.work(job);
-        return;
-    };
-    th.detach();
+    // the whole line and its PATH, or it isn't run
+    job.argv = commands.copyArgv(a, argv) catch return refused(StepJob, job);
+    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch return refused(StepJob, job);
+    if (store and key == null) return refused(StepJob, job);
+    launch(StepJob, job);
 }
 
 /// "Provider and key…": `harness config get` for `model.provider`, then for
@@ -450,6 +543,11 @@ const ReadJob = struct {
         post(ReadJob, j);
     }
 
+    fn refuse(j: *ReadJob) void {
+        j.ok = false;
+        j.text = not_started;
+    }
+
     fn read(j: *ReadJob) !void {
         const provider = try j.get("model.provider");
         var values: [7][]const u8 = undefined;
@@ -465,26 +563,22 @@ const ReadJob = struct {
 };
 
 fn startRead(gen: u32, binary: []const u8, home: []const u8, path: []const u8) void {
-    const job = app.gpa.create(ReadJob) catch return;
-    job.* = .{ .gen = gen, .arena = .init(app.gpa) };
+    const job = make(ReadJob, .{ .gen = gen }) orelse return;
     const a = job.arena.allocator();
-    job.binary = a.dupe(u8, binary) catch "";
-    job.home = a.dupe(u8, home) catch "";
-    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch null;
-    const th = std.Thread.spawn(.{}, ReadJob.work, .{job}) catch {
-        ReadJob.work(job);
-        return;
-    };
-    th.detach();
+    job.binary = a.dupe(u8, binary) catch return refused(ReadJob, job);
+    job.home = a.dupe(u8, home) catch return refused(ReadJob, job);
+    if (path.len > 0) job.env = commands.withPath(a, app.env, path) catch return refused(ReadJob, job);
+    launch(ReadJob, job);
 }
 
 fn startRun(r: @FieldType(Effect, "run"), turn: std.mem.Allocator) void {
-    const job = app.gpa.create(RunJob) catch return;
-    job.* = .{ .cmd = r.cmd, .arena = .init(app.gpa) };
+    const job = make(RunJob, .{ .cmd = r.cmd }) orelse return;
     const a = job.arena.allocator();
-    job.argv = commands.argv(a, r.cmd, r.binary, r.home) catch &.{};
-    if (r.path.len > 0) job.env = commands.withPath(a, app.env, r.path) catch null;
+    // the whole line and its PATH, or it isn't run
+    job.argv = commands.argv(a, r.cmd, r.binary, r.home) catch return refused(RunJob, job);
+    if (r.path.len > 0) job.env = commands.withPath(a, app.env, r.path) catch return refused(RunJob, job);
     log("run {s}", .{std.mem.join(turn, " ", job.argv) catch ""});
+    if (job == &Spare(RunJob).job) return refused(RunJob, job);
     if (r.cmd == .run) {
         const env: ?*const std.process.Environ.Map = if (job.env) |*e| e else null;
         job.child = commands.spawnDetached(app.io, job.argv, env) catch |e| {
@@ -493,12 +587,16 @@ fn startRun(r: @FieldType(Effect, "run"), turn: std.mem.Allocator) void {
             post(RunJob, job);
             return;
         };
+        // waited on until it ends. With no thread for that, harness runs
+        // on and its end goes unseen (the checks still find it): waiting
+        // here would hold the window for as long as harness runs.
+        const th = thread(RunJob.work, job) catch {
+            log("no thread to wait for harness on", .{});
+            return free(RunJob, job);
+        };
+        return th.detach();
     }
-    const th = std.Thread.spawn(.{}, RunJob.work, .{job}) catch {
-        RunJob.work(job);
-        return;
-    };
-    th.detach();
+    launch(RunJob, job);
 }
 
 // ---- called by the system's layer, on the main thread ----
@@ -533,7 +631,9 @@ fn onTick(_: ?*anyopaque) callconv(.c) void {
 
 export fn hdesk_on_message(json: [*:0]const u8, main_frame: c_int, proto: [*:0]const u8, host: [*:0]const u8, port: c_int) void {
     const text = std.mem.span(json);
-    const src = bridge.source(main_frame != 0, std.mem.span(proto), std.mem.span(host), @intCast(@max(port, 0)), app.ctl.port(), app.ctl.showingBuiltin());
+    // the built-in page once it is the document: a page still there while
+    // one loads isn't it
+    const src = bridge.source(main_frame != 0, std.mem.span(proto), std.mem.span(host), @intCast(@max(port, 0)), app.ctl.port(), app.ctl.showingBuiltin() and app.doc.builtin);
     log("message {t} {s}", .{ src, text });
     var arena: std.heap.ArenaAllocator = .init(app.gpa);
     defer arena.deinit();
@@ -541,14 +641,17 @@ export fn hdesk_on_message(json: [*:0]const u8, main_frame: c_int, proto: [*:0]c
     dispatch(.{ .message = .{ .msg = msg, .source = src } });
 }
 
-export fn hdesk_on_navigate(url_z: [*:0]const u8, frame: c_int) c_int {
+/// A navigation asked for: 0 lets it load here, 1 has opened the system
+/// browser instead, 2 drops it. `clicked`: the person clicked a link (a
+/// script's navigation, or window.open, opens nothing outside).
+export fn hdesk_on_navigate_from(url_z: [*:0]const u8, frame: c_int, clicked: c_int) c_int {
     const url = std.mem.span(url_z);
     const f: policy.Frame = switch (frame) {
         0 => .main,
         1 => .sub,
         else => .new_window,
     };
-    const d = policy.decide(url, app.ctl.port(), f);
+    const d = policy.decide(url, app.ctl.port(), f, .{ .click = clicked != 0, .app = app.doc.appLoads() });
     if (d != .allow) log("nav {t} {t} {s}", .{ d, f, url });
     if (d == .external) {
         if (hooks_on and app.hooks != null) log("external {s}", .{url}) else sys.hdesk_open_external(url_z);
@@ -560,6 +663,12 @@ export fn hdesk_on_navigate(url_z: [*:0]const u8, frame: c_int) c_int {
     };
 }
 
+/// The same, from a layer that doesn't say yet whether it was a click:
+/// every navigation counts as one.
+export fn hdesk_on_navigate(url_z: [*:0]const u8, frame: c_int) c_int {
+    return hdesk_on_navigate_from(url_z, frame, 1);
+}
+
 export fn hdesk_on_response(url: [*:0]const u8, status: c_int, main_frame: c_int) void {
     if (main_frame == 0) return;
     log("response {d} {s}", .{ status, url });
@@ -568,6 +677,7 @@ export fn hdesk_on_response(url: [*:0]const u8, status: c_int, main_frame: c_int
 
 export fn hdesk_on_finish(url: [*:0]const u8) void {
     log("finish {s}", .{url});
+    app.doc.finished(std.mem.span(url));
 }
 
 export fn hdesk_on_failed(url: [*:0]const u8, code: c_int) void {
@@ -623,6 +733,10 @@ export fn hdesk_on_menu(item: c_int) void {
     dispatch(.{ .menu = m });
 }
 
+export fn hdesk_on_reopen() void {
+    log("shown again", .{});
+}
+
 export fn hdesk_on_crashed() void {
     log("crashed", .{});
     dispatch(.crashed);
@@ -674,6 +788,11 @@ fn onHooks(_: ?*anyopaque) callconv(.c) void {
             const secure = sys.hdesk_test_key(if (k == .fill) 1 else 0);
             log("key-sheet {t} secure={d}", .{ k, secure });
         },
+        .click => |id| if (comptime @import("builtin").os.tag == .macos) {
+            sys.hdesk_test_click(z(a, id));
+        } else log("unknown click {s}", .{id}),
+        .nothreads => |n| no_threads = n,
+        .nomemory => |n| no_memory = n,
         .quit => sys.hdesk_quit(),
     };
 }

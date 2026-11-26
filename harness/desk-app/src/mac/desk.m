@@ -173,11 +173,18 @@ static int frameOf(WKFrameInfo *f) {
     return f.isMainFrame ? HDESK_FRAME_MAIN : HDESK_FRAME_SUB;
 }
 
+// Whether the person clicked a link: a link activated with a mouse button.
+// A script's own click() has no button, and a script setting location or
+// calling window.open activates no link.
+static int clicked(WKNavigationAction *a) {
+    return a.navigationType == WKNavigationTypeLinkActivated && a.buttonNumber != 0;
+}
+
 - (void)webView:(WKWebView *)wv
     decidePolicyForNavigationAction:(WKNavigationAction *)a
                     decisionHandler:(void (^)(WKNavigationActionPolicy))h {
     int frame = frameOf(a.targetFrame);
-    int d = hdesk_on_navigate(cstr(a.request.URL.absoluteString), frame);
+    int d = hdesk_on_navigate_from(cstr(a.request.URL.absoluteString), frame, clicked(a));
     if (frame == HDESK_FRAME_NEW_WINDOW) {
         // never a second window: the desk's own pages load in this one
         if (d == HDESK_ALLOW) [wv loadRequest:a.request];
@@ -194,7 +201,7 @@ static int frameOf(WKFrameInfo *f) {
                     windowFeatures:(WKWindowFeatures *)features {
     (void)cfg;
     (void)features;
-    if (hdesk_on_navigate(cstr(a.request.URL.absoluteString), HDESK_FRAME_NEW_WINDOW) == HDESK_ALLOW) [wv loadRequest:a.request];
+    if (hdesk_on_navigate_from(cstr(a.request.URL.absoluteString), HDESK_FRAME_NEW_WINDOW, clicked(a)) == HDESK_ALLOW) [wv loadRequest:a.request];
     return nil;
 }
 
@@ -273,8 +280,9 @@ static void failed(WKWebView *wv, NSError *e) {
               initiatedByFrame:(WKFrameInfo *)f
              completionHandler:(void (^)(NSArray<NSURL *> *))h {
     (void)wv;
-    (void)f;
     NSOpenPanel *panel = [NSOpenPanel openPanel];
+    // an app framed in the desk, not the desk itself: said before a file is chosen
+    if (!f.isMainFrame) panel.message = @"An app on the desk asks for a file. It can read the file you choose.";
     panel.allowsMultipleSelection = p.allowsMultipleSelection;
     panel.canChooseDirectories = p.allowsDirectories;
     panel.canChooseFiles = YES;
@@ -289,9 +297,11 @@ static void failed(WKWebView *wv, NSError *e) {
                       initiatedByFrame:(WKFrameInfo *)f
                      completionHandler:(void (^)(void))h {
     (void)wv;
-    (void)f;
+    // the desk page's own only, and under a line that says whose words they are
+    if (!f.isMainFrame) return h();
     NSAlert *a = [NSAlert new];
-    a.messageText = message;
+    a.messageText = @"Message from the page";
+    a.informativeText = message ?: @"";
     [a addButtonWithTitle:@"OK"];
     [a beginSheetModalForWindow:self.window
               completionHandler:^(NSModalResponse r) {
@@ -305,9 +315,10 @@ static void failed(WKWebView *wv, NSError *e) {
                         initiatedByFrame:(WKFrameInfo *)f
                        completionHandler:(void (^)(BOOL))h {
     (void)wv;
-    (void)f;
+    if (!f.isMainFrame) return h(NO);
     NSAlert *a = [NSAlert new];
-    a.messageText = message;
+    a.messageText = @"Question from the page";
+    a.informativeText = message ?: @"";
     [a addButtonWithTitle:@"OK"];
     [a addButtonWithTitle:@"Cancel"];
     [a beginSheetModalForWindow:self.window
@@ -318,10 +329,71 @@ static void failed(WKWebView *wv, NSError *e) {
 
 @end
 
+// ---- one window a data folder ----
+
+// A port named after the data folder: the first start on a folder holds
+// it; a later one asks through it for the window, and ends. (`harness
+// open` starts the app anew each time, since a running app is handed no
+// arguments: this is what keeps that to one window a folder.)
+const char *hdesk_home(void);
+
+static CFDataRef onAsked(CFMessagePortRef port, SInt32 msg, CFDataRef data, void *info) {
+    (void)port, (void)msg, (void)data, (void)info;
+    if (desk.window) {
+        if (desk.window.miniaturized) [desk.window deminiaturize:nil];
+        [desk.window makeKeyAndOrderFront:nil];
+        [NSApp activateIgnoringOtherApps:YES];
+        hdesk_on_reopen();
+    }
+    pid_t pid = getpid();
+    return CFDataCreate(NULL, (const UInt8 *)&pid, sizeof pid);
+}
+
+static int firstHere(void) {
+    NSString *home = str(hdesk_home());
+    if (!home.isAbsolutePath) home = [[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:home];
+    home = home.stringByResolvingSymlinksInPath;
+    unsigned long long h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)home.UTF8String; p && *p; p++) h = (h ^ *p) * 1099511628211ULL;
+    CFStringRef name = (__bridge CFStringRef)[NSString stringWithFormat:@"io.github.legatia.harness-desk.h%016llx", h];
+    for (int i = 0; i < 2; i++) {
+        CFMessagePortRef there = CFMessagePortCreateRemote(NULL, name);
+        if (there) {
+            CFDataRef reply = NULL;
+            SInt32 r = CFMessagePortSendRequest(there, 1, NULL, 5, 5, kCFRunLoopDefaultMode, &reply);
+            CFRelease(there);
+            if (r == kCFMessagePortSuccess) {
+                // (its own activation can be refused; this start, which
+                // the system just brought forward, hands its turn over)
+                if (reply && CFDataGetLength(reply) == sizeof(pid_t)) {
+                    pid_t pid;
+                    CFDataGetBytes(reply, CFRangeMake(0, sizeof pid), (UInt8 *)&pid);
+                    [[NSRunningApplication runningApplicationWithProcessIdentifier:pid] activateWithOptions:0];
+                }
+                if (reply) CFRelease(reply);
+                return 0;
+            }
+            if (reply) CFRelease(reply);
+        }
+        // nobody answers on it: this start is the folder's one
+        CFMessagePortRef mine = CFMessagePortCreateLocal(NULL, name, onAsked, NULL, NULL);
+        if (mine) {
+            CFRunLoopSourceRef src = CFMessagePortCreateRunLoopSource(NULL, mine, 0);
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes);
+            CFRelease(src);
+            return 1;
+        }
+    }
+    // the name is held by something that doesn't answer: a window of its
+    // own beats none
+    return 1;
+}
+
 // ---- the C interface ----
 
 int hdesk_run(const char *user_agent) {
     @autoreleasepool {
+        if (!firstHere()) return 0;
         NSApplication *app = [NSApplication sharedApplication];
         desk = [HDDesk new];
         desk.userAgent = str(user_agent);
@@ -440,6 +512,39 @@ int hdesk_test_key(int action) {
 #else
     (void)action;
     return -1;
+#endif
+}
+
+void hdesk_test_click(const char *element) {
+#ifdef HDESK_TEST_HOOKS
+    // where the element is, then a mouse press and release there: an event
+    // from the system's side, as a person's click is
+    NSString *js = [NSString stringWithFormat:@"(function(){var e=document.getElementById('%@');if(!e)return null;"
+                                              @"e.scrollIntoView({block:'center'});var r=e.getBoundingClientRect();"
+                                              @"return [r.left+r.width/2,r.top+r.height/2];})()", str(element)];
+    [desk.web evaluateJavaScript:js
+               completionHandler:^(id v, NSError *e) {
+                 (void)e;
+                 if (![v isKindOfClass:[NSArray class]] || [v count] != 2) return;
+                 WKWebView *web = desk.web;
+                 double x = [v[0] doubleValue], y = [v[1] doubleValue];
+                 if (!web.isFlipped) y = web.bounds.size.height - y;
+                 NSPoint at = [web convertPoint:NSMakePoint(x, y) toView:nil];
+                 for (int up = 0; up < 2; up++) {
+                     NSEvent *ev = [NSEvent mouseEventWithType:up ? NSEventTypeLeftMouseUp : NSEventTypeLeftMouseDown
+                                                      location:at
+                                                 modifierFlags:0
+                                                     timestamp:NSProcessInfo.processInfo.systemUptime
+                                                  windowNumber:desk.window.windowNumber
+                                                       context:nil
+                                                   eventNumber:0
+                                                    clickCount:1
+                                                      pressure:up ? 0 : 1];
+                     if (up) [web mouseUp:ev]; else [web mouseDown:ev];
+                 }
+               }];
+#else
+    (void)element;
 #endif
 }
 

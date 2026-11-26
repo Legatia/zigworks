@@ -1,4 +1,5 @@
-//! The harness commands the app runs, through the binary desk.json names.
+//! The harness commands the app runs, through its own copy of harness
+//! (`Controller.binary`).
 const std = @import("std");
 
 const Io = std.Io;
@@ -22,6 +23,13 @@ pub fn argv(a: std.mem.Allocator, cmd: Command, binary: []const u8, home: []cons
     try out.appendSlice(a, words);
     try out.appendSlice(a, &.{ "--home", try a.dupe(u8, home) });
     return out.toOwnedSlice(a);
+}
+
+/// `line`, every word copied into `a`: whole, or an error.
+pub fn copyArgv(a: std.mem.Allocator, line: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, line.len);
+    for (line, out) |w, *o| o.* = try a.dupe(u8, w);
+    return out;
 }
 
 /// `harness autostart`'s answer: its first word, `on` or `off`.
@@ -306,4 +314,27 @@ test "a_command_that_couldnt_finish_says_which_way" {
     const a = arena.allocator();
     try t.expectEqualStrings("/b/harness didn't finish within 30 s.", try notRun(a, "/b/harness", error.Timeout));
     try t.expectEqualStrings("/b/harness couldn't be run (FileNotFound).", try notRun(a, "/b/harness", error.FileNotFound));
+}
+
+test "a_copied_line_is_whole_or_not_at_all" {
+    const line: []const []const u8 = &.{ "/x/harness", "secret", "add", "anthropic_api_key", "--stdin", "--home", "/data" };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const copy = try copyArgv(arena.allocator(), line);
+    try std.testing.expectEqual(line.len, copy.len);
+    for (line, copy) |w, c| {
+        try std.testing.expectEqualStrings(w, c);
+        try std.testing.expect(w.ptr != c.ptr);
+    }
+    // memory running out at any point: an error, never a line with words missing
+    var n: usize = 0;
+    while (n < 8) : (n += 1) {
+        var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = n });
+        var ar: std.heap.ArenaAllocator = .init(failing.allocator());
+        defer ar.deinit();
+        if (copyArgv(ar.allocator(), line)) |c| {
+            try std.testing.expectEqual(line.len, c.len);
+            for (line, c) |w, x| try std.testing.expectEqualStrings(w, x);
+        } else |e| try std.testing.expectEqual(error.OutOfMemory, e);
+    }
 }
