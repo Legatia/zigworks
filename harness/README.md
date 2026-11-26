@@ -3795,7 +3795,11 @@ serves pack files up to 20 MB each.
 The desk fits a portrait itself, in its window, in a few seconds: it
 finds the face's landmarks (MediaPipe's face landmarker), maps a neutral
 base head onto them and carries every expression shape along. It refuses
-a photo with the reason:
+a photo with the reason, and a refused photo isn't saved: the page keeps a
+new portrait to itself until the fit takes it, then uploads the portrait
+and what was fitted to it. A new portrait for a name that has one replaces
+it, and harness drops the head, the eyes and the eyes-closed version made
+for the one before (`POST upload?part=still`).
 
 | Check | Message |
 |---|---|
@@ -3830,7 +3834,7 @@ from source, `sh tools/fetch-desk-assets.sh DATA/desk-assets` fetches
 MediaPipe's files and checks each by SHA-256; copy
 `desk-assets/base-head.bin` from the repository beside them.
 `sh scripts/pack-desk-assets.sh DEST` makes the release's folder (the
-release job runs it).
+release job runs it, and CI's desk jobs).
 
 The base head is in this repository, `desk-assets/base-head.bin` (3.3 MB),
 made from USC ICT's ICT-FaceKit (MIT; its notice and how the file was made
@@ -4129,9 +4133,12 @@ scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Ma
 The package needs the fit files: `harness/scripts/pack-desk-assets.sh`
 fetches MediaPipe's at their pinned hashes and takes the base head from
 the repository, and a missing file stops it with one line.
-`DESK_ASSETS=DIR` uses a desk-assets folder made already;
-`DESK_ASSETS=none` leaves them out and says so (CI does, without the
-network):
+`DESK_ASSETS=DIR` takes them from a desk-assets folder made already,
+by name (`harness/scripts/copy-desk-assets.sh`: the fit files and the
+licence and notice files, nothing else the folder holds);
+`DESK_ASSETS=none` leaves them out and says so. CI packs them as a release
+does and packages from that folder; `sh scripts/test-desk-assets.sh`
+checks the two scripts with no network.
 
 ```
 DESK_ASSETS=none scripts/package-macos.sh 0.0.0 test.zip

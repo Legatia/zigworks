@@ -717,6 +717,8 @@ const Quick = struct {
 
 /// Posts with quick replies kept at once; the oldest goes first.
 const max_quick = 32;
+/// How long a press waits for its post's message to be noted.
+const quick_noting_ms = 2000;
 
 /// One of harness's messages in a group (see `Core.group_posts`).
 const GroupPost = struct { chat: i64, id: i64 };
@@ -4060,21 +4062,29 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        const got = blk: {
-            c.quick_mutex.lockUncancelable(c.io);
-            defer c.quick_mutex.unlock(c.io);
-            for (c.quick.items) |*q| if (q.n == n) {
-                if (q.used or q.msg == null or q.msg.? != message_id or which == 0 or which > q.labels.len) return false;
-                q.used = true;
-                break :blk .{
-                    .conv = a.dupe(u8, q.conv) catch return false,
-                    .agent = a.dupe(u8, q.agent) catch return false,
-                    .label = a.dupe(u8, q.labels[which - 1]) catch return false,
-                    .excerpt = a.dupe(u8, q.excerpt) catch return false,
-                    .place = Place{ .name = "", .chat = q.chat, .thread = q.thread },
-                };
-            };
-            return false;
+        var waited: u32 = 0;
+        const got = blk: while (true) : (waited += 5) {
+            {
+                c.quick_mutex.lockUncancelable(c.io);
+                defer c.quick_mutex.unlock(c.io);
+                const q = for (c.quick.items) |*q| {
+                    if (q.n == n) break q;
+                } else return false;
+                // its buttons show a moment before their message is noted
+                // (sendWithButtons): a press in between waits for that
+                if (q.msg != null or waited >= quick_noting_ms) {
+                    if (q.used or q.msg == null or q.msg.? != message_id or which == 0 or which > q.labels.len) return false;
+                    q.used = true;
+                    break :blk .{
+                        .conv = a.dupe(u8, q.conv) catch return false,
+                        .agent = a.dupe(u8, q.agent) catch return false,
+                        .label = a.dupe(u8, q.labels[which - 1]) catch return false,
+                        .excerpt = a.dupe(u8, q.excerpt) catch return false,
+                        .place = Place{ .name = "", .chat = q.chat, .thread = q.thread },
+                    };
+                }
+            }
+            c.io.sleep(.fromMilliseconds(5), .awake) catch {};
         };
         if (c.chan) |ch| ch.clear(ch.ctx, got.place, message_id);
         c.log.write(.chat, c.convPrivate(got.conv), .{ .event = "quick reply", .post = n, .text = got.label }) catch {};
@@ -15167,7 +15177,8 @@ pub const Core = struct {
     /// `POST upload?avatar=NAME&part=still|closed|head|eyes|eyemask
     /// [&consent=yes]`: a file of one of the owner's avatars, into
     /// `avatars/NAME/`; `avatar.ini` names what is there. A photo needs
-    /// the consent line ticked.
+    /// the consent line ticked. A new `still` drops the head, the eyes and
+    /// the closed eyes that were made for the one before.
     fn deskUpload(c: *Core, a: std.mem.Allocator, call: appserver.DeskCall) !appserver.Answer {
         const name = queryGet(call.query, "avatar") orelse return deskErr(a, .bad_request, "avatar=NAME");
         if (!config.avatarName(name)) return deskErr(a, .bad_request, "an avatar's name is a-z, 0-9 and -, up to 32");
@@ -15187,6 +15198,10 @@ pub const Core = struct {
             const other = try std.fmt.allocPrint(a, "{s}.{s}", .{ @tagName(part), if (std.mem.endsWith(u8, file_name, ".jpg")) "png" else "jpg" });
             Io.Dir.cwd().deleteFile(c.io, try std.fs.path.join(a, &.{ dir, other })) catch {};
         }
+        // another portrait: the head, the eyes and the closed eyes were
+        // made for the one before
+        if (part == .still) for ([_][]const u8{ "head.bin", "eyes.png", "eyemask.png", "closed.jpg", "closed.png" }) |old|
+            Io.Dir.cwd().deleteFile(c.io, try std.fs.path.join(a, &.{ dir, old })) catch {};
         try util.writeReplace(c.io, try std.fs.path.join(a, &.{ dir, file_name }), call.body);
         var pack: deskwin.Pack = .{};
         inline for (.{ "still", "closed" }) |k| for ([_][]const u8{ "jpg", "png" }) |ext| {
@@ -37056,6 +37071,32 @@ test "upload_writes_only_into_the_avatars_folder" {
     try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ f.home, "avatars", "butler" }), .{}));
 }
 
+test "a_new_portrait_drops_what_was_fitted_to_the_old_one" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const jpg = "\xff\xd8\xff\xe0portrait";
+    const png = "\x89PNG\r\n\x1a\neyes";
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", jpg);
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=head", "HEAD");
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=eyes", png);
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=eyemask", png);
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=closed&consent=yes", png);
+    const dir = try std.fs.path.join(a, &.{ f.home, "avatars", "me" });
+    try t.expectEqualStrings("[avatar]\nstill = still.jpg\nclosed = closed.png\nhead = head.bin\neyes = eyes.png\neyemask = eyemask.png\n", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "avatar.ini" }), a, .unlimited));
+    // another portrait: the head, eyes and closed eyes were made for the old one
+    try t.expectEqualStrings("{\"ok\":true,\"file\":\"still.jpg\"}", deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", jpg ++ "2").body);
+    for ([_][]const u8{ "head.bin", "eyes.png", "eyemask.png", "closed.png" }) |gone|
+        try t.expectError(error.FileNotFound, Io.Dir.cwd().statFile(t.io, try std.fs.path.join(a, &.{ dir, gone }), .{}));
+    try t.expectEqualStrings(jpg ++ "2", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "still.jpg" }), a, .unlimited));
+    try t.expectEqualStrings("[avatar]\nstill = still.jpg\n", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "avatar.ini" }), a, .unlimited));
+    // a refused upload leaves what's there
+    _ = deskCall(&f, .POST, "upload", "avatar=me&part=head", "HEAD");
+    try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "upload", "avatar=me&part=still&consent=yes", "GIF89a").status);
+    try t.expectEqualStrings("HEAD", try Io.Dir.cwd().readFileAlloc(t.io, try std.fs.path.join(a, &.{ dir, "head.bin" }), a, .unlimited));
+}
+
 test "desk_speech_fetches_the_providers_audio" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -37569,6 +37610,32 @@ test "desk_alone_quick_replies_are_pressed_on_the_desk" {
     try t.expectEqual(2, f.e.server.modelRequests());
     try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "press", "", "{\"id\":999999,\"n\":0}").status);
     try t.expectEqual(std.http.Status.bad_request, deskCall(&f, .POST, "press", "", "{\"id\":-1,\"n\":0}").status);
+}
+
+/// Notes the post `n`'s buttons as shown in message 77, a moment later.
+fn noteQuickLater(c: *Core, n: u32) void {
+    t.io.sleep(.fromMilliseconds(60), .awake) catch {};
+    c.quickShown(n, 77, .{ .name = "" });
+}
+
+test "a_quick_reply_pressed_before_its_buttons_are_noted_counts" {
+    var f: Fix = undefined;
+    try f.initAlone("", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // the buttons show (the channel has sent them) a moment before the
+    // worker notes their message: a press in between is not out of date
+    const n = try f.core.quickPost("main", "main", &.{"Book viewings"}, "Three flats match.");
+    const th = try std.Thread.spawn(.{}, noteQuickLater, .{ f.core, n });
+    const data = try std.fmt.allocPrint(a, "r{d}-{s}:1", .{ n, &f.core.approval_nonce });
+    const pressed = f.core.quickPress(77, data);
+    th.join();
+    try t.expect(pressed);
+    // once, and only from the message its buttons are in
+    try t.expect(!f.core.quickPress(77, data));
+    const m = try f.core.quickPost("main", "main", &.{"Not now"}, "Another post.");
+    f.core.quickShown(m, 78, .{ .name = "" });
+    try t.expect(!f.core.quickPress(77, try std.fmt.allocPrint(a, "r{d}-{s}:1", .{ m, &f.core.approval_nonce })));
 }
 
 test "a_desk_press_with_telegram_is_refused" {

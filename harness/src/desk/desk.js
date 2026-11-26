@@ -760,8 +760,11 @@ function speakWhere() {
   const v = $("speakSel").value || S.settings.speak;
   const sp = (S.settings.speakers || []).find((x) => x.name === v);
   const p = $("speakWhere");
-  p.hidden = !sp;
-  p.textContent = !sp ? "" : sp.key ? "Replies are sent to " + v + " to be read aloud." : "No " + v + " key is stored (harness secret add " + sp.secret + ").";
+  const all = S.settings.speakers || [];
+  // where replies would go is said before a provider is chosen: choosing applies at once
+  const before = all.length === 0 ? "" : "Choosing " + (all.length === 1 ? all[0].name : "a provider (" + all.map((x) => x.name).join(", ") + ")") + " sends replies to it to be read aloud.";
+  p.textContent = !sp ? before : sp.key ? "Replies are sent to " + v + " to be read aloud." : "No " + v + " key is stored (harness secret add " + sp.secret + ").";
+  p.hidden = !p.textContent;
   $("speakTune").hidden = !sp;
   if (sp) {
     // what's written is the chosen provider's; another shows its defaults
@@ -831,6 +834,8 @@ async function uploadPart(name, part, data, type) {
 let lastPhoto = null;
 let lastClosed = null;
 let lastName = "";
+// lastPhoto isn't in avatars/NAME/ yet: it goes there once the fit takes it
+let unsaved = false;
 
 function asBlob(v) {
   if (!v) return null;
@@ -838,7 +843,11 @@ function asBlob(v) {
   return new Blob([v]);
 }
 
-/** Runs the fit (fit.js) and keeps what it made; says what it found. */
+/**
+ * Runs the fit (fit.js) and keeps what it made; says what it found. A new
+ * portrait is fitted here first and saved only when the fit takes it, so a
+ * refused one never reaches harness.
+ */
 async function runFit(name) {
   $("fitBtn").hidden = true;
   note("fitOutcome", "Fitting…");
@@ -848,10 +857,16 @@ async function runFit(name) {
     res = await mod.fit(lastPhoto, lastClosed);
   } catch (e) {
     note("fitOutcome", (e && e.message) || "It couldn't be fitted.", true);
+    if (unsaved) note("upOutcome", "Not saved.", true);
     $("fitBtn").hidden = !lastPhoto;
     return;
   }
   try {
+    if (unsaved) {
+      await uploadPart(name, "still", lastPhoto, lastPhoto.type);
+      unsaved = false;
+      note("upOutcome", "Uploaded.");
+    }
     for (const k of ["head", "eyes", "eyemask"]) {
       const v = asBlob((res && res[k]) || (res && res.files && res.files[k]));
       if (v) await uploadPart(name, k, v, k === "head" ? "application/octet-stream" : "image/png");
@@ -881,14 +896,13 @@ $("upBtn").addEventListener("click", async () => {
   const why = !$("upConsent").checked ? "Tick the line first." : checkPhoto(file);
   if (why || !name) return note("upOutcome", why || "Give it a name: a-z, 0-9 and -.", true);
   $("upBtn").disabled = true;
-  note("upOutcome", "Uploading…");
+  note("upOutcome", "Checking…");
   try {
-    await uploadPart(name, "still", file, file.type);
-    note("upOutcome", "Uploaded.");
+    // an eyes-closed photo chosen for another avatar isn't this one's
+    if (lastClosed && lastName !== name) lastClosed = null;
     lastPhoto = file;
     lastName = name;
-    if (lastClosed && lastName !== name) lastClosed = null;
-    await loadState();
+    unsaved = true;
     await runFit(name);
   } catch (e) {
     if (!(e instanceof SignedOut)) note("upOutcome", e.message, true);
@@ -904,11 +918,14 @@ $("closedBtn").addEventListener("click", async () => {
   $("closedBtn").disabled = true;
   try {
     lastClosed = file; // saved after the fit accepts it (runFit)
-    if (!lastPhoto || lastName !== name) {
+    if (!lastPhoto || lastName !== name || unsaved) {
       // the portrait as harness keeps it, for the line-up check
       const ini = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/avatar.ini", { credentials: "same-origin", cache: "no-cache" }).then((r) => (r.ok ? r.text() : ""));
       const still = (ini.match(/^still\s*=\s*(\S+)/m) || [])[1];
-      if (still) lastPhoto = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/" + still, { credentials: "same-origin", cache: "no-cache" }).then((r) => r.blob());
+      if (still) {
+        lastPhoto = await fetch("/desk/avatars/" + encodeURIComponent(name) + "/" + still, { credentials: "same-origin", cache: "no-cache" }).then((r) => r.blob());
+        unsaved = false;
+      }
       lastName = name;
     }
     await runFit(name);
