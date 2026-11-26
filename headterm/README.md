@@ -201,7 +201,11 @@ order:
   for, then the final screen with the exit status. `--styles` adds styled
   runs.
 - **Timing:** keys are held until the program's first output has settled,
-  unless a wait comes first. A screen taken right after a send waits for the
+  unless a wait comes first. The hold ends after about 4 s: a program that
+  has printed nothing by then gets its keys anyway, and the step's line
+  says `sent before the program printed anything`. For a program that is
+  slow to start, wait for its first text (`--wait-text`) before the first
+  send. A screen taken right after a send waits for the
   program to react to the keys, then until its output has been quiet for
   200 ms, so `--send Down Enter --screen` needs no wait step in between.
 - **Success:** the session ends (`--keep` keeps it). Exit code 0.
@@ -287,7 +291,9 @@ selected.
   relying on the mode change.
 - Keys sent within 5 s of start, before the program has printed anything, are
   held until its first output has been quiet for 150 ms (at most 2 s). Some
-  programs drop typeahead that arrives before they are ready.
+  programs drop typeahead that arrives before they are ready, so when the
+  hold ends with nothing printed, `send` says `sent before the program
+  printed anything`.
 - `send` returns once the input is queued; `wait` shows the effect.
 
 ### wait

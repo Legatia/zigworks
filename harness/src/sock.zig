@@ -575,7 +575,7 @@ const winsock = struct {
     extern "ws2_32" fn ioctlsocket(s: usize, cmd: i32, arg: *u32) callconv(.winapi) c_int;
     extern "ws2_32" fn closesocket(s: usize) callconv(.winapi) c_int;
     const ws = struct {
-        extern "ws2_32" fn socket(af: c_int, kind: c_int, protocol: c_int) callconv(.winapi) usize;
+        extern "ws2_32" fn WSASocketW(af: c_int, kind: c_int, protocol: c_int, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
         extern "ws2_32" fn connect(s: usize, name: *const anyopaque, namelen: c_int) callconv(.winapi) c_int;
         extern "ws2_32" fn recv(s: usize, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
         extern "ws2_32" fn send(s: usize, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
@@ -587,6 +587,24 @@ const winsock = struct {
         extern "ws2_32" fn getsockname(s: usize, name: *anyopaque, namelen: *c_int) callconv(.winapi) c_int;
         extern "ws2_32" fn shutdown(s: usize, how: c_int) callconv(.winapi) c_int;
     };
+
+    // A socket is a handle a started program inherits unless told not to
+    // (std's spawn passes every inheritable handle on): a browser or an
+    // MCP server harness starts would hold harness's listener and its open
+    // connections, and keep the port after harness has gone. So none is
+    // inheritable: made so, and an accepted one cleared.
+    const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+    const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+    extern "kernel32" fn SetHandleInformation(h: std.os.windows.HANDLE, mask: u32, flags: u32) callconv(.winapi) std.os.windows.BOOL;
+    extern "kernel32" fn GetHandleInformation(h: std.os.windows.HANDLE, flags: *u32) callconv(.winapi) std.os.windows.BOOL;
+
+    /// Whether a program harness starts would inherit `s` (tests).
+    fn inheritable(s: Handle) bool {
+        var flags: u32 = HANDLE_FLAG_INHERIT;
+        if (!GetHandleInformation(@ptrFromInt(s), &flags).toBool()) return true;
+        return flags & HANDLE_FLAG_INHERIT != 0;
+    }
 
     var started: std.atomic.Value(bool) = .init(false);
 
@@ -618,7 +636,8 @@ const winsock = struct {
 
     fn socket(fam: u32, non_blocking: bool) Error!Handle {
         startup();
-        const s = ws.socket(@intCast(fam), SOCK_STREAM, IPPROTO_TCP);
+        // (overlapped, as socket() makes them)
+        const s = ws.WSASocketW(@intCast(fam), SOCK_STREAM, IPPROTO_TCP, null, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
         if (s == INVALID_SOCKET) return lastError();
         errdefer close(s);
         if (non_blocking) {
@@ -702,6 +721,7 @@ const winsock = struct {
     fn accept(s: Handle) Error!Handle {
         const got = ws.accept(s, null, null);
         if (got == INVALID_SOCKET) return lastError();
+        _ = SetHandleInformation(@ptrFromInt(got), HANDLE_FLAG_INHERIT, 0);
         return got;
     }
 };
@@ -720,6 +740,20 @@ test "a_listener_waits_for_a_connection_only_so_long" {
     closeHandle(here);
     var stop: std.atomic.Value(bool) = .init(true);
     try std.testing.expectEqual(null, try l.acceptWithin(std.testing.io, 5000, &stop));
+}
+
+test "no_socket_is_inherited_by_what_harness_starts_windows" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const l = try Listener.open(0);
+    defer l.close();
+    const there = try connect(std.testing.io, "127.0.0.1", l.port, 1000);
+    defer closeHandle(there);
+    const here = try l.accept();
+    defer closeHandle(here);
+    // the listener, a connection made, and one accepted
+    try std.testing.expect(!sys.inheritable(l.handle));
+    try std.testing.expect(!sys.inheritable(there));
+    try std.testing.expect(!sys.inheritable(here));
 }
 
 test "an_accepted_connection_sends_small_writes_at_once" {

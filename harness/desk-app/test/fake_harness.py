@@ -11,7 +11,9 @@ and getting in"), and nothing more:
       code used once and valid 60 s; GET /enter?code= sets a session cookie
       (HttpOnly, SameSite=Strict) and sends you to /desk; /desk and
       /desk/next are a test page, 403 without the cookie; /desk/framed is a
-      page for a frame in it; GET /report?k=v is logged;
+      page for a frame in it, /desk/framed-as (a frame that takes the
+      window's address before it posts) and /desk/framed-asks (a frame
+      that calls confirm) two more; GET /report?k=v is logged;
       DIR/state/stop-request makes it exit.
   fake_harness.py stop --home DIR        writes DIR/state/stop-request
   fake_harness.py autostart on|off --home DIR
@@ -133,6 +135,7 @@ def page(path, port, other):
 <p><a id="userinfo" href="http://127.0.0.1:{port}@example.com/">Look-alike</a></p>
 <p><a id="blank" href="https://example.org/blank" target="_blank">Elsewhere, new window</a></p>
 <p><a id="file" href="file:///etc/hosts">A file</a></p>
+<p><input type="file" id="pick"></p>
 <script>
 function post(m) {{
   var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
@@ -143,6 +146,17 @@ function frame() {{
   var f = document.createElement("iframe");
   f.sandbox = "allow-scripts";
   f.src = "/desk/framed";
+  document.body.appendChild(f);
+}}
+function frameAs() {{
+  var f = document.createElement("iframe");
+  f.sandbox = "allow-scripts";
+  f.src = "/desk/framed-as?to=" + encodeURIComponent(location.pathname + location.search);
+  document.body.appendChild(f);
+}}
+function frameAsks() {{
+  var f = document.createElement("iframe");
+  f.src = "/desk/framed-asks";
   document.body.appendChild(f);
 }}
 function report(k, v) {{ fetch("/report?" + encodeURIComponent(k) + "=" + encodeURIComponent(v)); }}
@@ -177,6 +191,35 @@ try {
   if (w) w.postMessage(m);
   else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(m);
 } catch (e) {}
+</script></body></html>
+"""
+
+
+# A frame that gives itself the window's own address (as far as the web
+# view lets a page rewrite its address) and then posts: a layer that knew
+# the desk page by its address alone would take this for it.
+FRAMED_AS = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>framed</title></head>
+<body><script>
+var to = new URLSearchParams(location.search).get("to"), took = "yes";
+try { history.replaceState(null, "", to); } catch (e) { took = e.name; }
+var m = {badge: 78};
+var w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.harness;
+try {
+  if (w) w.postMessage(m);
+  else if (window.chrome && window.chrome.webview) window.chrome.webview.postMessage(m);
+} catch (e) {}
+fetch("/report?framedas=" + encodeURIComponent(took), {mode: "no-cors"});
+</script></body></html>
+"""
+
+# A frame the desk's own address serves, without a sandbox: its confirm.
+FRAMED_ASKS = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>framed</title></head>
+<body><script>
+var said = "error";
+try { said = String(confirm("a frame asks")); } catch (e) { said = e.name; }
+fetch("/report?frameasks=" + encodeURIComponent(said));
 </script></body></html>
 """
 
@@ -234,6 +277,10 @@ def handler(fake, other):
                 return self.send(200, page(self.path, fake.port, other).encode(), "text/html; charset=utf-8")
             if u.path == "/desk/framed":
                 return self.send(200, FRAMED.encode(), "text/html; charset=utf-8")
+            if u.path == "/desk/framed-as":
+                return self.send(200, FRAMED_AS.encode(), "text/html; charset=utf-8")
+            if u.path == "/desk/framed-asks":
+                return self.send(200, FRAMED_ASKS.encode(), "text/html; charset=utf-8")
             if u.path == "/report":
                 for k, vs in q.items():
                     fake.log(f"report {k}={vs[0]}")

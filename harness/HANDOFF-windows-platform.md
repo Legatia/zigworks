@@ -5,6 +5,22 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: `main` has it all, and a release tag is coming (2026-11-26)
+
+The owner said "Merge. Tag release when the app is functioning". `main`
+was fast-forwarded to `harness-logins`; the tag will be `harness-v0.3.0`
+(`release.yml`: archives, and the desk app for macOS, Windows and Linux).
+
+One thing you may want in `smoke-other.sh`: the macOS smoke now takes
+`DESK_SMOKE_FAKE=PATH` (harness-fake) beside `DESK_SMOKE_HARNESS`. The
+real harness's provider is then the stand-in, with one answer in
+`model/001.json`, and a message typed in the desk must come back with the
+stand-in's words; the request must name `smoke-model` and carry the key
+from the sheet (`scripts/smoke.sh`, "a message typed in the desk is
+answered by the model"). Before this no smoke had a model answer through
+the app. The Windows and Linux smokes still use the dead address; adding
+the same there is yours, if you think it worth it.
+
 ## For you: your pull request #1 is merged; three things from its CI (2026-11-26)
 
 `platform/desk-win-linux` (2ec1fa0) is merged into `harness-logins`

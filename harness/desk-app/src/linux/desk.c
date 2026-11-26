@@ -224,7 +224,8 @@ int hdesk_test_key(int action) {
 // Where the element is, then a mouse press and release there, put to GTK
 // as the window system's own events are: WebKit takes them as a person's.
 static void click_there(GObject *src, GAsyncResult *res, gpointer d) {
-    (void)d;
+    // (3: the button that opens a menu)
+    guint button = GPOINTER_TO_UINT(d);
     JSCValue *v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(src), res, NULL);
     if (!v) return;
     char *s = jsc_value_is_string(v) ? jsc_value_to_string(v) : NULL;
@@ -243,8 +244,8 @@ static void click_there(GObject *src, GAsyncResult *res, gpointer d) {
             ev->button.y = y;
             ev->button.x_root = rx;
             ev->button.y_root = ry;
-            ev->button.button = 1;
-            ev->button.state = up ? GDK_BUTTON1_MASK : 0;
+            ev->button.button = button;
+            ev->button.state = up ? (button == 3 ? GDK_BUTTON3_MASK : GDK_BUTTON1_MASK) : 0;
             gdk_event_set_device(ev, pointer);
             gtk_main_do_event(ev);
             gdk_event_free(ev);
@@ -255,20 +256,38 @@ static void click_there(GObject *src, GAsyncResult *res, gpointer d) {
 }
 #endif
 
+#ifdef HDESK_TEST_HOOKS
+static void click_at(const char *element, guint button);
+#endif
+
+void hdesk_test_menu_click(const char *element) {
+#ifdef HDESK_TEST_HOOKS
+    click_at(element, 3);
+#else
+    (void)element;
+#endif
+}
+
 void hdesk_test_click(const char *element) {
 #ifdef HDESK_TEST_HOOKS
+    click_at(element, 1);
+#else
+    (void)element;
+#endif
+}
+
+#ifdef HDESK_TEST_HOOKS
+static void click_at(const char *element, guint button) {
     // (an id of letters, digits, - and _ only: it goes into a script)
     for (const char *p = element; *p; p++)
         if (!g_ascii_isalnum(*p) && *p != '-' && *p != '_') return;
     char *js = g_strdup_printf("(function(){var e=document.getElementById('%s');if(!e)return '';"
                                "e.scrollIntoView({block:'center'});var r=e.getBoundingClientRect();"
                                "return (r.left+r.width/2)+' '+(r.top+r.height/2);})()", element);
-    webkit_web_view_evaluate_javascript(web, js, -1, NULL, NULL, NULL, click_there, NULL);
+    webkit_web_view_evaluate_javascript(web, js, -1, NULL, NULL, NULL, click_there, GUINT_TO_POINTER(button));
     g_free(js);
-#else
-    (void)element;
-#endif
 }
+#endif
 
 void hdesk_menu_state(int start, int stop, int autostart_enabled, int autostart_on, int provider) {
     gtk_widget_set_sensitive(item_provider, provider != 0);
@@ -493,6 +512,106 @@ static gboolean on_context_menu(WebKitWebView *view, WebKitContextMenu *menu, Gd
     (void)event;
     (void)hit;
     (void)d;
+    hdesk_on_native("menu kept shut");
+    return TRUE;
+}
+
+// ---- a script's alert, confirm and prompt, and the file chooser ----
+// WebKitGTK doesn't say which frame asks, so there is one rule for all:
+// alert and confirm are shown under a line that says whose words they are,
+// prompt answers nothing (as on macOS), and leaving a page is never held
+// up by its script. (The desk frames its apps without allow-modals, so
+// theirs don't get this far.)
+
+#ifdef HDESK_TEST_HOOKS
+// A test build answers its own boxes: nobody is there to.
+static gboolean answer_soon(gpointer dlg) {
+    gtk_dialog_response(GTK_DIALOG(dlg), GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dlg), "hdesk-answer")));
+    return G_SOURCE_REMOVE;
+}
+#endif
+
+static void answered_by_test(GtkWidget *dlg, int response) {
+#ifdef HDESK_TEST_HOOKS
+    g_object_set_data(G_OBJECT(dlg), "hdesk-answer", GINT_TO_POINTER(response));
+    g_idle_add(answer_soon, dlg);
+#else
+    (void)dlg;
+    (void)response;
+#endif
+}
+
+static void on_script_response(GtkDialog *dlg, gint response, gpointer p) {
+    WebKitScriptDialog *d = (WebKitScriptDialog *)p;
+    if (webkit_script_dialog_get_dialog_type(d) == WEBKIT_SCRIPT_DIALOG_CONFIRM) webkit_script_dialog_confirm_set_confirmed(d, response == GTK_RESPONSE_OK);
+    webkit_script_dialog_close(d);
+    webkit_script_dialog_unref(d);
+    gtk_widget_destroy(GTK_WIDGET(dlg));
+}
+
+static gboolean on_script_dialog(WebKitWebView *view, WebKitScriptDialog *d, gpointer unused) {
+    (void)view;
+    (void)unused;
+    WebKitScriptDialogType type = webkit_script_dialog_get_dialog_type(d);
+    if (type == WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM) {
+        webkit_script_dialog_confirm_set_confirmed(d, TRUE);
+        return TRUE;
+    }
+    if (type == WEBKIT_SCRIPT_DIALOG_PROMPT) {
+        hdesk_on_native("prompt");
+        return TRUE;
+    }
+    int confirm = type == WEBKIT_SCRIPT_DIALOG_CONFIRM;
+    hdesk_on_native(confirm ? "confirm" : "alert");
+    // shown without a loop of its own (hdesk_alert says why); the page's
+    // script waits until the dialog is closed
+    GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(win), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT, confirm ? GTK_MESSAGE_QUESTION : GTK_MESSAGE_INFO,
+                                            confirm ? GTK_BUTTONS_OK_CANCEL : GTK_BUTTONS_OK, "%s", confirm ? "Question from the page" : "Message from the page");
+    const char *text = webkit_script_dialog_get_message(d);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dlg), "%s", text ? text : "");
+    g_signal_connect(dlg, "response", G_CALLBACK(on_script_response), webkit_script_dialog_ref(d));
+    gtk_widget_show(dlg);
+    answered_by_test(dlg, GTK_RESPONSE_OK);
+    return TRUE;
+}
+
+static void on_file_response(GtkDialog *dlg, gint response, gpointer p) {
+    WebKitFileChooserRequest *req = WEBKIT_FILE_CHOOSER_REQUEST(p);
+    GSList *names = response == GTK_RESPONSE_ACCEPT ? gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dlg)) : NULL;
+    guint n = g_slist_length(names);
+    if (n > 0) {
+        const char **files = g_new0(const char *, n + 1);
+        guint i = 0;
+        for (GSList *at = names; at; at = at->next) files[i++] = (const char *)at->data;
+        webkit_file_chooser_request_select_files(req, files);
+        g_free(files);
+    } else {
+        webkit_file_chooser_request_cancel(req);
+    }
+    g_slist_free_full(names, g_free);
+    g_object_unref(req);
+    gtk_widget_destroy(GTK_WIDGET(dlg));
+}
+
+// A chooser of the app's own, so that it can say what choosing means: the
+// page that asks (the desk, or an app framed in it: WebKitGTK doesn't say
+// which) reads the file that is chosen.
+static gboolean on_file_chooser(WebKitWebView *view, WebKitFileChooserRequest *req, gpointer unused) {
+    (void)view;
+    (void)unused;
+    GtkWidget *dlg = gtk_file_chooser_dialog_new("Choose a file", GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dlg), webkit_file_chooser_request_get_select_multiple(req));
+    GtkFileFilter *filter = webkit_file_chooser_request_get_mime_types_filter(req);
+    if (filter) gtk_file_chooser_set_filter(GTK_FILE_CHOOSER(dlg), filter);
+    GtkWidget *note = gtk_label_new("A page on the desk asks for a file. It can read the file you choose.");
+    gtk_label_set_xalign(GTK_LABEL(note), 0);
+    gtk_widget_show(note);
+    gtk_file_chooser_set_extra_widget(GTK_FILE_CHOOSER(dlg), note);
+    g_signal_connect(dlg, "response", G_CALLBACK(on_file_response), g_object_ref(req));
+    gtk_widget_show(dlg);
+    hdesk_on_native(gtk_file_chooser_get_extra_widget(GTK_FILE_CHOOSER(dlg)) == note ? "file chooser, with its note" : "file chooser");
+    answered_by_test(dlg, GTK_RESPONSE_CANCEL);
     return TRUE;
 }
 
@@ -587,6 +706,8 @@ static void build_window(void) {
     g_signal_connect(web, "web-process-terminated", G_CALLBACK(on_terminated), NULL);
     g_signal_connect(web, "permission-request", G_CALLBACK(on_permission), NULL);
     g_signal_connect(web, "context-menu", G_CALLBACK(on_context_menu), NULL);
+    g_signal_connect(web, "script-dialog", G_CALLBACK(on_script_dialog), NULL);
+    g_signal_connect(web, "run-file-chooser", G_CALLBACK(on_file_chooser), NULL);
     gtk_widget_set_size_request(GTK_WIDGET(web), MIN_W, MIN_H);
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);

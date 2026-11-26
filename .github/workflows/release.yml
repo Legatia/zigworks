@@ -64,6 +64,13 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
+      # harness's tests on Linux, as in ci.yml: its sandboxes are bubblewrap,
+      # which needs user namespaces (restricted on Ubuntu's runners), and its
+      # remote tests start a sshd of their own on 127.0.0.1
+      - if: startsWith(github.ref_name, 'harness-v') && runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends bubblewrap openssh-server
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Build
         shell: bash
         run: |

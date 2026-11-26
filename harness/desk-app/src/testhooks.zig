@@ -18,6 +18,9 @@ pub const Command = union(enum) {
     /// A real mouse click on the element with this id (macOS): what the
     /// page's own click() isn't.
     click: []const u8,
+    /// The same with the mouse's other button (Windows and Linux): what
+    /// would open the web view's own menu.
+    menu_click: []const u8,
     /// The next N jobs get no thread to run on, as when the system has
     /// none left.
     nothreads: u32,
@@ -43,10 +46,10 @@ pub fn parseCommand(raw: []const u8) ?Command {
         return .{ .frame = f };
     }
     if (std.mem.eql(u8, word, "key")) return .{ .key = std.meta.stringToEnum(KeyAction, rest) orelse return null };
-    if (std.mem.eql(u8, word, "click")) {
+    if (std.mem.eql(u8, word, "click") or std.mem.eql(u8, word, "rclick")) {
         if (rest.len == 0) return null;
         for (rest) |ch| if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return null;
-        return .{ .click = rest };
+        return if (word.len == 5) .{ .click = rest } else .{ .menu_click = rest };
     }
     if (std.mem.eql(u8, word, "nothreads")) return .{ .nothreads = std.fmt.parseInt(u32, rest, 10) catch return null };
     if (std.mem.eql(u8, word, "nomemory")) return .{ .nomemory = std.fmt.parseInt(u32, rest, 10) catch return null };
@@ -126,6 +129,8 @@ test "commands_parse" {
 test "click_commands_parse" {
     try t.expectEqualStrings("ext", parseCommand("click ext").?.click);
     try t.expectEqualStrings("self-blank_2", parseCommand("click self-blank_2\r").?.click);
+    try t.expectEqualStrings("ext", parseCommand("rclick ext").?.menu_click);
+    try t.expect(parseCommand("rclick a')") == null);
     // an id only: nothing that could be script
     for ([_][]const u8{ "click", "click ", "click a b", "click a')", "click a\"" }) |line| {
         try t.expect(parseCommand(line) == null);
