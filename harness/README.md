@@ -4188,7 +4188,9 @@ the files together. `WebView2Loader.dll` is Microsoft's, passed on under
 its licence (`WebView2Loader-LICENSE.txt`), and finds the web view. The
 web view itself is Microsoft's WebView2 Runtime, which Windows 11 has and
 most Windows 10 machines too; where it is missing the app says so and
-offers Microsoft's page to install it.
+offers Microsoft's page to install it. It does the same with a runtime
+too old to refuse a download or to tell a page shown inside the desk
+from the desk itself: the app doesn't run on one.
 
 **The key.** [Continue] asks for it in a small window of Windows' own,
 over the app's: a password field, Save and Cancel. It is not in the web
@@ -4251,6 +4253,15 @@ show on the taskbar. Closing the window minimizes it; Quit harness
 (Ctrl+Q) ends the app. Nothing of the web view reaches disk. A second
 start shows the first window where your session has a D-Bus session bus,
 and ends quietly where it has none.
+
+**The pages' sandbox.** The app asks WebKitGTK to run the process that
+shows the pages in its sandbox (bubblewrap) wherever bubblewrap can make
+a user namespace. Where it can't, the app starts all the same and its
+pages run without that sandbox. Ubuntu 24.04 restricts user namespaces
+as installed, so this may be your case: `bwrap --unshare-user
+--unshare-pid --ro-bind / / true` says (no output: it can). To allow it
+until the next restart: `sudo sysctl -w
+kernel.apparmor_restrict_unprivileged_userns=0`.
 
 **What Linux doesn't have.** WebKitGTK has no speech synthesis, so the
 desk speaks only through a provider (`speak =` a provider, or off),

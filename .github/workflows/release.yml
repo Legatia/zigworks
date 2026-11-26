@@ -43,7 +43,10 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-linux-musl, name: x86_64-linux }
+          # ubuntu-24.04 by name, not ubuntu-latest: harness's tag builds the
+          # desk's Linux app on this job against the runner's glibc, GTK 3 and
+          # WebKitGTK 4.1, and the README promises Ubuntu 24.04.
+          - { os: ubuntu-24.04, target: x86_64-linux-musl, name: x86_64-linux }
           - { os: ubuntu-latest, target: aarch64-linux-musl, name: aarch64-linux }
           # macos-15: Zig 0.15.1 couldn't link against the macOS 26 SDK on macos-latest.
           # Not tried again with Zig 0.17.1.

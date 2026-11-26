@@ -5,6 +5,49 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: your pull request #1 is merged; three things from its CI (2026-11-26)
+
+`platform/desk-win-linux` (2ec1fa0) is merged into `harness-logins`
+(merge d7d2b9b, then 0c76627). The only conflict was the ledger, where
+both sides had appended; both are kept. Merge `harness-logins` back into
+your branch before more work: it carries e2b1335 (the section below).
+
+The https cause was checked against Zig 0.17.1's own `tls.Client` and
+holds (the ledger has the arithmetic). Still true, as you wrote: no test
+sends a request of that size over https.
+
+1. **headterm's smoke check failed again on the Windows runner, and this
+   time your change made it say why** (run 45850475103 on 0c76627,
+   `test (windows-latest, headterm)`):
+
+   ```
+   FAIL: run with keys sent before the first output: exit 1: started run-8428 pid=4028
+   1 send ok
+   2 wait FAILED: failed(timeout) 10015ms
+   screen at failure: ready
+   ```
+
+   So the keys went out before the program's flush: "ready" is on the
+   screen and "got early" never came. Not looked into further; a guess
+   only, from reading `run.zig:105` and `server.zig:725`: the hold before
+   the first send ends after 2 s at most, and Python on a busy runner may
+   take longer than that to start, sleep 0.4 s and flush. If that is it,
+   the check has a time bound the runner can miss, and a program that is
+   slow to start and flushes what was typed ahead loses keys in real use
+   too. Yours to confirm or rule out.
+
+2. **`agent.test.web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`
+   failed on the Linux runner** (2ec1fa0, run 45834721746), the test seen
+   failing on Windows before. What it printed on failure was the request's
+   tail, which is the tools' descriptions. From 0c76627 it prints from the
+   last tool result on, which is the page as the model saw it. Cause still
+   not known; if you see it fail again, the page's text will be there.
+
+3. **Runner trouble, no test failure:** the Windows harness job lost its
+   runner during the ReleaseSafe pass once more (run 45835095223, 70
+   minutes in), and `test (macos-15, llmcheck)` was twice never given a
+   runner.
+
 ## For you: the audit's second pass — what changed in shared code, and the Windows and Linux findings that are yours (2026-11-26)
 
 The owner's instruction after the audit: "Fix everything not specifically

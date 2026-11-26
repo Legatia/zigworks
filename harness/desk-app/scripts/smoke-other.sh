@@ -59,6 +59,8 @@ if [ $OS = linux ] && [ -z "${DESK_SMOKE_SOUND:-}" ]; then
     # needs (that play() is allowed). DESK_SMOKE_SOUND=1 uses the machine's.
     export GST_PLUGIN_FEATURE_RANK="pulsesink:NONE,pipewiresink:NONE,alsasink:NONE,jackaudiosink:NONE,osssink:NONE,oss4sink:NONE,openalsink:NONE"
 fi
+# How long a start may take (a slow machine: DESK_SMOKE_START_S=150).
+START_S=${DESK_SMOKE_START_S:-60}
 STRICT=yes
 [ -n "${CI:-}" ] && STRICT=no
 
@@ -213,7 +215,7 @@ js_continue="document.getElementById('continue').click();"
 
 # ---- before harness was ever set up: "Set up" ----
 launch
-expect_log "ready" "the app starts" 60
+expect_log "ready" "the app starts" "$START_S"
 expect_log "show setup" "no config.ini: the Set up screen"
 expect_log "menu start=0 stop=0 autostart=- provider=0" "nothing to start or change before it is set up"
 wait_page 1
@@ -296,6 +298,16 @@ expect_log "ran autostart_query ok=1" "Open at login's state is asked"
 expect_log "menu start=0 stop=1 autostart=off provider=1" "Stop and Provider and key… are offered once harness runs"
 
 # ---- the page ----
+if [ $OS = linux ]; then
+    # the pages' process is in WebKit's sandbox wherever bubblewrap can make
+    # one (the app's own probe); where it can't, the app says so and runs
+    if bwrap --unshare-user --unshare-pid --ro-bind / / true 2> /dev/null; then
+        expect_log "sandbox on" "the pages' process is asked into WebKit's sandbox"
+        if pgrep -f "bwrap .*WebKitWebProcess" > /dev/null 2>&1; then ok "the web process runs under bubblewrap"; else not_ok "the web process runs under bubblewrap (no bwrap … WebKitWebProcess among the processes)"; fi
+    else
+        expect_log "sandbox off" "bubblewrap can't make a user namespace here: the app says its pages aren't sandboxed"
+    fi
+fi
 expect_log "badge 3" "the page's badge is in the window's title"
 expect_fake "report ua=" "the page reports"
 if grep -F "report ua=" "$HP/fake.log" | grep -qF "harness-desk/"; then ok "the user agent names harness-desk"; else not_ok "the user agent names harness-desk"; fi
@@ -313,11 +325,41 @@ fi
 # ---- navigation ----
 cmd "js click('next')"
 expect_log "finish http://127.0.0.1:$PORT/desk/next" "a link on the desk's address stays in the window"
+# a script's own click, its location, and window.open open nothing outside
+# (whichever frame the layer takes the navigation for: WebKitGTK doesn't say)
+expect_cancel() {
+    i=0
+    while [ $i -lt 100 ]; do
+        for f in main sub new_window; do
+            if grep -qF "nav cancel $f $1" "$TP/log" 2> /dev/null; then
+                ok "$2"
+                return
+            fi
+        done
+        sleep 0.1
+        i=$((i + 1))
+    done
+    not_ok "$2 (no \"nav cancel … $1\")"
+}
 for pair in "ext https://example.com/" "otherport http://127.0.0.1:$OTHER/" "userinfo http://127.0.0.1:$PORT@example.com/" "blank https://example.org/blank"; do
     id=${pair%% *}
     url=${pair#* }
     cmd "js click('$id')"
-    expect_log "external $url" "$url goes to the system browser"
+    expect_cancel "$url" "a script's click on $url opens nothing"
+done
+cmd "js location.href = 'https://example.net/by-script'"
+expect_cancel "https://example.net/by-script" "a script's navigation elsewhere is dropped"
+cmd "js window.open('https://example.net/opened')"
+expect_cancel "https://example.net/opened" "window.open elsewhere is dropped"
+cmd "js location.href = 'about:blank'"
+expect_cancel "about:blank" "a page can't blank the window"
+if grep -q "^external " "$TP/log"; then not_ok "nothing opened outside without a click: $(grep "^external " "$TP/log" | head -3)"; else ok "nothing opened outside without a click"; fi
+# the person's click does
+for pair in "ext https://example.com/" "otherport http://127.0.0.1:$OTHER/" "userinfo http://127.0.0.1:$PORT@example.com/" "blank https://example.org/blank"; do
+    id=${pair%% *}
+    url=${pair#* }
+    cmd "click $id"
+    expect_log "external $url" "a click on $url goes to the system browser"
 done
 # (a web view may refuse a file: link from a web page before the app is asked)
 cmd "js click('file')"
@@ -430,7 +472,7 @@ fi
 cmd "quit"
 if wait_gone; then ok "Quit quits"; else not_ok "Quit quits"; fi
 launch
-expect_log "ready" "the app starts again" 60
+expect_log "ready" "the app starts again" "$START_S"
 if [ "$target" = none ]; then
     echo "# SKIP: the window's frame is remembered (no other frame to set)"
 elif [ "$(grep "^frame " "$TP/log" | head -1)" = "frame $target" ]; then

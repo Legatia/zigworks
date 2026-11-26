@@ -737,6 +737,11 @@ export fn hdesk_on_reopen() void {
     log("shown again", .{});
 }
 
+/// Linux: whether the pages' process runs in WebKit's sandbox.
+export fn hdesk_on_sandbox(on: c_int) void {
+    log("sandbox {s}", .{if (on != 0) "on" else "off"});
+}
+
 export fn hdesk_on_crashed() void {
     log("crashed", .{});
     dispatch(.crashed);
@@ -788,9 +793,7 @@ fn onHooks(_: ?*anyopaque) callconv(.c) void {
             const secure = sys.hdesk_test_key(if (k == .fill) 1 else 0);
             log("key-sheet {t} secure={d}", .{ k, secure });
         },
-        .click => |id| if (comptime @import("builtin").os.tag == .macos) {
-            sys.hdesk_test_click(z(a, id));
-        } else log("unknown click {s}", .{id}),
+        .click => |id| sys.hdesk_test_click(z(a, id)),
         .nothreads => |n| no_threads = n,
         .nomemory => |n| no_memory = n,
         .quit => sys.hdesk_quit(),
