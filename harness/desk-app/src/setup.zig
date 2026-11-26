@@ -120,12 +120,18 @@ fn nameOf(f: Form, before: ?InUse) []const u8 {
 
 /// What's wrong with the form, as the line under it; null: nothing.
 pub fn problem(f: Form) ?[]const u8 {
-    if (trim(f.model).len == 0) return "Model is empty.";
+    const m = trim(f.model);
+    if (m.len == 0) return "Model is empty.";
+    // one value on `harness config set`'s line and one line in config.ini:
+    // nothing that reads as an option, no line end
+    if (m[0] == '-') return "Model can't start with a dash.";
+    for (m) |c| if (std.ascii.isControl(c)) return "Model has a character that can't be used.";
     if (entry(f.provider).address) {
         const u = trim(f.url);
         if (u.len == 0) return "Address is empty.";
         // as harness reads it (model.validUrl): lower case
         if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return "Address must start with http:// or https://.";
+        for (u) |c| if (std.ascii.isControl(c) or c == ' ') return "Address has a character that can't be used.";
     }
     return null;
 }
@@ -156,6 +162,24 @@ pub fn plainRemote(url: []const u8) bool {
         };
     }
     return !(loop and n == 4);
+}
+
+/// The host an address names (no user, port or path), "" when it isn't an
+/// http or https address.
+pub fn hostOf(url: []const u8) []const u8 {
+    const u = trim(url);
+    var h = if (std.mem.startsWith(u8, u, "https://")) u["https://".len..] else if (std.mem.startsWith(u8, u, "http://")) u["http://".len..] else return "";
+    if (std.mem.indexOfAny(u8, h, "/?#")) |i| h = h[0..i];
+    if (std.mem.lastIndexOfScalar(u8, h, '@')) |i| h = h[i + 1 ..];
+    if (h.len > 0 and h[0] == '[') return h[0 .. (std.mem.indexOfScalar(u8, h, ']') orelse h.len - 1) + 1];
+    if (std.mem.indexOfScalar(u8, h, ':')) |i| h = h[0..i];
+    return h;
+}
+
+/// Whether two addresses name the same host: what a key stored for one
+/// may be sent to without asking.
+pub fn sameHost(x: []const u8, y: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(hostOf(x), hostOf(y));
 }
 
 fn trim(s: []const u8) []const u8 {
@@ -494,4 +518,32 @@ test "a_plain_address_that_is_not_this_computer_is_told_apart" {
         "",
         "gateway.example.com",
     }) |u| try t.expect(!plainRemote(u));
+}
+
+test "a_model_or_address_that_isnt_one_value_is_refused" {
+    // what would read as an option, or carry a second line into config.ini
+    try t.expectEqualStrings("Model can't start with a dash.", problem(.{ .provider = .anthropic, .model = "--home" }).?);
+    try t.expectEqualStrings("Model can't start with a dash.", problem(.{ .provider = .anthropic, .model = "  -x" }).?);
+    try t.expectEqualStrings("Model has a character that can't be used.", problem(.{ .provider = .anthropic, .model = "a\nmodel.url = http://x" }).?);
+    try t.expectEqualStrings("Model has a character that can't be used.", problem(.{ .provider = .anthropic, .model = "a\x00b" }).?);
+    try t.expectEqualStrings("Model has a character that can't be used.", problem(.{ .provider = .anthropic, .model = "a\x7fb" }).?);
+    try t.expectEqualStrings("Address has a character that can't be used.", problem(.{ .provider = .other, .model = "m", .url = "http://a\r\nauth = none" }).?);
+    try t.expectEqualStrings("Address has a character that can't be used.", problem(.{ .provider = .other, .model = "m", .url = "http://a b" }).?);
+    // the usual ones pass, with the line end a paste brings
+    try t.expect(problem(.{ .provider = .anthropic, .model = "claude-opus-4-5\n" }) == null);
+    try t.expect(problem(.{ .provider = .other, .model = "llama3.1:8b", .url = " http://127.0.0.1:11434/v1 " }) == null);
+    try t.expect(problem(.{ .provider = .other, .model = "meta/llama 3", .url = "https://x.example/v1" }) == null);
+}
+
+test "hosts_compare_without_case_port_or_path" {
+    try t.expect(sameHost("https://a.example/v1", " https://A.Example:8443/v2?x "));
+    try t.expect(sameHost("http://user@a.example", "https://a.example#f"));
+    try t.expect(sameHost("http://[::1]:8080/v1", "http://[::1]/"));
+    try t.expect(sameHost("", ""));
+    try t.expect(!sameHost("https://a.example", "https://b.example"));
+    try t.expect(!sameHost("https://a.example", "https://a.example.b.example"));
+    try t.expect(!sameHost("https://a.example", "https://a.example@b.example/"));
+    try t.expect(!sameHost("https://a.example", ""));
+    try t.expectEqualStrings("a.example", hostOf("https://a.example:1/x"));
+    try t.expectEqualStrings("", hostOf("a.example"));
 }

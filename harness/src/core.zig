@@ -15536,12 +15536,29 @@ pub const Core = struct {
             try util.jsonString(out, a, def.voice);
             try out.print(a, ",\"key\":{s},\"secret\":", .{if (key) "true" else "false"});
             try util.jsonString(out, a, if (c.providers.find(name)) |p| p.key_name else name);
+            try out.appendSlice(a, ",\"host\":");
+            try util.jsonString(out, a, c.providerHost(a, name));
             try out.append(a, '}');
         }
-        try out.print(a, "],\"echo\":{s},\"voice\":{s}", .{ if (d.echo) "true" else "false", if (c.cfg.voice.provider.len > 0) "true" else "false" });
+        // the microphone: offered with [voice] set, and where recordings go
+        const vp = c.cfg.voice.provider;
+        try out.print(a, "],\"echo\":{s},\"voice\":{s},\"voice_provider\":", .{ if (d.echo) "true" else "false", if (vp.len > 0) "true" else "false" });
+        try util.jsonString(out, a, vp);
+        try out.appendSlice(a, ",\"voice_host\":");
+        try util.jsonString(out, a, if (vp.len > 0) c.providerHost(a, vp) else "");
+        // the data folder's (the last place looked in): where the owner puts them
         try out.print(a, ",\"fit_files\":{s},\"fit_dir\":", .{if (fit_there) "true" else "false"});
-        try util.jsonString(out, a, dirs[0]);
+        try util.jsonString(out, a, dirs[dirs.len - 1]);
         try out.append(a, '}');
+    }
+
+    /// The host (and a port other than the scheme's own) a provider's calls
+    /// go to, as the desk names it where the owner's words are sent; "" for
+    /// a provider that isn't there or an address that doesn't read.
+    fn providerHost(c: *Core, a: std.mem.Allocator, name: []const u8) []const u8 {
+        const p = c.providers.find(name) orelse return "";
+        const u = url_parse.parse(a, p.url) catch return "";
+        return u.host_port;
     }
 
     /// The avatars there are: `avatars/`'s folders, butler first (its pack
@@ -36947,6 +36964,18 @@ test "desk_settings_write_and_reload" {
     try expectHas(st, "\"avatar\":\"me\",\"avatars\":[\"me\"]");
 }
 
+test "desk_settings_say_where_recordings_go" {
+    // none set: the microphone isn't offered, and nowhere is named
+    var off: Fix = undefined;
+    try off.init("", "", "");
+    try expectHas(deskCall(&off, .GET, "state", "", "").body, "\"voice\":false,\"voice_provider\":\"\",\"voice_host\":\"\"");
+    off.deinit();
+    // set: the provider and the host recordings are sent to
+    var f: Fix = undefined;
+    try f.init("[provider whisper]\napi = openai\nurl = http://127.0.0.1:9/v1\nauth = none\n[voice]\nprovider = whisper\nmodel = large-v3-turbo\n", "", "");
+    defer f.deinit();
+    try expectHas(deskCall(&f, .GET, "state", "", "").body, "\"voice\":true,\"voice_provider\":\"whisper\",\"voice_host\":\"127.0.0.1:9\"");
+}
 test "desk_state_says_whether_the_fit_files_are_there" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -37269,7 +37298,7 @@ test "desk_settings_list_every_speaker_with_its_defaults" {
     try f.init("[provider kokoro]\napi = openai\nurl = http://127.0.0.1:9/v1\nauth = none\n", "", "");
     defer f.deinit();
     const st = deskCall(&f, .GET, "state", "", "").body;
-    try expectHas(st, "\"speakers\":[{\"name\":\"openai\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":false,\"secret\":\"openai\"},{\"name\":\"gemini\",\"api\":\"gemini\",\"model\":\"gemini-3.8-flash-lite-tts\",\"voice\":\"Schedar\",\"key\":false,\"secret\":\"gemini\"},{\"name\":\"kokoro\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":true,\"secret\":\"kokoro\"}]");
+    try expectHas(st, "\"speakers\":[{\"name\":\"openai\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":false,\"secret\":\"openai\",\"host\":\"api.openai.com\"},{\"name\":\"gemini\",\"api\":\"gemini\",\"model\":\"gemini-3.8-flash-lite-tts\",\"voice\":\"Schedar\",\"key\":false,\"secret\":\"gemini\",\"host\":\"generativelanguage.googleapis.com\"},{\"name\":\"kokoro\",\"api\":\"openai\",\"model\":\"tts-1\",\"voice\":\"alloy\",\"key\":true,\"secret\":\"kokoro\",\"host\":\"127.0.0.1:9\"}]");
     try expectHas(st, "\"speak_model\":\"\",\"speak_voice\":\"\"");
     try expectHas(st, "\"openai\",\"gemini\",\"kokoro\"]");
 }

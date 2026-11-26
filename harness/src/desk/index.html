@@ -30,6 +30,7 @@
       <section class="stage" aria-label="Avatar">
         <div class="frame">
           <div class="avatar" id="avatar"></div>
+          <p class="avatar-note" id="avatarNote" role="status" hidden></p>
           <div class="empty-stage" id="emptyStage">
             <button type="button" id="addPortraitBtn" class="btn cut-s" hidden>Add a portrait</button>
             <svg class="bust" viewBox="0 0 400 400" preserveAspectRatio="xMidYMax meet" aria-hidden="true" focusable="false">
@@ -66,12 +67,13 @@
         <form class="compose" id="compose">
           <label class="sr" for="msg">Message</label>
           <div class="field cut-s"><span class="prompt" aria-hidden="true">&gt;</span><input id="msg" type="text" autocomplete="off" placeholder="Message"></div>
-          <button type="button" id="micBtn" class="icon cut-s" aria-pressed="false" aria-label="Speak" title="Speak" hidden>
+          <button type="button" id="micBtn" class="icon cut-s" aria-pressed="false" aria-label="Record a message" title="Record a message" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="square" aria-hidden="true"><rect x="9" y="3" width="6" height="12"></rect><path d="M5 11a7 7 0 0 0 14 0M12 18v3"></path></svg>
           </button>
           <button type="submit" class="send cut-s">Send</button>
         </form>
         <p class="compose-note" id="composeNote" role="status" hidden></p>
+        <p class="compose-note where" id="micWhere" hidden></p>
       </section>
     </main>
 
@@ -79,7 +81,7 @@
       <section aria-labelledby="needsH">
         <h2 id="needsH">Needs you <span class="count" id="needsCount"></span></h2>
         <div id="needs"></div>
-        <p class="empty" id="needsEmpty">Nothing waits for you.</p>
+        <p class="empty" id="needsEmpty">No open items</p>
       </section>
       <section aria-labelledby="topicsH">
         <h2 id="topicsH">Topics</h2>
@@ -121,7 +123,7 @@
             <span class="bubble" id="fitInfo" hidden>
               <ul>
                 <li>They fit a photo onto the 3D head: MediaPipe's face landmarker (about 23 MB) and the base head.</li>
-                <li>harness's release archive has them in desk-assets/ beside the harness binary; harness finds them there too.</li>
+                <li>harness's release archive has them in desk-assets/ beside the harness binary; harness uses those first.</li>
                 <li>Built from source: sh tools/fetch-desk-assets.sh with this folder, and desk-assets/base-head.bin from the repository copied into it.</li>
               </ul>
             </span>
@@ -135,6 +137,8 @@
           <button type="button" aria-expanded="false" aria-controls="photoInfo" aria-label="About the photo">i</button>
           <span class="bubble" id="photoInfo" hidden>
             <ul>
+              <li>Facing the camera, eyes open, mouth closed.</li>
+              <li>One face, head and shoulders, wider than tall.</li>
               <li>The photo is fitted onto a 3D head and becomes the whole scene: its background, hair, shoulders and lighting.</li>
               <li>These are refused, with the reason: a face turned more than about 8°, an open mouth or teeth showing, closed eyes, more than one face, a face too small to find.</li>
               <li>These fit but may look off: glasses (the eyes move behind frames drawn on the skin), hair over the eyes, cartoon or anime styles (which may not be found at all).</li>
@@ -143,12 +147,7 @@
           </span>
         </span>
       </h3>
-      <ul class="rules">
-        <li>Facing the camera, eyes open, mouth closed.</li>
-        <li>One face, head and shoulders, wider than tall.</li>
-        <li>Works best without glasses.</li>
-        <li>JPEG or PNG, up to 10 MB.</li>
-      </ul>
+      <p class="fine">JPEG or PNG, up to 10 MB.</p>
       <fieldset class="bare" id="upControls">
       <div class="row">
         <label class="sr" for="upName">Name</label>
@@ -171,6 +170,7 @@
           <button type="button" aria-expanded="false" aria-controls="closedInfo" aria-label="About the eyes-closed version">i</button>
           <span class="bubble" id="closedInfo" hidden>
             <ul>
+              <li>Recommended: the avatar rests with its eyes closed.</li>
               <li>Make one with an image tool: ask it to close the eyes and change nothing else. It's one image edit, not a video.</li>
               <li>It must line up with the first photo, and the desk checks this.</li>
               <li>Without it, closed eyes are drawn in the skin's tone.</li>
@@ -178,7 +178,6 @@
           </span>
         </span>
       </h3>
-      <p class="fine">Recommended: the avatar rests with its eyes closed.</p>
       <fieldset class="bare" id="closedControls">
       <div class="row">
         <label class="sr" for="closedFile">Eyes-closed photo</label>

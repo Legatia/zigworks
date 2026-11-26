@@ -267,11 +267,28 @@ check "$(grep -qF "report speech=started" "$H/fake.log"; echo $?)" "speech start
 # ---- navigation ----
 cmd "js click('next')"
 expect_log "finish http://127.0.0.1:$PORT/desk/next" "a link on the desk's address stays in the window"
+# a script's own click, its location, and window.open open nothing outside
 for pair in "ext https://example.com/" "otherport http://127.0.0.1:$OTHER/" "userinfo http://127.0.0.1:$PORT@example.com/" "blank https://example.org/blank"; do
     id=${pair%% *}
     url=${pair#* }
+    frame=main
+    [ "$id" = blank ] && frame=new_window
     cmd "js click('$id')"
-    expect_log "external $url" "$url goes to the system browser"
+    expect_log "nav cancel $frame $url" "a script's click on $url opens nothing"
+done
+cmd "js location.href = 'https://example.net/by-script'"
+expect_log "nav cancel main https://example.net/by-script" "a script's navigation elsewhere is dropped"
+cmd "js window.open('https://example.net/opened')"
+expect_log "nav cancel new_window https://example.net/opened" "window.open elsewhere is dropped"
+cmd "js location.href = 'about:blank'"
+expect_log "nav cancel main about:blank" "a page can't blank the window"
+if grep -q "^external " "$T/log"; then not_ok "nothing opened outside without a click: $(grep "^external " "$T/log" | head -3)"; else ok "nothing opened outside without a click"; fi
+# the person's click does
+for pair in "ext https://example.com/" "otherport http://127.0.0.1:$OTHER/" "userinfo http://127.0.0.1:$PORT@example.com/" "blank https://example.org/blank"; do
+    id=${pair%% *}
+    url=${pair#* }
+    cmd "click $id"
+    expect_log "external $url" "a click on $url goes to the system browser"
 done
 # (WebKit refuses a file: link from a web page before the app is asked)
 cmd "js click('file')"
@@ -314,6 +331,15 @@ expect_log "menu start=0 stop=1 autostart=on provider=1" "Open at login is check
 cmd "menu autostart"
 expect_log "run $OWN autostart off --home $H" "and off again"
 expect_again "menu start=0 stop=1 autostart=off provider=1" 2 "Open at login is unchecked"
+# no thread for a command: said, and nothing run on the main thread instead
+printf 'nothreads 1\nmenu autostart\n' >> "$T/commands"
+expect_log "ran autostart_on ok=0 " "a command with no thread to run on is reported as not run"
+expect_log "alert Couldn't change Open at login | " "and said"
+expect_again "menu start=0 stop=1 autostart=off provider=1" 2 "Open at login stays unchecked" 3
+# no memory for one: the same
+printf 'nomemory 1\nmenu autostart\n' >> "$T/commands"
+expect_log "no memory for a job" "a command with no memory for its job"
+expect_again "ran autostart_on ok=0 " 2 "is reported as not run too"
 cmd "menu reload"
 expect_log "reload" "Reload reloads the desk"
 
@@ -376,6 +402,19 @@ else
     cmd "frame $target"
     expect_log "frame $target" "the window takes a new frame ($target, inside $visible)"
 fi
+# one window a data folder: a second start on it ends by itself, and the
+# first shows its window
+mkdir -p "$D/t2"
+"$BIN" --home "$H" --test-dir "$D/t2" >> "$D/app2.out" 2>&1 &
+SECOND=$!
+i=0
+while kill -0 "$SECOND" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$SECOND" 2>/dev/null; then
+    kill "$SECOND"
+    not_ok "a second start on the same folder ends by itself"
+else ok "a second start on the same folder ends by itself"; fi
+expect_log "shown again" "and the first shows its window"
+if [ -s "$D/t2/log" ]; then not_ok "the second start did nothing else"; else ok "the second start did nothing else"; fi
 cmd "quit"
 i=0
 while kill -0 "$APP_PID" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done

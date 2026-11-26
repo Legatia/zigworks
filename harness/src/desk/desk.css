@@ -105,6 +105,7 @@ body[data-state="working"] .sweep { display: block; }
 .bust * { vector-effect: non-scaling-stroke; }
 @keyframes breathe { 50% { transform: scale(1.006); } }
 
+.avatar-note { position: absolute; left: 20px; top: 18px; max-width: min(420px, calc(100% - 200px)); margin: 0; font-size: 13px; line-height: 1.4; color: #FF8A7D; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); overflow-wrap: anywhere; }
 .readouts { position: absolute; right: 20px; top: 18px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font: 12px var(--mono); color: var(--muted); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.9); }
 
 /* the status card: harness's own facts */
@@ -149,6 +150,7 @@ body[data-state="resting"] .card .dot, body[data-state="quiet"] .card .dot { ani
 #micBtn { width: 48px; height: 48px; }
 #micBtn[aria-pressed="true"] { background: var(--alert); color: var(--bg); }
 .compose-note { max-width: 900px; width: 100%; margin: 0 auto; font-size: 13px; color: var(--soft); min-height: 0; }
+.compose-note.where { color: var(--muted); }
 
 /* ---- the side panel ---- */
 .side h2 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.06em; display: flex; align-items: center; gap: 10px; }
@@ -199,8 +201,6 @@ dialog::backdrop { background: rgba(7, 7, 13, 0.75); }
 .dlg legend { padding: 0 6px; font-weight: 600; }
 .choice { display: flex; align-items: center; gap: 10px; min-height: 44px; }
 .choice input { width: 18px; height: 18px; accent-color: var(--cyan); }
-.rules { margin: 6px 0 10px; padding-left: 18px; color: var(--soft); font-size: 14px; }
-.rules li { margin: 2px 0; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .row input[type="text"] { height: 44px; padding: 0 10px; background: var(--bg); border: 1px solid var(--line-hi); min-width: 0; flex: 1; }
 .row input[type="file"] { font-size: 13px; color: var(--soft); max-width: 100%; }

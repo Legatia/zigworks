@@ -36,6 +36,7 @@ const S = {
   avatarName: null,
   // each load's number: a load that isn't the latest is let go
   avatarGen: 0,
+  avatarError: "",
   reentered: false,
 };
 
@@ -64,7 +65,13 @@ function reenter() {
 class SignedOut extends Error {}
 
 async function api(path, opts = {}) {
-  const r = await fetch(API + path, { credentials: "same-origin", ...opts });
+  let r;
+  try {
+    r = await fetch(API + path, { credentials: "same-origin", ...opts });
+  } catch (_) {
+    // the browser's own words for this ("Load failed") say nothing
+    throw new Error("harness isn't answering.");
+  }
   if (r.status === 401) {
     reenter();
     throw new SignedOut("signed out");
@@ -141,16 +148,15 @@ function renderCard() {
   let two = "";
   if (st === "urgent") {
     const n = S.items.filter((it) => it.urgent).length;
-    one = n > 0 ? (n === 1 ? "An urgent item is open." : n + " urgent items are open.") : "An urgent alert is open.";
-    two = n > 0 ? "It's first under Needs you." : "Answer it in Telegram, or under Needs you when it asks.";
+    one = n > 0 ? (n === 1 ? "1 urgent item" : n + " urgent items") : "Urgent alert open";
+    two = n > 0 ? "" : "Answer it in Telegram, or under Needs you when it asks.";
   } else if (st === "speaking") {
     // the card says harness's facts only; the words are in the caption
     one = "Reading a reply aloud.";
     const c = S.convs.find((x) => x.name === (S.speakingConv || S.conv));
     two = c ? "In " + c.title + "." : "";
   } else if (st === "needs") {
-    one = S.items.length === 1 ? "One thing waits for you." : S.items.length + " things wait for you.";
-    two = "Under Needs you.";
+    one = S.items.length === 1 ? "1 open item" : S.items.length + " open items";
   } else if (st === "working") {
     const r = S.runs[0];
     const label = r.by === "owner" ? "“" + r.label + "”" : r.label;
@@ -158,15 +164,16 @@ function renderCard() {
     const helpers = r.helpers === 1 ? "1 helper" : r.helpers > 1 ? r.helpers + " helpers" : "";
     two = [helpers, minutes(r.started), S.runs.length > 1 ? S.runs.length - 1 + " more running" : ""].filter(Boolean).join(" · ");
   } else if (st === "quiet") {
-    one = quietEnd() ? "Quiet until " + quietEnd() + "." : "Quiet hours.";
-    two = "Urgent things still come through.";
+    one = quietEnd() ? "Quiet until " + quietEnd() : "Quiet hours";
   } else {
-    one = "Nothing needs you.";
+    one = "No open items";
     two = S.data && S.data.next ? "Next: " + S.data.next : "";
   }
   $("line1").textContent = one;
   $("line2").textContent = two;
   $("line2").hidden = !two;
+  // the graphics may stop or come back while the desk is open
+  avatarNote();
   $("replayBtn").hidden = !(S.lastSpoken && S.settings.speak !== "off");
   const work = S.convs.find((c) => c.subject === "work");
   $("workBtn").hidden = !(st === "working" && work);
@@ -196,6 +203,11 @@ function renderHeader() {
   $("muteBtn").setAttribute("aria-label", S.muted ? "Unmute" : "Mute");
   $("muteBtn").title = S.muted ? "Unmute" : "Mute";
   $("micBtn").hidden = !S.settings.voice;
+  // where a recording goes, in sight while the microphone is offered
+  const vp = S.settings.voice_provider || "";
+  const vh = S.settings.voice_host || "";
+  $("micWhere").textContent = S.settings.voice ? "Recordings are sent to " + (vp || "the voice provider") + (vh ? " (" + vh + ")" : "") + " to be transcribed." : "";
+  $("micWhere").hidden = !S.settings.voice;
 }
 
 // ---- items: Needs you and the chat's buttons ----
@@ -531,14 +543,29 @@ $("micBtn").addEventListener("click", async () => {
   }
   const chunks = [];
   const conv = S.conv;
-  recorder = new MediaRecorder(stream);
-  recorder.addEventListener("dataavailable", (e) => chunks.push(e.data));
-  recorder.addEventListener("stop", async () => {
+  let limit = 0;
+  const idle = () => {
+    clearTimeout(limit);
     stream.getTracks().forEach((t) => t.stop());
-    const type = recorder.mimeType || "audio/webm";
     recorder = null;
     $("micBtn").setAttribute("aria-pressed", "false");
-    $("micBtn").setAttribute("aria-label", "Speak");
+    $("micBtn").setAttribute("aria-label", "Record a message");
+    $("micBtn").title = "Record a message";
+  };
+  let rec;
+  try {
+    rec = new MediaRecorder(stream);
+  } catch (_) {
+    // no recorder here, or none for this microphone: the microphone is let go
+    idle();
+    note("composeNote", "The microphone isn't available.", true);
+    return;
+  }
+  recorder = rec;
+  rec.addEventListener("dataavailable", (e) => chunks.push(e.data));
+  rec.addEventListener("stop", async () => {
+    const type = rec.mimeType || "audio/webm";
+    idle();
     const blob = new Blob(chunks, { type });
     if (blob.size > 10 * 1024 * 1024) return note("composeNote", "That recording is over 10 MB.", true);
     note("composeNote", "Transcribing…");
@@ -549,11 +576,19 @@ $("micBtn").addEventListener("click", async () => {
       if (!(err instanceof SignedOut)) note("composeNote", err.message, true);
     }
   });
-  recorder.start();
+  try {
+    rec.start();
+  } catch (_) {
+    idle();
+    note("composeNote", "The microphone isn't available.", true);
+    return;
+  }
   $("micBtn").setAttribute("aria-pressed", "true");
-  $("micBtn").setAttribute("aria-label", "Stop");
-  // two minutes at most, as for Telegram's voice notes
-  setTimeout(() => recorder && recorder.state === "recording" && recorder.stop(), 120000);
+  $("micBtn").setAttribute("aria-label", "Stop recording");
+  $("micBtn").title = "Stop recording";
+  // two minutes at most, as for Telegram's voice notes; dropped when the
+  // recording ends sooner, so it never stops the next one
+  limit = setTimeout(() => rec.state === "recording" && rec.stop(), 120000);
 });
 
 // ---- the avatar ----
@@ -570,8 +605,10 @@ async function ensureAvatar() {
   if (S.avatar) S.avatar.dispose && S.avatar.dispose();
   S.avatar = null;
   S.avatarName = name;
+  S.avatarError = "";
   $("avatar").textContent = "";
   emptyStage(!name);
+  avatarNote();
   if (!name) return;
   try {
     const av = await createAvatar($("avatar"), "/desk/avatars/" + encodeURIComponent(name) + "/", { reducedMotion });
@@ -583,12 +620,22 @@ async function ensureAvatar() {
     S.avatar = av;
     S.avatar.setState(stateNow());
     $("emptyStage").hidden = true;
-  } catch (_) {
+  } catch (e) {
     if (gen !== S.avatarGen) return;
     S.avatar = null;
     $("avatar").textContent = "";
     emptyStage(true);
+    const why = String((e && e.message) || e);
+    S.avatarError = /^The avatar didn't load/.test(why) ? why : "The avatar didn't load: " + why;
   }
+  avatarNote();
+}
+
+/** Why the chosen avatar isn't drawn, or is drawn as its portrait only. */
+function avatarNote() {
+  const text = S.avatarError || (S.avatar && S.avatar.problem) || "";
+  $("avatarNote").textContent = text;
+  $("avatarNote").hidden = !text;
 }
 
 /** The outline shows until an avatar draws; the button once there is none. */
@@ -623,7 +670,17 @@ function take(d) {
 async function loadState() {
   try {
     const d = await api("state");
+    const was = S.conv;
     take(d);
+    // the open conversation is gone (archived elsewhere): main's messages,
+    // not the gone one's under main's name
+    const moved = S.conv !== was;
+    if (moved) {
+      S.msgs = [];
+      try {
+        history.replaceState(null, "", "#" + encodeURIComponent(S.conv));
+      } catch (_) {}
+    }
     if (!S.seq) S.seq = d.seq;
     renderHeader();
     renderNeeds();
@@ -634,6 +691,7 @@ async function loadState() {
     renderCard();
     renderSettings();
     ensureAvatar();
+    if (moved) loadHistory().then(markSeen);
   } catch (_) {}
 }
 
@@ -647,6 +705,8 @@ function onEvent(ev) {
   switch (ev.type) {
     case "message": {
       const m = ev.msg;
+      // already here (the history was loaded after it was written)
+      if (ev.conv === S.conv && S.msgs.some((x) => x.id === m.id)) break;
       if (ev.conv === S.conv) {
         S.msgs.push(m);
         if (S.msgs.length > 50) S.msgs.shift();
@@ -761,9 +821,11 @@ function speakWhere() {
   const sp = (S.settings.speakers || []).find((x) => x.name === v);
   const p = $("speakWhere");
   const all = S.settings.speakers || [];
-  // where replies would go is said before a provider is chosen: choosing applies at once
-  const before = all.length === 0 ? "" : "Choosing " + (all.length === 1 ? all[0].name : "a provider (" + all.map((x) => x.name).join(", ") + ")") + " sends replies to it to be read aloud.";
-  p.textContent = !sp ? before : sp.key ? "Replies are sent to " + v + " to be read aloud." : "No " + v + " key is stored (harness secret add " + sp.secret + ").";
+  // where replies would go (the provider and its host) is said before a
+  // provider is chosen: choosing applies at once
+  const at = (x) => x.name + (x.host ? " (" + x.host + ")" : "");
+  const before = all.length === 0 ? "" : "Choosing " + (all.length === 1 ? at(all[0]) : "a provider (" + all.map(at).join(", ") + ")") + " sends replies to it to be read aloud.";
+  p.textContent = !sp ? before : sp.key ? "Replies are sent to " + at(sp) + " to be read aloud." : "No " + v + " key is stored (harness secret add " + sp.secret + ").";
   p.hidden = !p.textContent;
   $("speakTune").hidden = !sp;
   if (sp) {
@@ -979,7 +1041,11 @@ document.addEventListener("visibilitychange", () => {
 // ---- start ----
 
 (async () => {
-  const want = decodeURIComponent((location.hash || "").slice(1));
+  // a hash that doesn't decode opens main
+  let want = "";
+  try {
+    want = decodeURIComponent((location.hash || "").slice(1));
+  } catch (_) {}
   if (want) S.conv = want;
   await loadState();
   await loadHistory();

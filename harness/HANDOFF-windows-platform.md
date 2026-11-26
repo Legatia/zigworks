@@ -5,6 +5,217 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the audit's second pass — what changed in shared code, and the Windows and Linux findings that are yours (2026-11-26)
+
+The owner's instruction after the audit: "Fix everything not specifically
+about windows or Linux. And add the windows and Linux ones in handoff for
+windows session". So the shared Zig core, the macOS layer, harness and
+the desk page are fixed on `harness-logins`; `windows/desk.c` and
+`linux/desk.c` are untouched. Three lists follow: what waits on you in
+the native layers, what changed under you, and what your smoke may trip
+on.
+
+### Yours: findings in the Windows and Linux layers (not fixed)
+
+Most severe first. None was run here (no Windows or Linux machine); each
+is from reading the code.
+
+1. **Linux: the web process's sandbox is never turned on in code**
+   (`linux/desk.c:447-468`: no `webkit_web_context_set_sandbox_enabled`),
+   while `ci.yml:178-182` says the web process runs under bubblewrap and
+   turns Ubuntu's userns restriction off for the smoke. One of two is
+   true: the sandbox is off (app pages an agent wrote render unsandboxed),
+   or it is on and a stock Ubuntu 24.04 with the restriction left on
+   shows a blank window. Needs one run on stock 24.04 without the sysctl,
+   then the call and the README's line to match.
+2. **Linux: the microphone decision ignores which frame asked**
+   (`linux/desk.c:395-407`): every user-media request is judged by the
+   window's URL with `main_frame = 1`, and a request that is neither audio
+   nor video is taken as the microphone. Only the iframe's attributes stop
+   a framed app today. The same file passes `1` as `main_frame` to
+   `hdesk_on_message` (`:386`). Windows tells frames apart
+   (`windows/desk.c:497-500`).
+3. **Both: the web view's own context menu is left on**
+   (`windows/desk.c:584-614`: no
+   `put_AreDefaultContextMenusEnabled(FALSE)`; `linux/desk.c:477-482`: no
+   `context-menu` handler). Right-click offers Print, Save as, Open link
+   in new window, Download linked file. New windows and downloads are
+   refused already; the print and save dialogs are reachable.
+4. **Windows: the declared minimum WebView2 runtime (86.0.616.0,
+   `windows/desk.c:674`) lacks interfaces the policy needs.** Download
+   blocking and the per-frame permission use `ICoreWebView2_4` and
+   `Frame3` (`:497-500`, `:623-627`), and a failed `QueryInterface` is
+   skipped silently: on an old fixed runtime downloads go through and a
+   frame's microphone request arrives as the main frame's. Raise the
+   minimum to the first runtime that has both, or refuse to start without
+   them.
+5. **Windows: children inherit handles.** Zig's spawn calls
+   `CreateProcessW` with `bInheritHandles = TRUE` and no handle list, and
+   Winsock sockets are inheritable by default; the comment at
+   `desk-app/src/alive.zig` ("sockets are not inherited") is wrong for
+   Windows. Scenario: Start harness is clicked while the check's socket is
+   open, and the long-lived `harness.exe` keeps a copy. Impact
+   unconfirmed. (`alive.zig`'s Winsock path changed in this pass, see
+   below; the socket is still created the same way.)
+6. **Linux: the release's baseline floats.** `release.yml` builds the
+   Linux package on `ubuntu-latest`, `package-linux.sh:65` links the
+   runner's glibc and WebKitGTK, and the README promises Ubuntu 24.04.
+   Pin `ubuntu-24.04`.
+7. **Windows: `hdesk_post_main` ignores a `PostMessageW` failure**
+   (`windows/desk.c:946-948`): a job finishing after the window is
+   destroyed is leaked and never delivered. Only at exit.
+8. **Windows: `state\desk-code` is protected by the folder's ACL only.**
+   macOS and Linux write it mode 600 in a 700 folder. Under
+   `%LOCALAPPDATA%` the inherited ACL is the owner's; a `--home` outside
+   it (another drive, a shared folder) was not examined. Either set an
+   owner-only ACL on the file, or refuse a folder others can read.
+9. **Not confirmed, worth a look:** Windows judges a message as the main
+   frame's by URL equality (`windows/desk.c:411-414`); Linux's display
+   capture mapping; Linux GStreamer packages for sound and the
+   microphone.
+
+### Shared code changed under you: the native halves to do
+
+The rule kept here: no edit to your two files. Where the core needed
+something new from the native layer, it got a NEW export that only
+`mac/desk.m` calls, and the old export behaves as before for you.
+
+- **Outside links open only on a person's click** (`policy.decide(url,
+  port, frame, by)`, `By{ click, app }`). New export
+  `hdesk_on_navigate_from(url, frame, clicked)`; the old
+  `hdesk_on_navigate(url, frame)` counts every navigation as a click, so
+  on Windows and Linux a script's `location =` or `window.open` to
+  another site still opens the system browser. Switch to the new one
+  with a real flag: WebView2 `NavigationStartingEventArgs.IsUserInitiated`
+  (and the same on `NewWindowRequested`), WebKitGTK
+  `webkit_navigation_action_is_user_gesture()`. macOS counts only a link
+  activated with a mouse button. The macOS smoke proves it with a real
+  click: test hook `click ID` → `hdesk_test_click(id)` (a system mouse
+  event at the element), against the page's own `click()`, which must
+  open nothing. You will need the same hook to test yours.
+- **A page can't blank the window, and the built-in pages are known by
+  their load** (`policy.Doc`). `about:blank` in the main frame is allowed
+  only while the app itself is loading a built-in page
+  (`Doc.showing()` … `Doc.finished(url)`), and **messages from the page
+  are taken as the built-in page's buttons only after `hdesk_on_finish`
+  has reported `about:blank` for it**. Your layers already report that
+  (`windows/desk.c:369`; Linux `on_load_changed`); keep it so, and note
+  that Windows's `html_pending` shortcut (`:307`) never asks the policy
+  for the built-in load, which is fine.
+- **Script dialogs and the file chooser, by frame** (macOS only so far):
+  `alert`/`confirm`/`prompt` are shown for the desk page's main frame
+  only, under "Message from the page"; a frame's are dropped. A file
+  chooser a framed app opens says "An app on the desk asks for a file. It
+  can read the file you choose." Do the same in
+  `ScriptDialogOpening` / `script-dialog` and `run-file-chooser`. No
+  automated test here either: it was checked by reading.
+- **One window a data folder, on macOS through a message port.**
+  `harness open` now builds its command line in
+  `autostart.deskAppOpenArgv(a, os, app_path, home)`: macOS runs `open -n
+  -a APP --args --home HOME` (a start of its own each time); the Windows
+  and Linux argv is what it was. `hdesk_on_reopen()` is a new Zig export
+  only `mac/desk.m` calls (logs "shown again"). The README and the spec
+  now promise one window a data folder on every system: yours do this
+  with the lock and bring the window forward themselves; say so if a case
+  doesn't hold.
+- **The app runs its own harness first** (`controller`): the copy beside
+  the program (`setup.beside()`), and what `desk.json` names only in a
+  build that carries none. `desk.json` is a file in the data folder; it
+  no longer chooses the binary of a packaged app.
+- **`/alive` answers with a mark.** harness's `/alive` body is
+  `harness`, and `alive.zig` takes a 200 whose body starts with it
+  (`alive.mark`); a port another program answers 200 on is no longer
+  "harness is running". `alive.zig`'s read loop changed on both socket
+  paths (it reads the answer as it comes, within one timeout for
+  connecting, sending and reading); `test/fake_harness.py` sends the
+  mark. An older harness (no mark) reads as not running.
+- **`entry.wait(io, a, home, timeout_ms, poll_ms, turn)`** takes a
+  `Turn`: a later entry takes over from an earlier one, whose wait ends
+  without touching the code. `entry.withdraw` takes back this program's
+  `open-request` when a wait ends without a code, and harness deletes a
+  stale `open-request` when it starts (one left behind was answered by a
+  harness started later).
+- **The page's own asking is throttled:** enter-again and the attention
+  bounce are acted on once in `controller.page_ask_every_ms` (5 s).
+- **`CheckResult`** gained `bad_config` (a `config.ini` that is there and
+  can't be read is said, not treated as none) and `undone` (the check
+  couldn't be made: nothing changes).
+- **A job that can't be run is answered** (`main.zig`): no thread or no
+  memory for a command gives the command's own failure ("ran … ok=0", the
+  alert) and nothing runs on the main thread in its place. Test hooks
+  `nothreads N` and `nomemory N`; `commands.copyArgv` copies a line whole
+  or not at all.
+- **Setup:** a model or address that isn't one value (spaces, line
+  breaks, control characters) is refused; and the key is asked for again
+  when the address names another host than the one the stored key was
+  sent to (`setup.hostOf`, `setup.sameHost`).
+- **`tools/fetch-desk-assets.sh`** reads each file's hash from stdin
+  (works under Git Bash: no `/dev/fd`).
+
+### harness and the desk page (shared; runs on your systems too)
+
+- **A desk call from no session is refused before its body is read**
+  (`appserver.zig` `handle`): a signed-out `POST`/`PUT` under
+  `/desk/api/` gets 401 at once. With `Expect: 100-continue` no "100
+  Continue" is sent; otherwise a body up to 11 MiB already on its way is
+  read off and dropped before the answer, **because closing with it
+  unread makes Windows reset the connection and the 401 is lost**. Test
+  `a_signed_out_desk_call_is_refused_before_its_body_is_read` uses a raw
+  socket and a 2 MB unsigned upload: watch it on the Windows job.
+- **The fit files' order changed:** `desk-assets/` beside the binary,
+  then `../Resources/desk-assets/`, then the data folder's (it was the
+  data folder first). The fit's script is imported into the desk's
+  origin, so a file in the data folder must not stand in for a shipped
+  one. Your packages (files beside `harness.exe` / `harness`) are served
+  from the first place now. `fit_dir` in the settings still names the
+  data folder. harness's `scripts/smoke.sh` checks 66 and 67 were
+  rewritten for the order.
+- **Settings JSON has three new fields:** `host` on each of `speakers[]`,
+  and `voice_provider`, `voice_host` (the host, with a port other than
+  the scheme's own, that replies or recordings are sent to).
+- **The desk page's words changed** (the owner's copy rules: plain
+  labels, explanations behind the "i"). If a probe of yours matches any
+  of these, it needs the new text:
+  - the microphone button: `aria-label`/`title` "Record a message"
+    (was "Speak"), "Stop recording" while recording (was "Stop"); a new
+    line under the message box, `#micWhere`: "Recordings are sent to NAME
+    (HOST) to be transcribed.";
+  - the card: "1 open item" / "N open items", "1 urgent item" / "N urgent
+    items", "Urgent alert open", "Quiet until HH:MM" / "Quiet hours", "No
+    open items"; Needs you when empty: "No open items" (was "Nothing
+    waits for you."); the Inbox app says the same;
+  - Speak replies names the host: "Replies are sent to NAME (HOST) to be
+    read aloud.";
+  - the photo's two rules moved into its "i" bubble, "Works best without
+    glasses." is gone, "Recommended: the avatar rests with its eyes
+    closed." moved into the eyes-closed "i"; inline stays "JPEG or PNG,
+    up to 10 MB.", the consent line and "The photo stays on this
+    computer…";
+  - new `#avatarNote` on the stage: why the chosen avatar didn't load, or
+    is shown as its portrait only.
+- **Page fixes** (all in `desk.js`): a message already in the loaded
+  history isn't shown twice; a conversation that vanishes while open
+  falls back to main with main's messages; the recorder's two-minute stop
+  is cleared when a recording ends sooner; a `MediaRecorder` that can't
+  be made lets the microphone go and says "The microphone isn't
+  available."; a hash that doesn't decode opens main; a call that can't
+  reach harness says "harness isn't answering." (was the browser's "Load
+  failed").
+
+### What `smoke-other.sh` may trip on
+
+- A `js …click()` sent to a built-in page **before** its `finish
+  about:blank` is logged is now ignored (the page isn't known as the
+  app's own until then). `smoke-other.sh` sends such clicks around lines
+  204, 292, 315, 325 and 331; if the Windows or Linux desk job turns red
+  on this commit, wait for the `finish about:blank` line first, as the
+  macOS smoke does.
+- Outside-link checks: with the old `hdesk_on_navigate` every navigation
+  is a click, so your existing "external URL" lines hold until you
+  switch; after the switch a script's click must log `nav cancel`.
+- The stand-in harness's `/alive` sends the mark; a stand-in of your own
+  must too.
+
 ## For you: the desk app was audited; what changed and what waits on you (2026-11-26)
 
 The owner asked for an audit of the desk app before it is released. Fixed

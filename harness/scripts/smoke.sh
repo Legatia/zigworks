@@ -1033,10 +1033,10 @@ if [ $windows = 0 ]; then
 	check "autostart on writes the login item, off removes it, and alone it says which first" 'HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^off" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart on >/dev/null && grep -rqF -- "--home" "$T/user" && grep -rqF "$DH" "$T/user" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart | grep -qE "^on" && HOME="$T/user" XDG_CONFIG_HOME="" HARNESS_HOME="$DH" "$H" autostart off >/dev/null && [ -z "$(find "$T/user" -type f)" ]'
 fi
 
-# the fit files (/desk/assets/) from the first place that has them: the
-# data folder's desk-assets/, then desk-assets/ beside harness's binary,
-# then the app bundle's Resources/desk-assets/ (the binary copied into a
-# bundle's layout); nothing outside them, links not followed
+# the fit files (/desk/assets/) from the first place that has them:
+# desk-assets/ beside harness's binary, then the app bundle's
+# Resources/desk-assets/ (the binary copied into a bundle's layout), then
+# the data folder's desk-assets/; nothing outside them, links not followed
 FH="$T/fitdata"
 FA="$T/fitapp/Contents"
 mkdir -p "$FA/MacOS/desk-assets" "$FA/Resources/desk-assets/mediapipe"
@@ -1057,6 +1057,7 @@ EOF
 chmod 600 "$FH/config.ini"
 mkdir -p "$FH/desk-assets"
 printf data >"$FH/desk-assets/a.txt"
+printf data >"$FH/desk-assets/e.txt"
 printf beside >"$FA/MacOS/desk-assets/a.txt"
 printf beside >"$FA/MacOS/desk-assets/b.txt"
 for f in a b c; do printf bundle >"$FA/Resources/desk-assets/$f.txt"; done
@@ -1071,11 +1072,11 @@ wait_for "$T/frun.out" "running on" 15
 # folder's path alone too, so that one is rewritten here)
 FHN="$FH"
 [ $windows = 1 ] && FHN=$(cygpath -m "$FH" 2>/dev/null || (cd "$FH" && pwd -W))
-MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$F" --desk-get "$FHN" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
-rm "$FH/desk-assets/a.txt"
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$F" --desk-get "$FHN" /desk/assets/a.txt /desk/assets/b.txt /desk/assets/c.txt /desk/assets/e.txt /desk/assets/mediapipe/d.txt /desk/assets/../outside.txt /desk/assets/%2e%2e/outside.txt /desk/assets/mediapipe/../../outside.txt /desk/assets/link.txt /desk/assets/none.txt >"$T/fit1.out" 2>&1
+rm "$FA/MacOS/desk-assets/a.txt" "$FA/Resources/desk-assets/a.txt"
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$F" --desk-get "$FHN" /desk/assets/a.txt >"$T/fit2.out" 2>&1
-check "the fit files come from the data folder first, then beside the binary, then the app bundle" 'grep -qxF "/desk/assets/a.txt 200 data" "$T/fit1.out" && grep -qxF "/desk/assets/b.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/c.txt 200 bundle" "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/d.txt 200 bundle wasm" "$T/fit1.out" && grep -qxF "/desk/assets/none.txt 404 No such file." "$T/fit1.out"'
-check "a fit file gone from the data folder is served from beside the binary" 'grep -qxF "/desk/assets/a.txt 200 beside" "$T/fit2.out"'
+check "the fit files come from beside the binary first, then the app bundle, then the data folder" 'grep -qxF "/desk/assets/a.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/b.txt 200 beside" "$T/fit1.out" && grep -qxF "/desk/assets/e.txt 200 data" "$T/fit1.out" && grep -qxF "/desk/assets/c.txt 200 bundle" "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/d.txt 200 bundle wasm" "$T/fit1.out" && grep -qxF "/desk/assets/none.txt 404 No such file." "$T/fit1.out"'
+check "a fit file harness no longer ships is served from the data folder" 'grep -qxF "/desk/assets/a.txt 200 data" "$T/fit2.out"'
 check "no path leaves the fit files' folders, and a link there isn't followed" 'grep -qxF "/desk/assets/../outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/%2e%2e/outside.txt 404 No such file." "$T/fit1.out" && grep -qxF "/desk/assets/mediapipe/../../outside.txt 404 No such file." "$T/fit1.out" && { [ $windows = 1 ] || grep -qxF "/desk/assets/link.txt 404 No such file." "$T/fit1.out"; } && ! grep -qE " 200 (outside|\[model\])" "$T/fit1.out"'
 HARNESS_HOME="$FH" "$HB" stop >/dev/null 2>&1
 wait "$RPID" 2>/dev/null
