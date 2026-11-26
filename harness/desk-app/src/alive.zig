@@ -1,5 +1,6 @@
-//! Whether harness answers on its port: `GET /alive`, a 200 within a time
-//! limit. The socket is the system's own, non-blocking, waited on with poll
+//! Whether harness answers on its port: `GET /alive`, a 200 that says
+//! `harness`, within a time limit (another program on the port, which
+//! answers 200 to anything, isn't harness). The socket is the system's own, non-blocking, waited on with poll
 //! (Windows: Winsock's, waited on with WSAPoll): std's connect can't yet
 //! take a time limit (harness's sock.zig says the same).
 const std = @import("std");
@@ -11,7 +12,7 @@ const posix = std.posix;
 const c = std.c;
 
 /// True when harness answers `GET /alive` on 127.0.0.1:`port` with a 200
-/// within `timeout_ms` (connecting, sending and reading the status line).
+/// and its mark within `timeout_ms` (connecting, sending and reading).
 pub fn check(port: u16, timeout_ms: u32) bool {
     return checkOrFail(port, timeout_ms) catch false;
 }
@@ -103,9 +104,14 @@ fn checkWindows(port: u16, timeout_ms: u32) !bool {
         sent += @intCast(n);
     }
 
-    var resp: [64]u8 = undefined;
+    var resp: [2048]u8 = undefined;
     var got: usize = 0;
-    while (got < resp.len and std.mem.indexOf(u8, resp[0..got], "\r\n") == null) {
+    while (got < resp.len) {
+        switch (answer(resp[0..got])) {
+            .yes => return true,
+            .no => return false,
+            .more => {},
+        }
         if (!ws.ready(s, ws.POLLRDNORM, deadline)) return false;
         const n = ws.recv(s, resp[got..].ptr, @intCast(resp.len - got), 0);
         if (n < 0) {
@@ -115,10 +121,26 @@ fn checkWindows(port: u16, timeout_ms: u32) !bool {
         if (n == 0) break;
         got += @intCast(n);
     }
-    return is200(resp[0..got]);
+    return answer(resp[0..got]) == .yes;
 }
 
-/// "HTTP/1.x 200 …": the status line is enough.
+/// What harness's `/alive` answers with, after its headers.
+pub const mark = "harness";
+
+const Answer = enum { more, yes, no };
+
+/// What the answer read so far says: a 200 whose body starts with the mark
+/// is harness.
+fn answer(resp: []const u8) Answer {
+    if (resp.len < 13) return .more;
+    if (!is200(resp)) return .no;
+    const end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return .more;
+    const body = resp[end + 4 ..];
+    if (body.len < mark.len) return if (std.mem.startsWith(u8, mark, body)) .more else .no;
+    return if (std.mem.startsWith(u8, body, mark)) .yes else .no;
+}
+
+/// "HTTP/1.x 200 …"
 fn is200(line: []const u8) bool {
     return (std.mem.startsWith(u8, line, "HTTP/1.1 200") or std.mem.startsWith(u8, line, "HTTP/1.0 200")) and
         line.len > 12 and (line[12] == ' ' or line[12] == '\r');
@@ -171,10 +193,14 @@ fn checkOrFail(port: u16, timeout_ms: u32) !bool {
         sent += @intCast(n);
     }
 
-    // the status line is enough: "HTTP/1.x 200 …"
-    var resp: [64]u8 = undefined;
+    var resp: [2048]u8 = undefined;
     var got: usize = 0;
-    while (got < resp.len and std.mem.indexOf(u8, resp[0..got], "\r\n") == null) {
+    while (got < resp.len) {
+        switch (answer(resp[0..got])) {
+            .yes => return true,
+            .no => return false,
+            .more => {},
+        }
         if (!try ready(fd, posix.POLL.IN, deadline)) return false;
         const n = c.recv(fd, resp[got..].ptr, resp.len - got, 0);
         if (n < 0) {
@@ -186,7 +212,7 @@ fn checkOrFail(port: u16, timeout_ms: u32) !bool {
         if (n == 0) break;
         got += @intCast(n);
     }
-    return is200(resp[0..got]);
+    return answer(resp[0..got]) == .yes;
 }
 
 /// Whether `fd` became ready for `events` before `deadline`.
@@ -257,13 +283,24 @@ const OneShot = struct {
     }
 };
 
-test "alive_is_200_only" {
-    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" };
+test "alive_is_harness_saying_so" {
+    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nharness" };
     try ok.start();
     try t.expect(check(ok.port, 2000));
     ok.finish();
 
-    var missing: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" };
+    // another program on the port, answering every path with a page
+    var other: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n<!doctype html>" };
+    try other.start();
+    try t.expect(!check(other.port, 2000));
+    other.finish();
+
+    var empty: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" };
+    try empty.start();
+    try t.expect(!check(empty.port, 2000));
+    empty.finish();
+
+    var missing: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 7\r\n\r\nharness" };
     try missing.start();
     try t.expect(!check(missing.port, 2000));
     missing.finish();
@@ -272,6 +309,19 @@ test "alive_is_200_only" {
     try junk.start();
     try t.expect(!check(junk.port, 2000));
     junk.finish();
+}
+
+test "the_answer_is_read_as_it_comes" {
+    try t.expectEqual(Answer.more, answer(""));
+    try t.expectEqual(Answer.more, answer("HTTP/1.1 200 OK\r\nx: y\r\n"));
+    try t.expectEqual(Answer.more, answer("HTTP/1.1 200 OK\r\nx: y\r\n\r\nharn"));
+    try t.expectEqual(Answer.yes, answer("HTTP/1.1 200 OK\r\nx: y\r\n\r\nharness"));
+    try t.expectEqual(Answer.yes, answer("HTTP/1.0 200 OK\r\n\r\nharness\n"));
+    try t.expectEqual(Answer.no, answer("HTTP/1.1 200 OK\r\nx: y\r\n\r\nharmless"));
+    try t.expectEqual(Answer.no, answer("HTTP/1.1 204 No Content\r\n"));
+    try t.expectEqual(Answer.no, answer("HTTP/1.1 2000 OK\r\n"));
+    // the word in a header is not the answer
+    try t.expectEqual(Answer.more, answer("HTTP/1.1 200 OK\r\nserver: harness\r\n"));
 }
 
 test "nothing_listening_is_not_alive" {
@@ -293,7 +343,7 @@ test "a_server_that_never_answers_is_not_alive_within_the_time" {
 }
 
 test "the_request_names_alive_and_the_host" {
-    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.0 200 OK\r\n\r\n" };
+    var ok: OneShot = .{ .server = undefined, .port = 0, .reply = "HTTP/1.0 200 OK\r\n\r\nharness" };
     try ok.start();
     try t.expect(check(ok.port, 2000));
     ok.finish();

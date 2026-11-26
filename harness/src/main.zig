@@ -2416,9 +2416,11 @@ fn openCmd(app: *App) !Exit {
         complain("The desk app isn't installed: put harness-desk beside harness (it comes in the release archive){s}.", .{if (os == .macos) ", or harness-desk.app in Applications" else ""});
         return .failed;
     };
+    const argv = try autostart.deskAppOpenArgv(app.arena, os, app_path, home);
     if (os == .macos) {
-        // `open -a` starts it, or brings the running one to the front
-        var child = try std.process.spawn(app.io, .{ .argv = &.{ "/usr/bin/open", "-a", app_path, "--args", "--home", home }, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
+        // started through `open`; the app itself brings the one already
+        // open on this folder to the front
+        var child = try std.process.spawn(app.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .inherit });
         const term = try child.wait(app.io);
         if (term != .exited or term.exited != 0) {
             complain("The desk app didn't open ({s}).", .{app_path});
@@ -2427,7 +2429,7 @@ fn openCmd(app: *App) !Exit {
         return .ok;
     }
     // its own: one window, brought to the front by the app itself
-    _ = try std.process.spawn(app.io, .{ .argv = &.{ app_path, "--home", home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = if (os == .windows) null else 0 });
+    _ = try std.process.spawn(app.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .pgid = if (os == .windows) null else 0 });
     return .ok;
 }
 

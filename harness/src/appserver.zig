@@ -238,6 +238,14 @@ pub const Server = struct {
                 for (s.asset_dirs) |x| gpa.free(x);
                 gpa.free(s.asset_dirs);
             }
+            // a request from before this start (the desk app quit or gave
+            // up with it there) is nobody's now: it gets no code. Nothing
+            // answers on the port yet, so the app has asked this start for
+            // nothing.
+            if (std.fs.path.join(gpa, &.{ d.state, "open-request" })) |left| {
+                defer gpa.free(left);
+                Io.Dir.cwd().deleteFile(io, left) catch {};
+            } else |_| {}
             s.desk_thread = try std.Thread.spawn(.{}, deskLoop, .{s});
         }
         if (s.log) |l| l.write(.app, false, .{ .event = "server started", .port = s.port }) catch {};
@@ -423,6 +431,23 @@ pub const Server = struct {
         // the desk's voice and upload take more
         const limit: usize = if (std.mem.eql(u8, path, "/desk/api/voice") or std.mem.eql(u8, path, "/desk/api/upload")) max_desk_body else max_body;
         var body: []const u8 = "";
+        // a desk call from no session is refused before its body is taken:
+        // nothing of it is kept, and a client that asked first ("Expect:
+        // 100-continue") is told no instead of being told to go on
+        if (desk_api and (method == .POST or method == .PUT)) {
+            const signed_in = if (deskwin.cookieOf(cookie, deskwin.cookie_name)) |tok| s.sessions.valid(s.io, tok) else false;
+            if (!signed_in) {
+                if (req.head.expect != null) {
+                    req.head.expect = null;
+                } else if (req.head.content_length) |n| if (n > 0 and n <= max_desk_body + (1 << 20)) {
+                    // already on its way: read off (closed with it unread,
+                    // Windows resets the connection and the answer is lost)
+                    var drain_buf: [8192]u8 = undefined;
+                    _ = req.readerExpectNone(&drain_buf).discardRemaining() catch {};
+                };
+                return s.respond(req, .unauthorized, "{\"error\":\"signed out\"}", "application/json", own_origin, .plain, null);
+            }
+        }
         if (method == .POST or method == .PUT) {
             const too_big = if (limit == max_body) "A call carries at most 1 MiB." else "A call carries at most 10 MB.";
             if (req.head.content_length) |n| if (n > limit) {
@@ -444,7 +469,8 @@ pub const Server = struct {
             };
         }
         const rq: Rq = .{ .req = req, .method = method, .query = query, .body = body, .origin = origin, .dest = dest, .own_origin = own_origin, .cookie = cookie, .if_none = if_none, .content_type = ctype };
-        if (std.mem.eql(u8, path, "/alive")) return s.respondEx(req, .ok, "", "text/plain; charset=utf-8", own_origin, .plain, null, .{});
+        // (the word tells the desk app this is harness, not another program on the port)
+        if (std.mem.eql(u8, path, "/alive")) return s.respondEx(req, .ok, "harness", "text/plain; charset=utf-8", own_origin, .plain, null, .{});
         if (s.desk_home.len > 0) {
             if (std.mem.eql(u8, path, "/enter")) return s.enter(a, rq);
             if (std.mem.eql(u8, path, "/desk") or std.mem.startsWith(u8, path, "/desk/")) return s.desk(a, rq, path);
@@ -899,23 +925,27 @@ fn deskName(rel: []const u8) bool {
     return false;
 }
 
-/// Where the fit's files (`/desk/assets/`) are looked for, in order: the
-/// data folder's `desk-assets/`, then, when harness's own folder is known,
-/// `desk-assets/` beside the binary and, when that folder is an app
-/// bundle's `Contents/MacOS`, `../Resources/desk-assets/`. In `a`.
+/// Where the fit's files (`/desk/assets/`) are looked for, in order: when
+/// harness's own folder is known, `desk-assets/` beside the binary and,
+/// when that folder is an app bundle's `Contents/MacOS`,
+/// `../Resources/desk-assets/`; then, last, the data folder's
+/// `desk-assets/` (always there: the place `fetch-desk-assets.sh` fills).
+/// What harness ships comes first because the fit's script runs in the
+/// desk's origin: a file put in the data folder never stands in for it.
+/// In `a`.
 pub fn assetDirs(a: std.mem.Allocator, home: []const u8, exe_dir: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (out.items) |d| a.free(d);
         out.deinit(a);
     }
-    try out.append(a, try std.fs.path.join(a, &.{ home, "desk-assets" }));
     if (exe_dir.len > 0) {
         try out.append(a, try std.fs.path.join(a, &.{ exe_dir, "desk-assets" }));
         if (std.mem.eql(u8, std.fs.path.basename(exe_dir), "MacOS")) if (std.fs.path.dirname(exe_dir)) |up| {
             if (std.mem.eql(u8, std.fs.path.basename(up), "Contents")) try out.append(a, try std.fs.path.join(a, &.{ up, "Resources", "desk-assets" }));
         };
     }
+    try out.append(a, try std.fs.path.join(a, &.{ home, "desk-assets" }));
     return out.toOwnedSlice(a);
 }
 
@@ -1507,10 +1537,27 @@ test "alive_answers_and_nothing_else" {
     try withDesk(&f, &fh);
     const got = try get(f.a, f.s.port, "/alive", f.host);
     try t.expectEqual(200, got.status);
-    try t.expectEqualStrings("", got.body);
+    // the desk app tells harness from another program on the port by this
+    try t.expectEqualStrings("harness", got.body);
     try expectHas(got.head, "cache-control: no-store");
     try t.expectEqual(403, (try get(f.a, f.s.port, "/alive", try std.fmt.allocPrint(f.a, "Host: localhost:{d}\r\n", .{f.s.port}))).status);
     try t.expectEqual(405, (try send(f.a, f.s.port, "POST", "/alive", f.host, "")).status);
+}
+
+test "a_request_left_before_the_start_gets_no_code" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    var fh: FakeHost = .{};
+    // the desk app quit, or gave up, with its request still there
+    try f.tmp.dir.createDirPath(t.io, "state");
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = "state/open-request", .data = "pid 1\n" });
+    try withDesk(&f, &fh);
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/open-request", .{}));
+    t.io.sleep(.fromMilliseconds(700), .awake) catch {};
+    try t.expectError(error.FileNotFound, f.tmp.dir.statFile(t.io, "state/desk-code", .{}));
+    // one asked for now is answered
+    _ = try enterDesk(&f);
 }
 
 test "enter_sets_a_session_cookie_once" {
@@ -1716,6 +1763,35 @@ test "desk_bodies_may_be_10_mb_for_voice_and_upload_only" {
     try t.expectEqual(2, fh.desk_calls);
 }
 
+test "a_signed_out_desk_call_is_refused_before_its_body_is_read" {
+    var f: Fix = undefined;
+    try f.init();
+    defer f.deinit();
+    const a = f.a;
+    var fh: FakeHost = .{};
+    try withDesk(&f, &fh);
+    // asks before sending 10 MB: told no, and never told to go on
+    const h = try sock.connect(t.io, "127.0.0.1", f.s.port, 2000);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var wbuf: [4096]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(t.io, h, &rbuf, &wbuf, 5000);
+    defer sk.close();
+    try sk.writer.print("POST /desk/api/upload?avatar=mine&part=still&consent=yes HTTP/1.1\r\n{s}Expect: 100-continue\r\nContent-Length: 10000000\r\n\r\n", .{f.host});
+    try sk.writer.flush();
+    const first = (try sk.reader.takeDelimiter('\n')) orelse return error.BadResponse;
+    try expectHas(first, "HTTP/1.1 401");
+    // and the connection ends there, with none of the body awaited
+    const rest = try sk.reader.allocRemaining(a, .limited(1 << 20));
+    try expectHas(rest, "signed out");
+    try t.expect(std.mem.indexOf(u8, rest, "100 Continue") == null);
+    // sent without asking: read off (not kept) and refused the same
+    const two = try a.alloc(u8, 2 << 20);
+    @memset(two, 'x');
+    try t.expectEqual(401, (try sendBig(a, f.s.port, "POST", "/desk/api/upload?avatar=mine&part=still&consent=yes", f.host, two)).status);
+    try t.expectEqual(0, fh.desk_calls);
+}
+
 /// `send` for bodies larger than the socket's buffers.
 fn sendBig(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, extra: []const u8, body: []const u8) !Got {
     const h = try sock.connect(t.io, "127.0.0.1", port, 2000);
@@ -1735,16 +1811,13 @@ fn sendBig(a: std.mem.Allocator, port: u16, method: []const u8, path: []const u8
 
 test "the_settings_page_carries_the_photo_rules" {
     const page = deskFile("index.html").?;
-    // inline beside the upload button, the consent line, the privacy line
+    // inline beside the upload button: the file's limits, the consent line,
+    // the privacy line
     for ([_][]const u8{
-        "Facing the camera, eyes open, mouth closed.",
-        "One face, head and shoulders, wider than tall.",
-        "Works best without glasses.",
-        "JPEG or PNG, up to 10 MB.",
+        "<p class=\"fine\">JPEG or PNG, up to 10 MB.</p>",
         "This is me, someone who agreed, or a made-up character.",
         "The photo stays on this computer",
         "Add an eyes-closed version",
-        "Recommended: the avatar rests with its eyes closed.",
         // behind the "i" bubbles
         "The photo is fitted onto a 3D head and becomes the whole scene: its background, hair, shoulders and lighting.",
         "These are refused, with the reason: a face turned more than about 8°, an open mouth or teeth showing, closed eyes, more than one face, a face too small to find.",
@@ -1757,6 +1830,24 @@ test "the_settings_page_carries_the_photo_rules" {
         "Needs you",
         "Lately",
     }) |line| try expectHas(page, line);
+    // what a photo should be is explained once, behind the photo's "i"; the
+    // eyes-closed advice behind its own
+    const photo_info = std.mem.indexOf(u8, page, "id=\"photoInfo\"").?;
+    const up_controls = std.mem.indexOf(u8, page, "id=\"upControls\"").?;
+    const closed_info = std.mem.indexOf(u8, page, "id=\"closedInfo\"").?;
+    const closed_controls = std.mem.indexOf(u8, page, "id=\"closedControls\"").?;
+    for ([_]struct { []const u8, usize, usize }{
+        .{ "Facing the camera, eyes open, mouth closed.", photo_info, up_controls },
+        .{ "One face, head and shoulders, wider than tall.", photo_info, up_controls },
+        .{ "Recommended: the avatar rests with its eyes closed.", closed_info, closed_controls },
+    }) |c| {
+        try t.expectEqual(@as(usize, 1), std.mem.count(u8, page, c[0]));
+        const at = std.mem.indexOf(u8, page, c[0]).?;
+        try t.expect(at > c[1] and at < c[2]);
+        // in the bubble's list, not after it
+        try t.expect(at < std.mem.indexOfPos(u8, page, c[1], "</ul>").?);
+    }
+    try t.expect(std.mem.indexOf(u8, page, "Works best without glasses.") == null);
     // the consent tick gates the upload: the button starts disabled
     try expectHas(page, "<button type=\"button\" id=\"upBtn\" class=\"btn cut-s\" disabled>Upload</button>");
     try expectHas(page, "<input type=\"checkbox\" id=\"upConsent\">");
@@ -1813,12 +1904,17 @@ test "desk_assets_come_from_the_first_place_that_has_them" {
     const data = "desk-assets/";
     const beside = "app/Contents/MacOS/desk-assets/";
     const bundle = "app/Contents/Resources/desk-assets/";
+    // what harness ships comes first: a file put in the data folder never
+    // stands in for it (the fit's script runs in the desk's origin)
     for ([_][]const u8{ data, beside, bundle }) |p| try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}a.txt", .{p}), .data = p });
-    for ([_][]const u8{ beside, bundle }) |p| try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}b.txt", .{p}), .data = p });
+    for ([_][]const u8{ data, bundle }) |p| try f.tmp.dir.writeFile(t.io, .{ .sub_path = try std.fmt.allocPrint(a, "{s}b.txt", .{p}), .data = p });
+    try f.tmp.dir.writeFile(t.io, .{ .sub_path = data ++ "d.txt", .data = data });
     try f.tmp.dir.createDirPath(t.io, bundle ++ "mediapipe/wasm");
     try f.tmp.dir.writeFile(t.io, .{ .sub_path = bundle ++ "mediapipe/wasm/c.wasm", .data = "\x00asm bundle" });
-    try t.expectEqualStrings(data, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
-    try t.expectEqualStrings(beside, (try get(a, f.s.port, "/desk/assets/b.txt", with)).body);
+    try t.expectEqualStrings(beside, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
+    try t.expectEqualStrings(bundle, (try get(a, f.s.port, "/desk/assets/b.txt", with)).body);
+    // only the data folder has it (tools/fetch-desk-assets.sh's place)
+    try t.expectEqualStrings(data, (try get(a, f.s.port, "/desk/assets/d.txt", with)).body);
     const c = try get(a, f.s.port, "/desk/assets/mediapipe/wasm/c.wasm", with);
     try t.expectEqual(200, c.status);
     try t.expectEqualStrings("\x00asm bundle", c.body);
@@ -1828,8 +1924,10 @@ test "desk_assets_come_from_the_first_place_that_has_them" {
     try expectHas(c.head, try std.fmt.allocPrint(a, "etag: {s}", .{&tag}));
     try t.expectEqual(304, (try get(a, f.s.port, "/desk/assets/mediapipe/wasm/c.wasm", try std.fmt.allocPrint(a, "{s}If-None-Match: {s}\r\n", .{ with, &tag }))).status);
     // gone from the first place: the next one's
-    try f.tmp.dir.deleteFile(t.io, data ++ "a.txt");
-    try t.expectEqualStrings(beside, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
+    try f.tmp.dir.deleteFile(t.io, beside ++ "a.txt");
+    try t.expectEqualStrings(bundle, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
+    try f.tmp.dir.deleteFile(t.io, bundle ++ "a.txt");
+    try t.expectEqualStrings(data, (try get(a, f.s.port, "/desk/assets/a.txt", with)).body);
     try t.expectEqual(404, (try get(a, f.s.port, "/desk/assets/none.txt", with)).status);
     // avatars stay the data folder's alone
     try f.tmp.dir.createDirPath(t.io, "app/Contents/MacOS/avatars/me");
@@ -1841,16 +1939,20 @@ test "desk_assets_without_a_binary_folder_are_the_data_folders" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try t.expectEqual(1, (try assetDirs(a, "/data", "")).len);
+    const alone = try assetDirs(a, "/data", "");
+    try t.expectEqual(1, alone.len);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), alone[0]);
+    // shipped places first, the data folder's last
     const dirs = try assetDirs(a, "/data", "/opt/x/Contents/MacOS");
     try t.expectEqual(3, dirs.len);
-    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), dirs[0]);
-    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents/MacOS", "desk-assets" }), dirs[1]);
-    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents", "Resources", "desk-assets" }), dirs[2]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents/MacOS", "desk-assets" }), dirs[0]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/opt/x/Contents", "Resources", "desk-assets" }), dirs[1]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), dirs[2]);
     // a binary outside an app bundle: no Resources beside its folder
     const plain = try assetDirs(a, "/data", "/usr/local/bin");
     try t.expectEqual(2, plain.len);
-    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/usr/local/bin", "desk-assets" }), plain[1]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/usr/local/bin", "desk-assets" }), plain[0]);
+    try t.expectEqualStrings(try std.fs.path.join(a, &.{ "/data", "desk-assets" }), plain[1]);
 }
 
 test "fit_files_are_judged_as_they_are_served" {
@@ -1861,11 +1963,13 @@ test "fit_files_are_judged_as_they_are_served" {
     const a = arena.allocator();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);
     const dirs = try assetDirs(a, try std.fs.path.join(a, &.{ root, "data" }), try std.fs.path.join(a, &.{ root, "bin" }));
+    // in the data folder alone (the last place looked in)
     for (fit_files) |rel| {
         const p = try std.fs.path.join(a, &.{ dirs[1], rel });
         try Io.Dir.cwd().createDirPath(t.io, std.fs.path.dirname(p).?);
         try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = p, .data = "x" });
     }
+    try t.expect(std.mem.endsWith(u8, std.fs.path.dirname(dirs[1]).?, "data"));
     try t.expect(fitFilesThere(t.io, a, dirs));
     // an oversized copy in the first place answers 413, so it isn't there
     const big = try a.alloc(u8, max_desk_file + 1);

@@ -85,7 +85,7 @@
             return it.status !== "open";
           })
           .reverse();
-        state.textContent = waiting.length === 0 ? "Nothing waits for you." : waiting.length + (waiting.length === 1 ? " item waits." : " items wait.");
+        state.textContent = waiting.length === 0 ? "No open items" : waiting.length + (waiting.length === 1 ? " open item" : " open items");
         group(waiting, open, function (it) {
           return it.kind + ", by " + it.by;
         });

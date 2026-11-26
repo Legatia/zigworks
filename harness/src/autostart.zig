@@ -115,6 +115,19 @@ pub fn deskAppCandidates(a: std.mem.Allocator, os: Os, exe_dir: []const u8, user
     return out.items;
 }
 
+/// What `harness open` runs: the desk app at `app_path` on the data
+/// folder `home`. The app keeps one window a data folder: a second start
+/// on a folder brings the first's window to the front and ends. macOS:
+/// `open -n`, a start of its own each time, since `open -a` alone gives a
+/// running app no arguments and one open on another folder would come to
+/// the front instead.
+pub fn deskAppOpenArgv(a: std.mem.Allocator, os: Os, app_path: []const u8, home: []const u8) ![]const []const u8 {
+    return a.dupe([]const u8, switch (os) {
+        .macos => &.{ "/usr/bin/open", "-n", "-a", app_path, "--args", "--home", home },
+        .windows, .linux => &.{ app_path, "--home", home },
+    });
+}
+
 // ---- tests ----
 
 const t = std.testing;
@@ -192,4 +205,19 @@ test "the_desk_app_is_looked_for_beside_then_in_applications" {
     const lin = try deskAppCandidates(a, .linux, "/opt/harness", "/home/x");
     try t.expectEqual(1, lin.len);
     try t.expectEqualStrings("/opt/harness/harness-desk", lin[0]);
+}
+
+test "open_starts_the_app_on_this_folder" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // macOS: a start of its own each time (`-n`): `open -a` alone hands a
+    // running app no arguments, so one open on another folder would come
+    // to the front in its place. The app keeps one window a folder itself.
+    const mac = try deskAppOpenArgv(a, .macos, "/Applications/harness-desk.app", "/data/b");
+    try t.expectEqual(@as(usize, 7), mac.len);
+    for ([_][]const u8{ "/usr/bin/open", "-n", "-a", "/Applications/harness-desk.app", "--args", "--home", "/data/b" }, mac) |want, got| try t.expectEqualStrings(want, got);
+    const lin = try deskAppOpenArgv(a, .linux, "/opt/harness/harness-desk", "/data/b");
+    try t.expectEqual(@as(usize, 3), lin.len);
+    for ([_][]const u8{ "/opt/harness/harness-desk", "--home", "/data/b" }, lin) |want, got| try t.expectEqualStrings(want, got);
 }

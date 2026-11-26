@@ -57,10 +57,37 @@ pub fn take(io: Io, a: std.mem.Allocator, home: []const u8) !?[]u8 {
     return try a.dupe(u8, code);
 }
 
-/// `take`, every `poll_ms`, until a code or `timeout_ms` has passed.
-pub fn wait(io: Io, a: std.mem.Allocator, home: []const u8, timeout_ms: u32, poll_ms: u32) !?[]u8 {
+/// Which wait is the one the app still wants: a later entry takes over
+/// from an earlier one, whose wait then ends without touching the code
+/// (it is the later one's).
+pub const Turn = struct {
+    current: *const std.atomic.Value(u32),
+    mine: u32,
+
+    pub fn over(tn: Turn) bool {
+        return tn.current.load(.acquire) != tn.mine;
+    }
+};
+
+/// Takes back the request, when it is still there and this program's: one
+/// left behind would be answered by a harness started later.
+pub fn withdraw(io: Io, home: []const u8) void {
+    var buf: [Io.Dir.max_path_bytes]u8 = undefined;
+    const p = statePath(&buf, home, "open-request") catch return;
+    const cwd = Io.Dir.cwd();
+    var text: [64]u8 = undefined;
+    const got = cwd.readFile(io, p, &text) catch return;
+    var line: [32]u8 = undefined;
+    const ours = std.fmt.bufPrint(&line, "pid {d}\n", .{pid()}) catch return;
+    if (std.mem.eql(u8, got, ours)) cwd.deleteFile(io, p) catch {};
+}
+
+/// `take`, every `poll_ms`, until a code, or `timeout_ms` has passed, or
+/// another wait took over.
+pub fn wait(io: Io, a: std.mem.Allocator, home: []const u8, timeout_ms: u32, poll_ms: u32, turn: Turn) !?[]u8 {
     const started = Io.Clock.awake.now(io);
     while (true) {
+        if (turn.over()) return null;
         if (try take(io, a, home)) |code| return code;
         if (started.durationTo(Io.Clock.awake.now(io)).toMilliseconds() >= timeout_ms) return null;
         io.sleep(.fromMilliseconds(poll_ms), .awake) catch {};
@@ -142,6 +169,40 @@ test "an_empty_code_file_is_not_a_code" {
     _ = try tmp.dir.statFile(t.io, "state/desk-code", .{});
 }
 
+test "a_wait_another_took_over_takes_no_code" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(a, &tmp);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/desk-code", .data = "the-new-ones-code" });
+    var current: std.atomic.Value(u32) = .init(2);
+    // the code is the newer wait's: left where it is, and no time spent
+    const started = Io.Clock.awake.now(t.io);
+    try t.expect((try wait(t.io, a, home, 5000, 20, .{ .current = &current, .mine = 1 })) == null);
+    try t.expect(started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds() < 2000);
+    _ = try tmp.dir.statFile(t.io, "state/desk-code", .{});
+    try t.expectEqualStrings("the-new-ones-code", (try wait(t.io, a, home, 5000, 20, .{ .current = &current, .mine = 2 })).?);
+}
+
+test "withdraw_removes_this_programs_request_only" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(a, &tmp);
+    withdraw(t.io, home); // none: nothing to do
+    try request(t.io, home);
+    withdraw(t.io, home);
+    try t.expectError(error.FileNotFound, tmp.dir.statFile(t.io, "state/open-request", .{}));
+    // another copy of the app's
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "state/open-request", .data = "pid 1\n" });
+    withdraw(t.io, home);
+    _ = try tmp.dir.statFile(t.io, "state/open-request", .{});
+}
+
 const LateWriter = struct {
     fn run(dir: Io.Dir) void {
         t.io.sleep(.fromMilliseconds(200), .awake) catch {};
@@ -158,12 +219,14 @@ test "wait_returns_a_code_written_later_and_null_after_the_time" {
     const home = try tmpHome(a, &tmp);
 
     const th = try std.Thread.spawn(.{}, LateWriter.run, .{tmp.dir});
-    const code = try wait(t.io, a, home, 5000, 20);
+    var current: std.atomic.Value(u32) = .init(7);
+    const turn: Turn = .{ .current = &current, .mine = 7 };
+    const code = try wait(t.io, a, home, 5000, 20, turn);
     th.join();
     try t.expectEqualStrings("late-code", code.?);
 
     const started = Io.Clock.awake.now(t.io);
-    try t.expect((try wait(t.io, a, home, 300, 20)) == null);
+    try t.expect((try wait(t.io, a, home, 300, 20, turn)) == null);
     const took = started.durationTo(Io.Clock.awake.now(t.io)).toMilliseconds();
     try t.expect(took >= 280 and took < 2000);
 }

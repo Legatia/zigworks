@@ -43,6 +43,9 @@ void hdesk_ask_key(const char *title, const char *note);
 // an NSSecureTextField, 0 when no sheet is open, -1 in a build without
 // test hooks (which does nothing).
 int hdesk_test_key(int action);
+// Test hooks only (macOS): a real mouse click, down and up, on the page
+// element with this id. Does nothing in a build without test hooks.
+void hdesk_test_click(const char *id);
 
 // A sheet on the window with one OK button.
 void hdesk_alert(const char *title, const char *text);
@@ -63,6 +66,13 @@ void hdesk_min_frame(double *w, double *h);
 // Exported by Zig.
 void hdesk_on_ready(void);
 void hdesk_on_message(const char *json, int main_frame, const char *proto, const char *host, int port);
+// A navigation asked for: HDESK_ALLOW loads it here, HDESK_EXTERNAL has
+// opened the system browser instead, HDESK_CANCEL drops it. `clicked`: 1
+// when the person clicked a link, 0 for a script's own navigation or
+// window.open (which then open nothing outside).
+int hdesk_on_navigate_from(const char *url, int frame, int clicked);
+// The same with every navigation counted as a click: for a layer that
+// doesn't tell them apart yet.
 int hdesk_on_navigate(const char *url, int frame);
 void hdesk_on_response(const char *url, int status, int main_frame);
 void hdesk_on_finish(const char *url);
@@ -71,3 +81,6 @@ int hdesk_on_media(const char *proto, const char *host, int port, int main_frame
 void hdesk_on_menu(int item);
 void hdesk_on_key(const char *buf, int len);
 void hdesk_on_crashed(void);
+// macOS: another start on this data folder asked for the window, and it
+// was shown (Windows and Linux bring it to the front themselves)
+void hdesk_on_reopen(void);

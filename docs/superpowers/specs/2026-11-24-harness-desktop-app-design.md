@@ -153,7 +153,10 @@ what is below.
   looks in the default data folder, unless `harness open` launched it with
   `--home DIR`.
 - At each start, harness writes `state/desk.json` there: its binary's
-  path, the port, the data folder and harness's version.
+  path, the port, the data folder and harness's version. The app takes
+  the port from it and runs its own copy of harness; the binary's path is
+  used only by an app built without one (audit, 2026-11-26: a file in the
+  data folder must not choose the program the app runs).
 - Before harness has ever been set up, the app sets it up itself (see
   "First run, and the desk alone").
 
@@ -171,8 +174,9 @@ what is below.
   - `{"reenter": true}`: the session ended (harness restarted), so enter
     again.
 - **Liveness:** while disconnected, the app checks every 5 s that harness
-  answers on its port (`GET /alive`: no data, just 200). It enters as soon
-  as harness does.
+  answers on its port (`GET /alive`: a 200 and the word `harness`,
+  nothing else; another program on the port isn't taken for harness). It
+  enters as soon as harness does.
 
 **Getting in (one-time code, a session cookie, nothing reusable on disk):**
 
@@ -213,8 +217,10 @@ token path as today.
 
 **The web view is configured as an app:**
 
-- no navigation away from `127.0.0.1:PORT`; other links open in the system
-  browser;
+- no navigation away from `127.0.0.1:PORT`. A link to elsewhere that the
+  owner clicked with the mouse opens in the system browser; any other
+  navigation away (a script's, a redirect's, a frame's) is refused and
+  opens nothing;
 - media plays without a click;
 - the app answers the page's microphone request for this origin only:
   - macOS: `requestMediaCapturePermissionFor…`, plus
@@ -306,7 +312,11 @@ release.
 - **Presses:** a press in the desk answers an inbox item through
   `answerItem(…, via .bar)`, the shell's path, keeping the shell's 0.5 s
   click guard.
-- **Voice input:** the mic button shows only when `[voice]` is set.
+- **Voice input:** the mic button ("Record a message"; "Stop recording"
+  while it records) shows only when `[voice]` is set. Under the message
+  box, inline while the button shows: "Recordings are sent to NAME (HOST)
+  to be transcribed." (harness's settings give the provider and its
+  host; Speak replies names its provider's host the same way).
   1. It records in the page (MediaRecorder); the desk app grants the
      microphone for this origin only.
   2. It posts the audio to a shell path (up to 10 MB, a larger body cap
@@ -386,6 +396,12 @@ The card reads, for example:
 
 When it's resting, the card shows the next thing coming, from the
 cards. "See the work" opens the Work topic's latest post.
+
+The card's other lines are plain counts and labels (2026-11-26): "1 open
+item" / "N open items", "1 urgent item" / "N urgent items", "Urgent alert
+open", "Quiet until HH:MM", and "No open items" at rest; Needs you, when
+empty, says "No open items" too. When the chosen avatar can't be loaded,
+or is drawn as its portrait only, the stage says why.
 
 ### How the head works
 
@@ -529,13 +545,14 @@ The Avatar settings in the desk:
   to `[desk] avatar` through harness's write-then-reload path, as
   `/persona` does.
 - **Upload a photo,** JPEG or PNG, up to 10 MB.
-  - **Shown inline beside the button,** because they decide whether the
-    upload works:
+  - **Shown inline beside the button:** "JPEG or PNG, up to 10 MB."
+    (Amended 2026-11-26, the owner after the desk app's audit: what a
+    photo should be is explanation, so it goes behind the "i"; a photo
+    that doesn't fit is refused with the reason. "Works best without
+    glasses." is dropped: the bubble's line on glasses says it.)
+  - **Behind a small "i":**
     - Facing the camera, eyes open, mouth closed.
     - One face, head and shoulders, wider than tall.
-    - Works best without glasses.
-    - JPEG or PNG, up to 10 MB.
-  - **Behind a small "i":**
     - The photo is fitted onto a 3D head and becomes the whole scene: its
       background, hair, shoulders and lighting.
     - These are refused, with the reason: a face turned more than about
@@ -554,8 +571,8 @@ The Avatar settings in the desk:
 - **Fitting runs at once,** taking a few seconds, and the head goes live.
   While it runs, the still breathes.
 - **"Add an eyes-closed version"** takes a second photo.
-  - Inline: "Recommended: the avatar rests with its eyes closed."
-  - Behind an "i":
+  - Behind an "i" (all of it, since 2026-11-26):
+    - Recommended: the avatar rests with its eyes closed.
     - Make one with an image tool: ask it to close the eyes and change
       nothing else. It's one image edit, not a video.
     - It must line up with the first photo, and the desk checks this.
@@ -684,7 +701,10 @@ From the mockup:
   `Origin: null`.
 - **Names:**
   - the app is `harness-desk` ("harness" in the Dock), and `harness open`
-    starts it or brings it to the front;
+    starts it or brings it to the front, on the data folder harness was
+    given: one window a data folder on each system (a second start on a
+    folder shows the first's window and ends; another folder is another
+    window);
   - the page is at `/desk`;
   - code names must not clash with core's `desk`, `appDesk` or `wfDesk`;
   - `desk` joins `apps.reserved`.
@@ -782,8 +802,8 @@ This section closes them. It is my call throughout, not the owner's (see
   (`Contents/MacOS/harness`) and the fit files
   (`Contents/Resources/desk-assets/`). The Windows and Linux packages
   hold the same, beside the app's program.
-- **Finding harness:** the binary `state/desk.json` names, when it is
-  there. Otherwise the app's own copy.
+- **Finding harness:** the app's own copy. The binary `state/desk.json`
+  names is used only by an app built without one.
 - **No config.ini in the data folder:** the app shows its own screen,
   "Set up", instead of "Set up harness first":
   - Provider: Anthropic, OpenAI, OpenRouter, opencode, omnigate, or
@@ -818,8 +838,11 @@ This section closes them. It is my call throughout, not the owner's (see
   `tools/fetch-desk-assets.sh` in the release job, and the base head.
   They are not committed (23 MB), apart from the base head.
 - **harness serves `/desk/assets/…` from the first place that has the
-  file:** the data folder's `desk-assets/`, then `desk-assets/` beside
-  its binary, then `../Resources/desk-assets/` (the app bundle).
+  file:** `desk-assets/` beside its binary, then
+  `../Resources/desk-assets/` (the app bundle), then the data folder's
+  `desk-assets/`. (Amended 2026-11-26: the data folder was first. The
+  fit's script is imported into the desk's own origin, so a file in the
+  data folder must not stand in for a shipped one.)
 - **No avatar** (none chosen, or its pack isn't there): the stage shows a
   plain outline of a head and shoulders, the status card as usual, and
   [Add a portrait], which opens Settings at the avatar part.
@@ -903,7 +926,11 @@ This section closes them. It is my call throughout, not the owner's (see
     ones belonged to the old provider. Otherwise they stay as the owner set
     them.
   - "Provider and key…" asks for the key again when Replace the key is
-    ticked, or when the provider's key is stored under another name.
+    ticked, when the provider's key is stored under another name, or when
+    the Address names another host than the one in use (the stored key was
+    that host's; it isn't sent to a new one unasked). A new port or path on
+    the same host doesn't ask, and neither does a provider set to take no
+    key.
   - A change while harness runs: `harness config set`'s own line ("send
     /reload to use it.") in an alert, then the desk again. The app doesn't
     restart harness, which would end the owner's turn in progress. When

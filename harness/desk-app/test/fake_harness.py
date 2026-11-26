@@ -214,7 +214,7 @@ def handler(fake, other):
             u = urllib.parse.urlsplit(self.path)
             q = urllib.parse.parse_qs(u.query)
             if u.path == "/alive":
-                return self.send(200)
+                return self.send(200, b"harness")
             if u.path == "/enter":
                 code = (q.get("code") or [""])[0]
                 with fake.lock:
