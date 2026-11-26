@@ -510,7 +510,11 @@ test "an_owner_only_file_has_one_entry_of_its_own_windows" {
         errdefer std.debug.print("access list: {s}\n", .{text});
         try t.expect(std.mem.startsWith(u8, text, "D:P"));
         try t.expectEqual(1, std.mem.count(u8, text, "("));
-        try t.expect(std.mem.indexOf(u8, text, "(A;;FA;;;S-1-5-21-") != null or std.mem.indexOf(u8, text, "(A;;FA;;;S-1-12-1-") != null);
+        // (the account is written as its number, S-1-5-21-…, or by a short
+        // name where Windows has one: LA is the built-in Administrator, as
+        // on GitHub's runners. Never a group everyone is in.)
+        try t.expect(std.mem.indexOf(u8, text, "(A;;FA;;;") != null);
+        for ([_][]const u8{ ";;;WD)", ";;;AU)", ";;;BU)", ";;;IU)", ";;;AC)" }) |wide| try t.expect(std.mem.indexOf(u8, text, wide) == null);
         try t.expectEqualStrings(data, try tmp.dir.readFileAlloc(t.io, "code", a, .unlimited));
     }
     // (forward slashes in a full path are taken too)
