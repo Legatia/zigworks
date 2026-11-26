@@ -89,6 +89,14 @@ pub const Request = struct {
 
 const read_buf_len = 64 * 1024;
 const write_buf_len = 32 * 1024;
+/// How much of a request waits unencrypted: one TLS record's worth, never
+/// more. std's `tls.Client` flush (Zig 0.17.1) encrypts as much of what
+/// waits as fits the socket's buffer and forgets the rest; with 32 KB
+/// waiting, a request of 32,725 to 32,768 bytes (head and body) lost its
+/// last bytes, and the server waited for them until it closed. One record
+/// always fits: the flush asks the socket's buffer for a whole record's
+/// room first. (Found with harness against a real model, 2026-11-26.)
+const tls_plain_out_len = tls.max_ciphertext_inner_record_len;
 const body_buf_len = 32 * 1024;
 
 const Conn = struct {
@@ -196,7 +204,7 @@ pub const Client = struct {
                 .entropy = &entropy,
                 .realtime_now = Io.Clock.real.now(c.io),
                 .read_buffer = plain[0..read_buf_len],
-                .write_buffer = plain[read_buf_len..],
+                .write_buffer = plain[read_buf_len..][0..tls_plain_out_len],
                 // HTTP says how long each answer is, so a cut-off one is noticed.
                 .allow_truncation_attacks = true,
             }) catch |e| {
