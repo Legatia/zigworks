@@ -89,7 +89,10 @@ pub fn exchange(gpa: std.mem.Allocator, io: Io, certs: *Certs, up: rules.Upstrea
             .entropy = &entropy,
             .realtime_now = Io.Clock.real.now(io),
             .read_buffer = mem[2 * buf_len ..][0..buf_len],
-            .write_buffer = mem[3 * buf_len ..][0..buf_len],
+            // one TLS record's worth, never more: std's flush (Zig 0.17.1)
+            // encrypts what fits the socket's buffer and forgets the rest,
+            // so a request a few bytes short of a full buffer lost its end
+            .write_buffer = mem[3 * buf_len ..][0..tls.max_ciphertext_inner_record_len],
             // lengths in the answer tell a cut-off one apart
             .allow_truncation_attacks = true,
         }) catch |e| {
