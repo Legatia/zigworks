@@ -14,10 +14,27 @@ pub const private_file: Io.File.Permissions = if (@import("builtin").os.tag == .
 /// tried again for up to 2 s, then the error, the old file kept and no
 /// temporary one left.
 pub fn writeReplace(io: Io, path: []const u8, data: []const u8) !void {
-    return writeReplaceWaiting(io, path, data, 2000);
+    return replace(io, path, data, 2000, false);
 }
 
 pub fn writeReplaceWaiting(io: Io, path: []const u8, data: []const u8, wait_ms: u32) !void {
+    return replace(io, path, data, wait_ms, false);
+}
+
+/// writeReplace for a file nobody but the user may read, wherever its
+/// folder is. On Windows a file otherwise takes its folder's access list:
+/// the user's own under their profile, whatever was set on another drive or
+/// a shared folder. Here the new file gets a list of its own with one
+/// entry, the user, before anything is written to it, and keeps it through
+/// the rename. A volume that keeps no access lists (FAT, some shares) is
+/// written as writeReplace does, as a mode is lost there on other systems;
+/// a volume that keeps them and refuses this one is an error, and nothing
+/// is written.
+pub fn writeReplaceOwnerOnly(io: Io, path: []const u8, data: []const u8) !void {
+    return replace(io, path, data, 2000, true);
+}
+
+fn replace(io: Io, path: []const u8, data: []const u8, wait_ms: u32, owner_only: bool) !void {
     var rnd: [6]u8 = undefined;
     io.random(&rnd);
     var buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -27,6 +44,7 @@ pub fn writeReplaceWaiting(io: Io, path: []const u8, data: []const u8, wait_ms: 
         var f = try cwd.createFile(io, tmp, .{ .exclusive = true, .permissions = private_file });
         defer f.close(io);
         errdefer cwd.deleteFile(io, tmp) catch {};
+        if (owner_only) try ownerOnly(f, tmp);
         try f.writeStreamingAll(io, data);
         try f.sync(io);
     }
@@ -43,6 +61,95 @@ pub fn writeReplaceWaiting(io: Io, path: []const u8, data: []const u8, wait_ms: 
         waited += 50;
     }
 }
+
+/// Windows: gives the open file `f` at `path` an access list of its own
+/// with one entry, the user this program runs as, and none inherited.
+fn ownerOnly(f: Io.File, path: []const u8) !void {
+    if (@import("builtin").os.tag != .windows) return;
+    const w = winacl;
+    var flags: u32 = 0;
+    const told = w.GetVolumeInformationByHandleW(f.handle, null, 0, null, null, &flags, null, 0).toBool();
+    if (told and flags & w.FILE_PERSISTENT_ACLS == 0) return;
+    var buf: [std.os.windows.PATH_MAX_WIDE + 8]u16 = undefined;
+    const p16 = try winPath(&buf, path);
+    var ea = [1]w.EXPLICIT_ACCESS_W{.{
+        .permissions = w.FILE_ALL_ACCESS,
+        .mode = w.SET_ACCESS,
+        .inheritance = 0,
+        .trustee = .{ .form = w.TRUSTEE_IS_NAME, .kind = w.TRUSTEE_IS_USER, .name = @constCast(std.unicode.utf8ToUtf16LeStringLiteral("CURRENT_USER")) },
+    }};
+    var acl: ?*anyopaque = null;
+    if (w.SetEntriesInAclW(1, &ea, null, &acl) != 0) return error.AccessDenied;
+    defer _ = w.LocalFree(acl);
+    if (w.SetNamedSecurityInfoW(p16, w.SE_FILE_OBJECT, w.DACL_SECURITY_INFORMATION | w.PROTECTED_DACL_SECURITY_INFORMATION, null, null, acl, null) != 0) return error.AccessDenied;
+}
+
+/// `path` for Windows' own calls: wide, ended with 0, and a full path
+/// (C:\…) in the form that may be longer than 260 characters.
+fn winPath(buf: []u16, path: []const u8) ![:0]u16 {
+    const full = path.len >= 3 and path[1] == ':' and (path[2] == '\\' or path[2] == '/');
+    if (path.len + 8 > buf.len) return error.NameTooLong;
+    var n: usize = 0;
+    if (full) for ("\\\\?\\") |c| {
+        buf[n] = c;
+        n += 1;
+    };
+    n += std.unicode.wtf8ToWtf16Le(buf[n..], path) catch return error.BadPathName;
+    if (full) for (buf[0..n]) |*c| {
+        if (c.* == '/') c.* = '\\';
+    };
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+/// Windows: the access list of the file at `path` as Windows writes one
+/// (`D:P(A;;FA;;;S-1-5-…)`: protected from the folder's, one entry giving
+/// all access to that account).
+pub fn accessListText(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (@import("builtin").os.tag != .windows) return error.Unsupported;
+    const w = winacl;
+    var buf: [std.os.windows.PATH_MAX_WIDE + 8]u16 = undefined;
+    const p16 = try winPath(&buf, path);
+    var dacl: ?*anyopaque = null;
+    var sd: ?*anyopaque = null;
+    if (w.GetNamedSecurityInfoW(p16, w.SE_FILE_OBJECT, w.DACL_SECURITY_INFORMATION, null, null, &dacl, null, &sd) != 0) return error.AccessDenied;
+    defer _ = w.LocalFree(sd);
+    var text: ?[*:0]u16 = null;
+    if (!w.ConvertSecurityDescriptorToStringSecurityDescriptorW(sd.?, 1, w.DACL_SECURITY_INFORMATION, &text, null).toBool()) return error.Unexpected;
+    defer _ = w.LocalFree(text);
+    return std.unicode.utf16LeToUtf8Alloc(a, std.mem.span(text.?));
+}
+
+const winacl = struct {
+    const windows = std.os.windows;
+    const SE_FILE_OBJECT: c_int = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x4;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x80000000;
+    const FILE_PERSISTENT_ACLS: u32 = 0x8;
+    const FILE_ALL_ACCESS: u32 = 0x1F01FF;
+    const SET_ACCESS: c_int = 2;
+    const TRUSTEE_IS_NAME: c_int = 1;
+    const TRUSTEE_IS_USER: c_int = 1;
+    const TRUSTEE_W = extern struct {
+        multiple: ?*anyopaque = null,
+        multiple_op: c_int = 0,
+        form: c_int,
+        kind: c_int,
+        name: ?*anyopaque,
+    };
+    const EXPLICIT_ACCESS_W = extern struct {
+        permissions: u32,
+        mode: c_int,
+        inheritance: u32,
+        trustee: TRUSTEE_W,
+    };
+    extern "kernel32" fn GetVolumeInformationByHandleW(file: windows.HANDLE, name: ?[*]u16, name_len: u32, serial: ?*u32, max_component: ?*u32, flags: ?*u32, fs: ?[*]u16, fs_len: u32) callconv(.winapi) windows.BOOL;
+    extern "kernel32" fn LocalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "advapi32" fn SetEntriesInAclW(count: u32, entries: [*]EXPLICIT_ACCESS_W, old: ?*anyopaque, new: *?*anyopaque) callconv(.winapi) u32;
+    extern "advapi32" fn SetNamedSecurityInfoW(name: [*:0]u16, kind: c_int, info: u32, owner: ?*anyopaque, group: ?*anyopaque, dacl: ?*anyopaque, sacl: ?*anyopaque) callconv(.winapi) u32;
+    extern "advapi32" fn GetNamedSecurityInfoW(name: [*:0]const u16, kind: c_int, info: u32, owner: ?*?*anyopaque, group: ?*?*anyopaque, dacl: *?*anyopaque, sacl: ?*?*anyopaque, sd: *?*anyopaque) callconv(.winapi) u32;
+    extern "advapi32" fn ConvertSecurityDescriptorToStringSecurityDescriptorW(sd: *anyopaque, rev: u32, info: u32, text: *?[*:0]u16, len: ?*u32) callconv(.winapi) windows.BOOL;
+};
 
 /// One environment variable.
 pub const Var = struct { name: []const u8, value: []const u8 };
@@ -380,6 +487,37 @@ test "a_replaced_file_is_the_old_or_the_new_never_a_part" {
     var n: usize = 0;
     while (try it.next(t.io)) |_| n += 1;
     try t.expectEqual(1, n);
+}
+
+test "an_owner_only_file_has_one_entry_of_its_own_windows" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    // a file written the usual way has what its folder gives it
+    const plain = try std.fs.path.join(a, &.{ dir, "plain" });
+    try writeReplace(t.io, plain, "x");
+    const usual = try accessListText(a, plain);
+    try t.expect(!std.mem.startsWith(u8, usual, "D:P"));
+    // owner only: protected from the folder's list, one entry, all access
+    const path = try std.fs.path.join(a, &.{ dir, "code" });
+    for ([_][]const u8{ "first", "second" }) |data| {
+        try writeReplaceOwnerOnly(t.io, path, data);
+        const text = try accessListText(a, path);
+        errdefer std.debug.print("access list: {s}\n", .{text});
+        try t.expect(std.mem.startsWith(u8, text, "D:P"));
+        try t.expectEqual(1, std.mem.count(u8, text, "("));
+        try t.expect(std.mem.indexOf(u8, text, "(A;;FA;;;S-1-5-21-") != null or std.mem.indexOf(u8, text, "(A;;FA;;;S-1-12-1-") != null);
+        try t.expectEqualStrings(data, try tmp.dir.readFileAlloc(t.io, "code", a, .unlimited));
+    }
+    // (forward slashes in a full path are taken too)
+    const slashed = try a.dupe(u8, path);
+    std.mem.replaceScalar(u8, slashed, '\\', '/');
+    try writeReplaceOwnerOnly(t.io, slashed, "third");
+    try t.expect(std.mem.startsWith(u8, try accessListText(a, path), "D:P"));
 }
 
 test "a_replace_waits_for_a_program_that_holds_the_file_windows" {

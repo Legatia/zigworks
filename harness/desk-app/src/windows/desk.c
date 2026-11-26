@@ -473,11 +473,19 @@ static void decide_permission(ICoreWebView2PermissionRequestedEventArgs *args, i
     }
 }
 
-// Set when a frame was made whose own requests this runtime can't hand to
-// on_frame_permission (no ICoreWebView2Frame3): they then arrive at the
-// window's handler looking like the desk page's, so from then on nobody is
-// given the microphone.
+// Set when a frame was made whose own messages or requests this runtime
+// can't hand to on_frame_message and on_frame_permission (no
+// ICoreWebView2Frame2 or Frame3): they would arrive at the window's
+// handlers looking like the desk page's. Nobody is given the microphone
+// from then on, and the app says the runtime is too old and ends
+// (frame_too_old).
 static int frames_untold;
+static void no_web_view(const wchar_t *why);
+static const wchar_t too_old[] = L"is too old for harness here";
+static void frame_too_old(void *unused) {
+    (void)unused;
+    no_web_view(too_old);
+}
 
 static HRESULT STDMETHODCALLTYPE on_permission(void *self, ICoreWebView2 *sender, ICoreWebView2PermissionRequestedEventArgs *args) {
     (void)self;
@@ -504,19 +512,27 @@ static HRESULT STDMETHODCALLTYPE on_frame_created(void *self, ICoreWebView2 *sen
     ICoreWebView2Frame *frame = NULL;
     if (FAILED(ICoreWebView2FrameCreatedEventArgs_get_Frame(args, &frame)) || !frame) return S_OK;
     EventRegistrationToken tok;
+    int untold = 0;
     ICoreWebView2Frame2 *f2 = NULL;
     if (SUCCEEDED(ICoreWebView2Frame_QueryInterface(frame, &IID_ICoreWebView2Frame2, (void **)&f2)) && f2) {
         ICoreWebView2Frame2_add_WebMessageReceived(f2, (ICoreWebView2FrameWebMessageReceivedEventHandler *)&frame_message, &tok);
         ICoreWebView2Frame2_Release(f2);
+    } else {
+        untold = 1;
     }
     ICoreWebView2Frame3 *f3 = NULL;
     if (SUCCEEDED(ICoreWebView2Frame_QueryInterface(frame, &IID_ICoreWebView2Frame3, (void **)&f3)) && f3) {
         ICoreWebView2Frame3_add_PermissionRequested(f3, (ICoreWebView2FramePermissionRequestedEventHandler *)&frame_permission, &tok);
         ICoreWebView2Frame3_Release(f3);
     } else {
-        frames_untold = 1;
+        untold = 1;
     }
     ICoreWebView2Frame_Release(frame);
+    // (said from the message loop, once: the box runs a loop of its own)
+    if (untold && !frames_untold) {
+        frames_untold = 1;
+        hdesk_post_main(frame_too_old, NULL);
+    }
     return S_OK;
 }
 HANDLER(frame_created, ICoreWebView2FrameCreatedEventHandler, on_frame_created);
@@ -562,6 +578,75 @@ static HRESULT STDMETHODCALLTYPE on_key(void *self, ICoreWebView2Controller *sen
 }
 HANDLER(key, ICoreWebView2AcceleratorKeyPressedEventHandler, on_key);
 
+// ---- a script's alert, confirm and prompt ----
+// The desk page's own alert and confirm are shown, in a box of Windows'
+// own under a line that says whose words they are. A framed page's are
+// dropped: alert returns, confirm answers no. prompt answers nothing for
+// either (as on macOS). Leaving a page is never held up by its script.
+
+typedef struct dialog_job {
+    ICoreWebView2ScriptDialogOpeningEventArgs *args;
+    ICoreWebView2Deferral *deferral;
+    wchar_t *text;
+    int confirm;
+} dialog_job;
+
+// From the message loop, not from inside the event: the box runs a loop of
+// its own (hdesk_alert says the same).
+static void show_dialog(void *arg) {
+    dialog_job *j = (dialog_job *)arg;
+    int yes = 1;
+#ifndef HDESK_TEST_HOOKS
+    yes = MessageBoxW(hwnd, j->text ? j->text : L"", j->confirm ? L"Question from the page" : L"Message from the page",
+                      j->confirm ? MB_OKCANCEL | MB_ICONQUESTION : MB_OK | MB_ICONINFORMATION) == IDOK;
+#endif
+    // (a test build shows no box and answers yes: nobody is there to)
+    if (yes) ICoreWebView2ScriptDialogOpeningEventArgs_Accept(j->args);
+    ICoreWebView2Deferral_Complete(j->deferral);
+    ICoreWebView2Deferral_Release(j->deferral);
+    ICoreWebView2ScriptDialogOpeningEventArgs_Release(j->args);
+    free_co(j->text);
+    free(j);
+}
+
+static HRESULT STDMETHODCALLTYPE on_script_dialog(void *self, ICoreWebView2 *sender, ICoreWebView2ScriptDialogOpeningEventArgs *args) {
+    (void)self;
+    COREWEBVIEW2_SCRIPT_DIALOG_KIND kind = COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT;
+    ICoreWebView2ScriptDialogOpeningEventArgs_get_Kind(args, &kind);
+    if (kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD) {
+        ICoreWebView2ScriptDialogOpeningEventArgs_Accept(args);
+        return S_OK;
+    }
+    // the desk page's own: the page that asks is the one the window shows
+    wchar_t *wuri = NULL, *wtop = NULL;
+    ICoreWebView2ScriptDialogOpeningEventArgs_get_Uri(args, &wuri);
+    ICoreWebView2_get_Source(sender, &wtop);
+    int desk = wuri && wtop && wcscmp(wuri, wtop) == 0;
+    free_co(wuri);
+    free_co(wtop);
+    char what[32];
+    snprintf(what, sizeof what, "%s %s",
+             kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT ? "alert" : kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM ? "confirm" : "prompt",
+             desk ? "desk" : "frame");
+    hdesk_on_native(what);
+    if (!desk || kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT) return S_OK;
+    dialog_job *j = (dialog_job *)calloc(1, sizeof *j);
+    if (!j) return S_OK;
+    if (FAILED(ICoreWebView2ScriptDialogOpeningEventArgs_GetDeferral(args, &j->deferral)) || !j->deferral) {
+        free(j);
+        return S_OK;
+    }
+    ICoreWebView2ScriptDialogOpeningEventArgs_get_Message(args, &j->text);
+    j->confirm = kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM;
+    j->args = args;
+    ICoreWebView2ScriptDialogOpeningEventArgs_AddRef(args);
+    // (hdesk_post_main can't say that it failed; at exit only, and then the
+    // page waiting on its answer goes with the process)
+    hdesk_post_main(show_dialog, j);
+    return S_OK;
+}
+HANDLER(script_dialog, ICoreWebView2ScriptDialogOpeningEventHandler, on_script_dialog);
+
 static void fit(void) {
     if (!ctl || !hwnd) return;
     RECT r;
@@ -569,7 +654,24 @@ static void fit(void) {
     ICoreWebView2Controller_put_Bounds(ctl, r);
 }
 
+#ifdef HDESK_TEST_HOOKS
+static int pretend_old(void) { return GetEnvironmentVariableW(L"HDESK_TEST_OLD_RUNTIME", NULL, 0) > 0; }
+#endif
+
 static void no_web_view(const wchar_t *why) {
+    char *said = utf8(why);
+    char note[160];
+    snprintf(note, sizeof note, "no web view: it %s", said ? said : "");
+    free(said);
+    hdesk_on_native(note);
+#ifdef HDESK_TEST_HOOKS
+    // (no box for the test that pretends: nobody is there to answer it)
+    if (pretend_old()) {
+        exit_code = 1;
+        PostQuitMessage(1);
+        return;
+    }
+#endif
     wchar_t text[600];
     _snwprintf(text, 600, L"harness shows its window through Microsoft's WebView2 Runtime, and it %ls.\n\nOpen Microsoft's page to install it?", why);
     text[599] = 0;
@@ -608,6 +710,9 @@ static HRESULT STDMETHODCALLTYPE on_controller(void *self, HRESULT result, ICore
         // the web view's own menu (Print, Save as, Open link in new window)
         // isn't the desk's
         ICoreWebView2Settings_put_AreDefaultContextMenusEnabled(settings, FALSE);
+        // alert, confirm and prompt are answered in on_script_dialog, not
+        // by the web view's own boxes
+        ICoreWebView2Settings_put_AreDefaultScriptDialogsEnabled(settings, FALSE);
         ICoreWebView2Settings2 *s2 = NULL;
         if (SUCCEEDED(ICoreWebView2Settings_QueryInterface(settings, &IID_ICoreWebView2Settings2, (void **)&s2)) && s2) {
             wchar_t *ua = NULL;
@@ -640,14 +745,23 @@ static HRESULT STDMETHODCALLTYPE on_controller(void *self, HRESULT result, ICore
     ICoreWebView2_add_WebMessageReceived(web, (ICoreWebView2WebMessageReceivedEventHandler *)&message, &tok);
     ICoreWebView2_add_PermissionRequested(web, (ICoreWebView2PermissionRequestedEventHandler *)&permission, &tok);
     ICoreWebView2_add_ProcessFailed(web, (ICoreWebView2ProcessFailedEventHandler *)&process_failed, &tok);
+    ICoreWebView2_add_ScriptDialogOpening(web, (ICoreWebView2ScriptDialogOpeningEventHandler *)&script_dialog, &tok);
     // Refusing downloads and telling a framed page from the desk's both
     // need ICoreWebView2_4. A runtime without it (an old fixed one: the
     // oldest the loader accepts, oldest_runtime, is older than this
     // interface) would let downloads through and hear a frame as the desk
     // page, so the app doesn't run on it.
     ICoreWebView2_4 *w4 = NULL;
-    if (FAILED(ICoreWebView2_QueryInterface(web, &IID_ICoreWebView2_4, (void **)&w4)) || !w4) {
-        no_web_view(L"is too old for harness here");
+    if (FAILED(ICoreWebView2_QueryInterface(web, &IID_ICoreWebView2_4, (void **)&w4))) w4 = NULL;
+#ifdef HDESK_TEST_HOOKS
+    // (test builds: with HDESK_TEST_OLD_RUNTIME set, a runtime without it)
+    if (w4 && pretend_old()) {
+        ICoreWebView2_4_Release(w4);
+        w4 = NULL;
+    }
+#endif
+    if (!w4) {
+        no_web_view(too_old);
         return S_OK;
     }
     ICoreWebView2_4_add_FrameCreated(w4, (ICoreWebView2FrameCreatedEventHandler *)&frame_created, &tok);
@@ -1170,28 +1284,57 @@ int hdesk_test_key(int action) {
 // The element's place came back ("[x,y]", or "null"): a press and a
 // release there through the browser's own input (the DevTools protocol's
 // Input.dispatchMouseEvent), which the page gets as a person's click.
+static int click_other; // the mouse's other button: what opens a menu
+
+// A menu of the web view's own is a window of its own, of Chromium's class:
+// how many of those are on screen.
+static BOOL CALLBACK count_menus(HWND w, LPARAM n) {
+    wchar_t cls[64];
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid != GetCurrentProcessId() && IsWindowVisible(w) && GetClassNameW(w, cls, 64) > 0 && wcsncmp(cls, L"Chrome_WidgetWin_", 17) == 0 &&
+        (GetWindowLongW(w, GWL_STYLE) & WS_POPUP))
+        (*(int *)n)++;
+    return TRUE;
+}
+static int menus_before;
+static void CALLBACK menus_after(HWND w, UINT msg, UINT_PTR id, DWORD at) {
+    (void)msg;
+    (void)at;
+    KillTimer(w, id);
+    int n = 0;
+    EnumWindows(count_menus, (LPARAM)&n);
+    hdesk_on_native(n > menus_before ? "menu shown" : "menu kept shut");
+}
+
 static HRESULT STDMETHODCALLTYPE on_click_place(void *self, HRESULT result, LPCWSTR json) {
     (void)self;
     double x = 0, y = 0;
     if (FAILED(result) || !json || !web || swscanf(json, L"[%lf,%lf]", &x, &y) != 2) return S_OK;
     static const wchar_t *const kinds[2] = { L"mousePressed", L"mouseReleased" };
+    if (click_other) {
+        menus_before = 0;
+        EnumWindows(count_menus, (LPARAM)&menus_before);
+    }
     for (int i = 0; i < 2; i++) {
         wchar_t params[200];
-        _snwprintf(params, 200, L"{\"type\":\"%ls\",\"x\":%.1f,\"y\":%.1f,\"button\":\"left\",\"buttons\":%d,\"clickCount\":1}", kinds[i], x, y, i == 0 ? 1 : 0);
+        _snwprintf(params, 200, L"{\"type\":\"%ls\",\"x\":%.1f,\"y\":%.1f,\"button\":\"%ls\",\"buttons\":%d,\"clickCount\":1}", kinds[i], x, y,
+                   click_other ? L"right" : L"left", i == 0 ? (click_other ? 2 : 1) : 0);
         params[199] = 0;
         ICoreWebView2_CallDevToolsProtocolMethod(web, L"Input.dispatchMouseEvent", params, (ICoreWebView2CallDevToolsProtocolMethodCompletedHandler *)&cdp_done);
     }
+    // (a menu would be up well within this)
+    if (click_other) SetTimer(hwnd, 9001, 1500, menus_after);
     return S_OK;
 }
 HANDLER(click_place, ICoreWebView2ExecuteScriptCompletedHandler, on_click_place);
-#endif
 
-void hdesk_test_click(const char *element) {
-#ifdef HDESK_TEST_HOOKS
+static void click_at(const char *element, int other) {
     if (!web) return;
     // (an id of letters, digits, - and _ only: it goes into a script)
     for (const char *p = element; *p; p++)
         if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return;
+    click_other = other;
     char js[420];
     snprintf(js, sizeof js, "(function(){var e=document.getElementById('%.80s');if(!e)return null;"
                             "e.scrollIntoView({block:'center'});var r=e.getBoundingClientRect();"
@@ -1200,6 +1343,20 @@ void hdesk_test_click(const char *element) {
     if (!w) return;
     ICoreWebView2_ExecuteScript(web, w, (ICoreWebView2ExecuteScriptCompletedHandler *)&click_place);
     free(w);
+}
+#endif
+
+void hdesk_test_menu_click(const char *element) {
+#ifdef HDESK_TEST_HOOKS
+    click_at(element, 1);
+#else
+    (void)element;
+#endif
+}
+
+void hdesk_test_click(const char *element) {
+#ifdef HDESK_TEST_HOOKS
+    click_at(element, 0);
 #else
     (void)element;
 #endif

@@ -12,7 +12,10 @@
 # DESK_SMOKE_HARNESS=PATH runs the setup once more against that real
 # harness (its own data folder and file store under the smoke's temp folder,
 # HERMES_HOME nowhere, and a provider of its own on a dead local address, so
-# no model is ever called).
+# no model is ever called). DESK_SMOKE_FAKE=PATH with it (the harness-fake
+# built beside that harness) is that provider instead: the first message
+# typed in the desk is answered by it, as a model would, and the request it
+# got carries the model's name and the key from the key window.
 # usage: scripts/smoke-other.sh path/to/harness-desk[.exe] [path/to/fake-harness.exe]
 #        (built by `zig build smoke`)
 # Windows: run it from Git Bash; needs the WebView2 Runtime, and says SKIP
@@ -92,6 +95,7 @@ end_pid() {
 }
 cleanup() {
     [ -n "$APP_PID" ] && kill "$APP_PID" 2> /dev/null
+    [ -n "${MODEL_PID:-}" ] && kill "$MODEL_PID" 2> /dev/null
     [ -f "$HP/fake.pid" ] && end_pid "$(cat "$HP/fake.pid")"
     [ -n "${REAL_HP:-}" ] && [ -f "$REAL_HP/config.ini" ] && "$OWNP" stop --home "$REAL_HOME" > /dev/null 2>&1
     rm -f "$OWNP"
@@ -195,6 +199,17 @@ desk_probe() {
     if wait_count "$TP/log" "\"probe\":{\"$1\"" $((before + 1)) 10; then
         PROBE=$(grep -F "\"probe\":{\"$1\"" "$TP/log" | tail -1)
     fi
+}
+# desk_until NAME JS TEXT [TRIES]: desk_probe until the page's answer holds TEXT
+desk_until() {
+    tries=0
+    while :; do
+        desk_probe "$1" "$2"
+        case $PROBE in *"$3"*) return 0 ;; esac
+        tries=$((tries + 1))
+        [ "$tries" -ge "${4:-40}" ] && return 1
+        sleep 0.5
+    done
 }
 expect_probe() {
     case $PROBE in *"$1"*) ok "$2" ;; *) not_ok "$2 (the page said: ${PROBE:-nothing})" ;; esac
@@ -321,6 +336,27 @@ if [ $OS = windows ]; then
 else
     echo "# WebKitGTK has no speech synthesis: not checked"
 fi
+# what the desk's microphone button needs of the web view
+probe recorder "[typeof MediaRecorder, typeof (navigator.mediaDevices || {}).getUserMedia, typeof MediaRecorder === 'function' && MediaRecorder.isTypeSupported ? ['audio/webm', 'audio/mp4', 'audio/ogg'].filter(function (t) { return MediaRecorder.isTypeSupported(t); }).join(',') : ''].join(' ')"
+echo "# the web view's recorder: $PROBE"
+expect_probe '"function function ' "the page can ask for the microphone and record from it"
+# and a recording comes out of the recorder (of a tone the page makes: no
+# microphone is needed, or asked for). WebKitGTK has no recorder without
+# GStreamer's transcode plugin (gstreamer1.0-plugins-bad, which its package
+# only suggests): the desk then says the microphone isn't available.
+RECORDER=yes
+if [ $OS = linux ] && ! ls /usr/lib/*/gstreamer-1.0/libgsttranscode.so > /dev/null 2>&1; then RECORDER=no; fi
+cmd "js (function () { var say = function (v) { post({probe: {recorded: v}}); }; try { var ac = new AudioContext(), d = ac.createMediaStreamDestination(), o = ac.createOscillator(); o.connect(d); o.start(); var r = new MediaRecorder(d.stream), n = 0; r.ondataavailable = function (e) { n += e.data.size; }; r.onstop = function () { say((n > 0 ? 'bytes ' : 'empty ') + r.mimeType); }; r.onerror = function (e) { say('error ' + (e.error ? e.error.name : '')); }; r.start(); setTimeout(function () { r.stop(); }, 800); } catch (e) { say('threw ' + e.name + ': ' + e.message); } })()"
+if in_log '"probe":{"recorded"' 15; then
+    said=$(grep -F '"probe":{"recorded"' "$TP/log" | tail -1)
+    echo "# the recorder: $said"
+    case $said in
+    *'"recorded":"bytes '*) ok "a recording comes out of the page's recorder" ;;
+    *) if [ $RECORDER = no ]; then echo "# SKIP: a recording comes out of the page's recorder (no gstreamer1.0-plugins-bad here: WebKitGTK has no recorder without it)"; else check 1 "a recording comes out of the page's recorder"; fi ;;
+    esac
+else
+    check 1 "a recording comes out of the page's recorder (it never said)"
+fi
 
 # ---- navigation ----
 cmd "js click('next')"
@@ -387,6 +423,39 @@ if [ "$(count "$TP/log" "run $OWN run ")" = "$runs" ]; then ok "the desk page ca
 cmd "js frame()"
 if in_log 'message other {"badge":77}' 10; then ok "a framed page's message is not the desk's"; else
     if grep -qF 'message desk {"badge":77}' "$TP/log"; then not_ok "a framed page's message is not the desk's"; else echo "# a framed page can't post here at all"; ok "a framed page's message is not the desk's"; fi
+fi
+# nor when the frame first gives itself the window's own address
+cmd "js frameAs()"
+if in_fake "report framedas=" 10; then
+    echo "# the frame rewrote its address to the window's: $(grep -F "report framedas=" "$HP/fake.log" | tail -1 | cut -d= -f2-)"
+    sleep 1
+    if grep -qF 'message desk {"badge":78}' "$TP/log"; then not_ok "a framed page under the window's address is not the desk either"; else ok "a framed page under the window's address is not the desk either"; fi
+else
+    not_ok "a framed page under the window's address is not the desk either (the frame never reported)"
+fi
+
+# ---- what a script may put on screen ----
+# (a test build shows no box, or answers its own: OK each time)
+probe confirmed "confirm('the desk page asks')"
+expect_probe '"confirmed":true' "the desk page's confirm is asked and answered"
+if [ $OS = windows ]; then
+    expect_log "native confirm desk" "the desk page's confirm is known as the desk's"
+    cmd "js frameAsks()"
+    expect_fake "report frameasks=false" "a framed page's confirm is dropped: it answers no"
+    expect_log "native confirm frame" "a framed page's confirm is known as a frame's"
+else
+    # (WebKitGTK doesn't say which frame asks: one rule for all)
+    expect_log "native confirm" "the confirm is the app's own box"
+fi
+probe prompted "prompt('a name?', 'x')"
+expect_probe '"prompted":null' "prompt answers nothing"
+# the web view's own menu stays shut on a click of the other button
+cmd "rclick next"
+expect_log "native menu kept shut" "the web view's own menu is not shown"
+if [ $OS = linux ]; then
+    # a file chooser is the app's own, with its line on what choosing means
+    cmd "click pick"
+    expect_log "native file chooser, with its note" "a file chooser says the page can read the file"
 fi
 
 # ---- reenter ----
@@ -504,19 +573,70 @@ for f in "$TP/log" "$D/app.out" "$HP/fake.log" "$HP/fake-settings.json" "$HP/con
 done
 if [ -z "$leaked" ]; then ok "the key is in no log, output, setting or command line"; else not_ok "the key is in no log, output, setting or command line:$leaked"; fi
 
+# ---- a system the web view can't be trusted on, or can't be sandboxed on ----
+if [ $OS = windows ]; then
+    # a WebView2 Runtime too old to refuse downloads or to tell a framed
+    # page from the desk's (pretended, by a test build): the app says so
+    # and doesn't run
+    HDESK_TEST_OLD_RUNTIME=1
+    export HDESK_TEST_OLD_RUNTIME
+    launch
+    unset HDESK_TEST_OLD_RUNTIME
+    if wait_gone; then ok "a runtime that is too old: the app ends"; else
+        not_ok "a runtime that is too old: the app ends"
+        end_pid "$APP_PID"
+    fi
+    APP_PID=
+    expect_log "native no web view: it is too old for harness here" "and says why" 2
+    if grep -q "^ready" "$TP/log"; then not_ok "and shows no page"; else ok "and shows no page"; fi
+else
+    # bubblewrap that can't make a user namespace, as on a stock Ubuntu
+    # 24.04 (here: a stand-in that fails, first on the PATH): the app runs,
+    # its pages unsandboxed, and says so
+    mkdir -p "$D/no-bwrap"
+    printf '#!/bin/sh\nexit 1\n' > "$D/no-bwrap/bwrap"
+    chmod +x "$D/no-bwrap/bwrap"
+    OLD_PATH=$PATH
+    PATH=$D/no-bwrap:$PATH
+    launch
+    PATH=$OLD_PATH
+    expect_log "sandbox off" "without a working bubblewrap the app says its pages aren't sandboxed" "$START_S"
+    expect_log "finish " "and shows its page all the same" "$START_S"
+    cmd "quit"
+    wait_gone
+    APP_PID=
+fi
+
 # ---- the same setup against a real harness ----
 if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     REAL_HP=$D/real-home
     REAL_HOME=$(native "$REAL_HP")
     cp "$DESK_SMOKE_HARNESS" "$OWNP"
+    # the provider: nothing at all, or the stand-in with one answer ready
+    # (DESK_SMOKE_FAKE: the harness-fake built beside that harness)
+    MODEL_URL=http://127.0.0.1:9/v1
+    MODEL_DIR=$D/model
+    MODEL_SAYS="The stand-in model answers."
+    if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        mkdir -p "$MODEL_DIR/model"
+        printf '{"choices":[{"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}' "$MODEL_SAYS" > "$MODEL_DIR/model/001.json"
+        "$DESK_SMOKE_FAKE" --dir "$(native "$MODEL_DIR")" > "$D/model.out" 2>&1 &
+        MODEL_PID=$!
+        if wait_for "$D/model.out" "port " 10; then
+            MODEL_URL=http://127.0.0.1:$(sed -n 's/^port //p' "$D/model.out" | tr -d '\r')/v1
+            ok "real harness: the stand-in provider is up"
+        else
+            not_ok "real harness: the stand-in provider is up"
+        fi
+    fi
     launch "$REAL_HOME"
     expect_log "show setup" "real harness: the Set up screen" 60
     wait_page 1
-    cmd "js $(js_provider other) $(js_set model smoke-model) $(js_set url http://127.0.0.1:9/v1) $js_continue"
+    cmd "js $(js_provider other) $(js_set model smoke-model) $(js_set url $MODEL_URL) $js_continue"
     expect_log "ask key Key" "real harness: the key is asked for"
     cmd "key fill"
     expect_log "step $OWN init --home $REAL_HOME" "real harness: init"
-    expect_log "step $OWN config set provider other.api openai provider other.url http://127.0.0.1:9/v1 model.provider other model.model smoke-model" "real harness: config set"
+    expect_log "step $OWN config set provider other.api openai provider other.url $MODEL_URL model.provider other model.model smoke-model" "real harness: config set"
     expect_log "store $OWN secret add other --stdin --home $REAL_HOME" "real harness: secret add other --stdin"
     expect_again "stepped ok=1" 3 "real harness: init, config set and the key all succeed"
     expect_log "run $OWN run --home $REAL_HOME" "real harness: harness run is started" 15
@@ -524,8 +644,18 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     expect_log "state in" "real harness: the app is in" 30
     in_log "finish http://127.0.0.1:" 15
     if grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$TP/log"; then ok "real harness: the desk page loads"; else not_ok "real harness: the desk page loads"; fi
-    if [ "$("$OWNP" config get model.provider --home "$REAL_HOME" | tr -d '\r')" = other ] && [ "$("$OWNP" config get "provider other.url" --home "$REAL_HOME" | tr -d '\r')" = http://127.0.0.1:9/v1 ]; then ok "real harness: config.ini has them"; else not_ok "real harness: config.ini has them"; fi
+    if [ "$("$OWNP" config get model.provider --home "$REAL_HOME" | tr -d '\r')" = other ] && [ "$("$OWNP" config get "provider other.url" --home "$REAL_HOME" | tr -d '\r')" = "$MODEL_URL" ]; then ok "real harness: config.ini has them"; else not_ok "real harness: config.ini has them"; fi
     if [ -e "$D/store/other" ]; then ok "real harness: the key is in its store (the smoke's own folder)"; else not_ok "real harness: the key is in its store (the smoke's own folder)"; fi
+    # a message typed in the desk is answered by the model: the stand-in's
+    # one answer, asked for by the model's name with the key from the sheet
+    if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        cmd "js document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
+        desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60
+        expect_probe "$MODEL_SAYS" "real harness: a message typed in the desk is answered by the model"
+        r=$MODEL_DIR/requests/001.json
+        if grep -qF '"target":"/v1/chat/completions"' "$r" 2> /dev/null && grep -qF '"model":"smoke-model"' "$r" && grep -qF 'Are you the model?' "$r"; then ok "real harness: the provider was asked for smoke-model with the message"; else not_ok "real harness: the provider was asked for smoke-model with the message"; fi
+        if grep -qF "Bearer $FAKE_KEY" "$r" 2> /dev/null; then ok "real harness: with the key from the sheet"; else not_ok "real harness: with the key from the sheet"; fi
+    fi
     # the conversation at its tallest: the message field is still inside the
     # window, at the size the app opens at and at its smallest
     tries=0

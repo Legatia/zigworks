@@ -2162,7 +2162,9 @@ its own copy of harness, not the binary named there.)
 
 **Getting in.** The app writes `state/open-request`; harness answers with a
 one-time code in `state/desk-code`, good for 60 s and once, readable only
-by you, deleted when it's used or runs out. The app opens
+by you (on Windows the file gets an access list of its own, with you as
+its one entry, wherever the data folder is), deleted when it's used or
+runs out. The app opens
 `/enter?code=…`, and harness answers with a session cookie (HttpOnly,
 SameSite=Strict, no expiry) that it keeps in memory only: a restart of
 harness ends every session, and the app enters again on its own. Nothing
@@ -4190,7 +4192,8 @@ web view itself is Microsoft's WebView2 Runtime, which Windows 11 has and
 most Windows 10 machines too; where it is missing the app says so and
 offers Microsoft's page to install it. It does the same with a runtime
 too old to refuse a download or to tell a page shown inside the desk
-from the desk itself: the app doesn't run on one.
+from the desk itself: the app doesn't run on one (part of that shows only
+when the desk first frames an app: the app says it then, and ends).
 
 **The key.** [Continue] asks for it in a small window of Windows' own,
 over the app's: a password field, Save and Cancel. It is not in the web
@@ -4211,6 +4214,16 @@ ends the app, and harness keeps running. Reload is Ctrl+R or F5. The web
 view runs InPrivate, so no cookie or storage outlives the app; its own
 working folder is `desk-webview` in the data folder, which also holds the
 window's place. An urgent item flashes the taskbar button.
+
+**What a page may put on screen.** The desk page's `alert` and `confirm`
+come in a box of Windows' own, headed "Message from the page" or
+"Question from the page". An app shown inside the desk gets no box: its
+`alert` returns and its `confirm` answers no. `prompt` answers nothing,
+and a page can't hold you with a "leave this page?" question. The web
+view's own right-click menu (Print, Save as) is off. The file chooser is
+the web view's own: WebView2 gives the app no say in it, so it carries
+no line of the app's, where macOS and Linux say that the page can read
+the file you choose.
 
 **Building it.** In `desk-app/`, with Microsoft's NuGet package
 Microsoft.Web.WebView2 for the header and the loader (pinned by version
@@ -4269,8 +4282,14 @@ never the browser's own voice. And WebKitGTK doesn't tell the app which
 frame of a page is navigating: a link you click to another site opens in
 your browser from an app shown inside the desk too, where on macOS and
 Windows it goes nowhere; what a script does by itself goes nowhere, as
-everywhere. On Wayland the window's size is remembered and its place is
-the desktop's to choose.
+everywhere. Nor does it say which frame shows a message or asks for a
+file. So `alert` and `confirm` come under "Message from the page" or
+"Question from the page" whoever asked (the desk frames its apps so that
+theirs are not shown at all), `prompt` answers nothing, and the file
+chooser says "A page on the desk asks for a file. It can read the file
+you choose." for the desk page too. The web view's own right-click menu
+is off. On Wayland the window's size is remembered and its place is the
+desktop's to choose.
 
 **Building it.** In `desk-app/`, with `libgtk-3-dev` and
 `libwebkit2gtk-4.1-dev` (found through pkg-config):

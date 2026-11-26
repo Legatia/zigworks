@@ -102,7 +102,9 @@ pub fn run(arena: Allocator, gpa: Allocator, opts: Options, steps: []const Step,
         switch (step) {
             .send => |s| {
                 // Keys sent before the program has drawn anything can be lost
-                // or misread, so let its first output settle (at most 2 s).
+                // or misread, so let its first output settle (at most 2 s
+                // here, and `send` holds them up to 2 s more; when that
+                // ends with nothing printed, send's answer says so).
                 if (!waited_before_send) {
                     _ = try session(arena, caller, opts, &.{ "wait", "--settle", "150", "--timeout", "2000" });
                     waited_before_send = true;

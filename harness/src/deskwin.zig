@@ -33,12 +33,13 @@ pub const Codes = struct {
         defer c.mutex.unlock(io);
         c.live = false;
         // whole: a temporary file made new (its mode is ours from the
-        // start), then renamed into place, so the app never reads half of
-        // it; on Windows, waited on (up to 2 s) while a reader holds the old
+        // start; on Windows an access list of its own, the user alone),
+        // then renamed into place, so the app never reads half of it; on
+        // Windows, waited on (up to 2 s) while a reader holds the old
         var line: [23]u8 = undefined;
         @memcpy(line[0..22], &code);
         line[22] = '\n';
-        try util.writeReplace(io, path, &line);
+        try util.writeReplaceOwnerOnly(io, path, &line);
         c.code = code;
         c.issued_ms = now_ms;
         c.live = true;
@@ -591,6 +592,11 @@ test "a_code_works_once_and_expires" {
     if (@import("builtin").os.tag != .windows) {
         const st = try tmp.dir.statFile(t.io, "desk-code", .{});
         try t.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode() & 0o777)));
+    } else {
+        // Windows: a list of its own (not the folder's), with one entry
+        const list = try util.accessListText(a, path);
+        try t.expect(std.mem.startsWith(u8, list, "D:P"));
+        try t.expectEqual(1, std.mem.count(u8, list, "("));
     }
     // a wrong code of the right length, and one of another length: no
     var wrong = code;

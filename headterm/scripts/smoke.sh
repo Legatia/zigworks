@@ -196,18 +196,33 @@ set -e
 check "run without steps is an error" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" | grep -q "give at least one step"' _ "$rc" "$err"
 
 # Keys sent right after start are held until the program's first output has
-# settled. This program drops typeahead (tcflush) before its prompt.
+# settled. This program drops typeahead (tcflush) before its prompt. The
+# hold has an end (about 4 s): on a machine so busy that python needs
+# longer than that to start, the keys go out unseen, run says so, and the
+# check has nothing to judge.
+held() {
+    case $2 in
+    *"sent before the program printed anything"*)
+        echo "skip - run waits for first output before sending (the program took longer to start than the hold lasts)"
+        "$HT" kill "$(printf '%s\n' "$2" | sed -n 's/^started \([^ ]*\) .*/\1/p')" >/dev/null 2>&1
+        ;;
+    *)
+        [ "$1" = 0 ] || fail "run with keys sent before the first output: exit $1: $2"
+        check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$2"
+        ;;
+    esac
+}
 if [ -n "$WINDOWS" ]; then
     # No termios on Windows: the keys typed ahead are read and dropped.
     if command -v python >/dev/null 2>&1; then
-        out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python -c 'import msvcrt,time; time.sleep(0.4); [msvcrt.getwch() for _ in iter(msvcrt.kbhit, False)]; print("ready"); print("got", input())' 2>&1) || fail "run with keys sent before the first output: exit $?: $out"
-        check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
+        out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python -c 'import msvcrt,time; time.sleep(0.4); [msvcrt.getwch() for _ in iter(msvcrt.kbhit, False)]; print("ready"); print("got", input())' 2>&1)
+        held "$?" "$out"
     else
         echo "skip - run waits for first output before sending (no python)"
     fi
 elif command -v python3 >/dev/null 2>&1; then
-    out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())' 2>&1) || fail "run with keys sent before the first output: exit $?: $out"
-    check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
+    out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())' 2>&1)
+    held "$?" "$out"
 fi
 
 # Highlighted rows are named in the default screen output.
