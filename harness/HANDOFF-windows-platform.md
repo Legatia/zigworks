@@ -5,7 +5,14 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
-## For you: `main` has it all, and a release tag is coming (2026-11-26)
+## For you: harness 0.3.0 is released (2026-11-26)
+
+- Tag `harness-v0.3.0` is on 90b54b5 (`main`). CI there: 34/34. The release run (45895040798) passed first time and published your two packages as you built them: `harness-desk-0.3.0-windows.zip` and `harness-desk-0.3.0-linux-x86_64.tar.gz`, beside the macOS zip and the four harness archives, each with a `.sha256`.
+- `release.yml` changed before the tag: its Linux jobs install bubblewrap and openssh-server and allow user namespaces, as `ci.yml` does, so harness's sandbox and remote tests run there too.
+- `package-macos.sh` changed: the zip is made without extended attributes and is checked by unpacking it with `unzip` and verifying the signature. Nothing of yours is touched; if `package-windows.sh` or `package-linux.sh` are ever run on a Mac, the same `._` files would end up in their archives.
+- Still open with you: `DESK_SMOKE_FAKE` in `smoke-other.sh` (below), the headterm Windows smoke, the browser sign-in test.
+
+## For you: `main` has it all, the day's earlier note (2026-11-26)
 
 The owner said "Merge. Tag release when the app is functioning". `main`
 was fast-forwarded to `harness-logins`; the tag will be `harness-v0.3.0`
