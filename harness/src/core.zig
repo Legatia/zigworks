@@ -17623,22 +17623,29 @@ const Recorder = struct {
         try r.ents.append(t.allocator, .{ .line = r.lines.items.len - 1, .desc = try d.toOwnedSlice(t.allocator) });
     }
 
+    // A line and its entities are recorded under one hold of the mutex: a
+    // test that has seen the line can ask for its entities at once, and no
+    // other line can come between the two.
     fn rich(ctx: *anyopaque, place: Place, text: []const u8, ents: []const topics_mod.Entity) anyerror!Sent {
-        const sent = try send(ctx, place, text);
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
+        const sent = try r.sendLocked(place, text);
         try r.noteEnts(text, ents);
         return sent;
     }
 
     fn buttonsRich(ctx: *anyopaque, place: Place, text: []const u8, ents: []const topics_mod.Entity, bs: []const [2][]const u8) ?i64 {
-        const id = buttons(ctx, place, text, bs) orelse return null;
         const r: *Recorder = @ptrCast(@alignCast(ctx));
-        r.mutex.lockUncancelable(t.io);
-        defer r.mutex.unlock(t.io);
-        r.noteEnts(text, ents) catch {};
-        return id;
+        const shown = blk: {
+            r.mutex.lockUncancelable(t.io);
+            defer r.mutex.unlock(t.io);
+            const b = r.buttonsLocked(place, text, bs) orelse return null;
+            r.noteEnts(text, ents) catch {};
+            break :blk b;
+        };
+        if (r.early) |e| e.press(e.ctx, &shown);
+        return shown.msg;
     }
 
     /// A card's new text, as "EDIT <id>: <text>"; a gone message fails.
@@ -17812,6 +17819,11 @@ const Recorder = struct {
         const r: *Recorder = @ptrCast(@alignCast(ctx));
         r.mutex.lockUncancelable(t.io);
         defer r.mutex.unlock(t.io);
+        return r.sendLocked(place, text);
+    }
+
+    /// `send`, under the mutex.
+    fn sendLocked(r: *Recorder, place: Place, text: []const u8) anyerror!Sent {
         if (r.fail) |e| return e;
         if (r.threads_fail and place.thread != 0) return error.TopicRefused;
         const held = if (r.probe) |m| blk: {
@@ -17829,20 +17841,25 @@ const Recorder = struct {
         const shown = blk: {
             r.mutex.lockUncancelable(t.io);
             defer r.mutex.unlock(t.io);
-            if (r.buttons_fail) return null;
-            const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
-            r.note(place, line) catch {};
-            r.next_id += 1;
-            r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4), .line = r.lines.items.len - 1 };
-            for (bs[0..r.last.n], 0..) |b, i| {
-                r.last.len[i] = @min(b[1].len, 64);
-                @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
-            }
-            r.asked.append(t.allocator, r.last) catch {};
-            break :blk r.last;
+            break :blk r.buttonsLocked(place, text, bs) orelse return null;
         };
         if (r.early) |e| e.press(e.ctx, &shown);
         return shown.msg;
+    }
+
+    /// Records a message with buttons (under the mutex); null: refused.
+    fn buttonsLocked(r: *Recorder, place: Place, text: []const u8, bs: []const [2][]const u8) ?Buttons {
+        if (r.buttons_fail) return null;
+        const line = std.fmt.allocPrint(t.allocator, "BUTTONS {s} [{s}]", .{ text, bs[0][1] }) catch return null;
+        r.note(place, line) catch {};
+        r.next_id += 1;
+        r.last = .{ .msg = r.next_id, .n = @min(bs.len, 4), .line = r.lines.items.len - 1 };
+        for (bs[0..r.last.n], 0..) |b, i| {
+            r.last.len[i] = @min(b[1].len, 64);
+            @memcpy(r.last.buf[i][0..r.last.len[i]], b[1][0..r.last.len[i]]);
+        }
+        r.asked.append(t.allocator, r.last) catch {};
+        return r.last;
     }
 
     fn clear(ctx: *anyopaque, place: Place, id: i64) void {
