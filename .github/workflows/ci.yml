@@ -104,9 +104,14 @@ jobs:
           set -o pipefail
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
       - run: zig build test -Doptimize=ReleaseSafe
-      # the fit files are left out here: no network, and the base head may
-      # not be in the repository yet (the release packs them, strictly)
-      - run: DESK_ASSETS=none scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
+      # the fit files as a release packs them: MediaPipe's fetched at their
+      # pinned SHA-256s and the base head from the repository, so a moved
+      # download or a changed hash shows here and not first on a tag; then
+      # the package made from that folder, copied by name (the pack and copy
+      # scripts' own checks first, with no network)
+      - run: sh ../scripts/test-desk-assets.sh
+      - run: sh ../scripts/pack-desk-assets.sh "$RUNNER_TEMP/desk-assets"
+      - run: DESK_ASSETS="$RUNNER_TEMP/desk-assets" scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
       # the smoke's setup runs once against the stand-in and once against
       # this harness (a data folder and secrets of its own, no model called)
       - run: |
@@ -139,8 +144,10 @@ jobs:
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
       - run: zig build test -Doptimize=ReleaseSafe
       - run: scripts/fetch-webview2.sh "$RUNNER_TEMP/webview2"
-      # (no fit files, as the macOS job: nothing is fetched for them here)
-      - run: DESK_ASSETS=none scripts/package-windows.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-windows.zip" "$RUNNER_TEMP/webview2"
+      # (the fit files as a release packs them, as the macOS job)
+      - run: sh ../scripts/test-desk-assets.sh
+      - run: sh ../scripts/pack-desk-assets.sh "$RUNNER_TEMP/desk-assets"
+      - run: DESK_ASSETS="$RUNNER_TEMP/desk-assets" scripts/package-windows.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-windows.zip" "$RUNNER_TEMP/webview2"
       # the web view itself is Windows' own, from Microsoft: installed here
       # when the runner's image lacks it (the smoke says SKIP without it)
       - name: WebView2 Runtime, where the runner has none
@@ -184,8 +191,10 @@ jobs:
           set -o pipefail
           zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
       - run: zig build test -Doptimize=ReleaseSafe
-      # (no fit files, as the macOS job: nothing is fetched for them here)
-      - run: DESK_ASSETS=none scripts/package-linux.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-linux-x86_64.tar.gz"
+      # (the fit files as a release packs them, as the macOS job)
+      - run: sh ../scripts/test-desk-assets.sh
+      - run: sh ../scripts/pack-desk-assets.sh "$RUNNER_TEMP/desk-assets"
+      - run: DESK_ASSETS="$RUNNER_TEMP/desk-assets" scripts/package-linux.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-linux-x86_64.tar.gz"
       - run: |
           set -o pipefail
           GDK_BACKEND=x11 zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"

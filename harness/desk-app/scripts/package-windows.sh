@@ -12,7 +12,9 @@
 #   unset   harness/scripts/pack-desk-assets.sh makes them: MediaPipe's
 #           files fetched at their pinned hashes, and the base head from the
 #           repository. Anything missing fails, with its one line. (Release.)
-#   DIR     a desk-assets folder made already, checked for the same files.
+#   DIR     a desk-assets folder made already: the same files are copied
+#           from it by name (harness/scripts/copy-desk-assets.sh), and
+#           nothing else it holds.
 #   none    left out, and said: for CI and tests, with no network and no
 #           base head. The app then has no fit files; the desk says so.
 # usage: scripts/package-windows.sh VERSION OUT.zip WEBVIEW2_DIR
@@ -39,11 +41,6 @@ fail() {
     exit 1
 }
 
-# what the desk's fit needs (the same list as scripts/package-macos.sh)
-FIT_FILES="mediapipe/vision_bundle.mjs mediapipe/wasm/vision_wasm_internal.js mediapipe/wasm/vision_wasm_internal.wasm
-mediapipe/wasm/vision_wasm_nosimd_internal.js mediapipe/wasm/vision_wasm_nosimd_internal.wasm mediapipe/face_landmarker.task
-base-head.bin LICENSE-mediapipe.txt THIRD-PARTY-mediapipe.txt NOTICE.txt"
-
 # the fit files first: a release without them stops before anything is built
 case ${DESK_ASSETS:-} in
 none) ASSETS= ;;
@@ -54,14 +51,12 @@ none) ASSETS= ;;
     ;;
 *)
     [ -d "$DESK_ASSETS" ] || fail "DESK_ASSETS=$DESK_ASSETS isn't a folder."
-    ASSETS=$DESK_ASSETS
+    # by name, never the folder whole: a working folder may hold other heads
+    # and portraits (its own one line says what is missing)
+    ASSETS=$W/desk-assets
+    sh "$HARNESS/scripts/copy-desk-assets.sh" "$DESK_ASSETS" "$ASSETS" > /dev/null || exit 1
     ;;
 esac
-if [ -n "$ASSETS" ]; then
-    for f in $FIT_FILES; do
-        [ -s "$ASSETS/$f" ] || fail "$f is missing from $ASSETS; nothing was packaged."
-    done
-fi
 
 # shellcheck disable=SC2086
 "$ZIG" build app -Doptimize=ReleaseSafe -Dstrip=true -Dtarget=x86_64-windows-gnu -Dversion="$VERSION" -Dwebview2="$SDK" --prefix "$W/out" ${ZIG_FLAGS:-}

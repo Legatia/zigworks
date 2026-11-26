@@ -5,6 +5,49 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the desk app was audited; what changed and what waits on you (2026-11-26)
+
+The owner asked for an audit of the desk app before it is released. Fixed
+on `harness-logins` (not on `main` yet, nothing tagged):
+
+- **The package scripts copy the fit files by name.** `package-windows.sh`
+  and `package-linux.sh` (and the macOS one) no longer `cp -R` the folder
+  `DESK_ASSETS=DIR` names: `harness/scripts/copy-desk-assets.sh SRC DEST`
+  copies the ten fit files and the `*LICENSE*`/`*NOTICE*` files at the
+  folder's top, and nothing else (a working folder here held a head and
+  portraits that aren't cleared to ship). The `FIT_FILES` list is gone from
+  the three scripts; the copy script checks. If you change what the fit
+  needs, change `pack-desk-assets.sh`, `copy-desk-assets.sh` and
+  `appserver.zig`'s `fit_files` together; `sh scripts/test-desk-assets.sh`
+  (no network) checks the first two.
+- **CI's three desk jobs now pack the fit files as a release does**
+  (`pack-desk-assets.sh`, the pinned fetch) and package with
+  `DESK_ASSETS="$RUNNER_TEMP/desk-assets"`, not `none`. A moved download
+  or a changed hash fails there and not first on a tag.
+- **A new portrait is saved only after the fit takes it** (`desk.js`), and
+  `POST upload?part=still` drops `head.bin`, `eyes.png`, `eyemask.png` and
+  `closed.*` made for the portrait before (`core.zig` `deskUpload`).
+- Settings says where replies would be sent before a speech provider is
+  chosen; the macOS bundle carries harness's `LICENSE`; a quick reply
+  pressed before its buttons were noted is no longer lost (`quickPress`
+  waits up to 2 s; it failed once on the macOS runner).
+
+Found and **held for the owner's word**, in your code, so don't be
+surprised by them and don't fix them without that word either:
+
+- `linux/desk.c`: nothing calls `webkit_web_context_set_sandbox_enabled`,
+  while `ci.yml`'s comment says the web process runs in bubblewrap. Needs
+  one run on stock Ubuntu 24.04 to see what WebKitGTK does by default.
+- An external open (`policy.zig`, `main.zig`, and `mac/desk.m` here) isn't
+  tied to a click: a page can ask for one by itself.
+- `state/desk.json` chooses the program the app starts (`controller.zig`,
+  `setup.zig`).
+- Smaller, Linux and Windows: the microphone decision ignores which frame
+  asked (`linux/desk.c`); default context menus are on; WebView2's stated
+  minimum (86) is older than interfaces the code uses; children inherit
+  handles on Windows; `hdesk_post_main` ignores a failed `PostMessageW`;
+  `release.yml` builds on `ubuntu-latest` while the README promises 24.04.
+
 ## For you: history was rewritten — re-make your branch before you push (2026-11-26)
 
 - The owner asked for their mail address to be taken out of the
