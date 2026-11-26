@@ -90,6 +90,14 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT" "$OUT.sha256"
-ditto -c -k --keepParent "$APP" "$OUT"
+# no extended attributes in the zip (macOS puts com.apple.provenance on
+# what it builds): one kept there comes out of unzip as a ._ file inside
+# the bundle, which breaks the seal. Nothing here is signed through one.
+ditto -c -k --norsrc --noextattr --keepParent "$APP" "$OUT"
+# the zip as unzip unpacks it, not only as Finder does: the same app, its
+# signature whole
+mkdir "$W/unzipped"
+unzip -q "$OUT" -d "$W/unzipped"
+codesign --verify --deep --strict "$W/unzipped/harness-desk.app" || { echo "package-macos: $OUT, unpacked by unzip, isn't the app that was signed" >&2; rm -f "$OUT"; exit 1; }
 (cd "$(dirname "$OUT")" && shasum -a 256 "$(basename "$OUT")" > "$(basename "$OUT").sha256")
 echo "$OUT: harness-desk.app $VERSION (x86_64 arm64), harness $("$APP/Contents/MacOS/harness" version | sed 's/^harness //')"
