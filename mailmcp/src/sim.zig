@@ -246,7 +246,7 @@ pub const Sim = struct {
         _ = try s.newAccount("anna@else.test", "anna-pass", "anna-token", &.{ .{ "INBOX", "" }, .{ "Drafts", "\\Drafts" } });
         const now = s.now_s;
         var d0: [40]u8 = undefined;
-        const date_now = rfcDate(&d0, now - 3600);
+        const date_now = rfcDate(&d0, recentAt(now));
         var d1: [40]u8 = undefined;
         const date_old = rfcDate(&d1, now - 2 * 86400);
         // the bill is due in three days, the owner's day (UTC here)
@@ -282,6 +282,13 @@ const days = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
 const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
 /// "Mon, 23 Nov 2026 09:12:00 +0000".
+/// When the new mail it starts with was sent: an hour ago, and not before
+/// today (UTC) began — the parcel's mail says "today", and a list asked for
+/// in the hour after midnight has to find it.
+fn recentAt(now: i64) i64 {
+    return @max(now - 3600, @divFloor(now, 86400) * 86400);
+}
+
 pub fn rfcDate(buf: *[40]u8, secs: i64) []const u8 {
     const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(secs) };
     const ed = es.getEpochDay();
@@ -950,6 +957,18 @@ fn trustOf(sim: *Sim) !tlsconn.Trust {
     var tr: tlsconn.Trust = .{};
     try tr.addPem(tst.allocator, tst.io, sim.ca_pem);
     return tr;
+}
+
+test "the_new_mail_it_starts_with_is_dated_today_in_the_hour_after_midnight_too" {
+    const day: i64 = 20783 * 86400; // 2026-11-26 00:00 UTC
+    // "delivers today" in the parcel's mail means the day it was sent
+    for ([_]i64{ 0, 1, 107, 3599 }) |into| {
+        const sent = recentAt(day + into);
+        try std.testing.expectEqual(day, @divFloor(sent, 86400) * 86400);
+        try std.testing.expect(sent <= day + into);
+    }
+    try std.testing.expectEqual(day + 3600, recentAt(day + 7200));
+    try std.testing.expectEqual(day + 86399 - 3600, recentAt(day + 86399));
 }
 
 test "imap_logs_in_and_reads_without_marking_anything_seen" {

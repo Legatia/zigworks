@@ -187,6 +187,20 @@ happens; self-hosting and the log support that; a scored run on real past
 cases comes before any feature; a ledger connector is added for overdue
 invoices.
 
+## A business's money (2026-11-26): specced, nothing built
+
+After the fintech research the owner concluded "it's not just for
+fintech, rather a general b2b money tool" and asked for a spec:
+`2026-11-26-harness-money-jobs-design.md`. Four packs on one runtime, in
+the order earn, keep, save: a billing audit (what customers should be
+paying and are not), disputes (from the fintech file), a payment-run
+check (a wrong payment stopped before it leaves, past duplicates found),
+and a bill watch (cloud and AI-model bills). One person uses it through
+the desk app; every pack is read-only first; rules are code. What harness
+lacks for it: findings with amounts and a page for them, file readers,
+connectors for billing, accounting and cloud bills, and any run against a
+real model or provider. Five questions for the owner are at its end.
+
 ## Parked: AI avatar livestreams (owner, 2026-11-24: "not top priority")
 
 Use case: a 24-hour AI avatar livestream that sells or chats.

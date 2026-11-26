@@ -495,6 +495,15 @@ either bridge. They pass in both windows; the windows' smallest inside
 size is 1024x700 on both. CI on 7476686: the three desk app jobs passed;
 mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber` once.
 
+Two specs for the owner since, neither with work for you:
+`docs/superpowers/specs/2026-11-25-harness-fintech-design.md` (revised)
+and `2026-11-26-harness-money-jobs-design.md` (a general tool for a
+business's money: a billing audit, disputes, a payment-run check and a
+bill watch). Both name parts harness would need (findings with amounts
+and a page for them in the desk, PDFs read and written, a record of what
+an approver was shown). Nothing is built, and nothing starts without the
+owner's word.
+
 Things I saw that are yours to decide:
 
 - **The usual models may be behind.** On 2026-11-25 the providers' own
