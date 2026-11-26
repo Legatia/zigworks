@@ -649,9 +649,25 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     # a message typed in the desk is answered by the model: the stand-in's
     # one answer, asked for by the model's name with the key from the sheet
     if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        # (typed once the page shows what was said before: it has its state
+        # and its history then, and is waiting for what comes next)
+        desk_until drawn "document.getElementById('log').children.length > 0" '"drawn":true' 40
         cmd "js document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
-        desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60
-        expect_probe "$MODEL_SAYS" "real harness: a message typed in the desk is answered by the model"
+        if desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 120; then
+            ok "real harness: a message typed in the desk is answered by the model"
+        else
+            not_ok "real harness: a message typed in the desk is answered by the model (the page said: ${PROBE:-nothing})"
+            # what each side has, for whoever reads this failure
+            desk_probe page "[document.getElementById('log').innerText.slice(-400), 'note: ' + document.getElementById('composeNote').textContent, 'field: ' + document.getElementById('msg').value, location.href].join(' || ')"
+            echo "# the page: ${PROBE:-nothing}"
+            echo "# the stand-in provider said: $(tail -3 "$D/model.out" 2> /dev/null | tr '\n' ' ')"
+            echo "# requests it got: $(ls "$MODEL_DIR/requests" 2> /dev/null | tr '\n' ' ')"
+            for f in "$REAL_HP"/log/*; do
+                [ -f "$f" ] || continue
+                echo "# harness's $(basename "$f"):"
+                tail -15 "$f" | cut -c1-300 | sed 's/^/#   /'
+            done
+        fi
         r=$MODEL_DIR/requests/001.json
         if grep -qF '"target":"/v1/chat/completions"' "$r" 2> /dev/null && grep -qF '"model":"smoke-model"' "$r" && grep -qF 'Are you the model?' "$r"; then ok "real harness: the provider was asked for smoke-model with the message"; else not_ok "real harness: the provider was asked for smoke-model with the message"; fi
         if grep -qF "Bearer $FAKE_KEY" "$r" 2> /dev/null; then ok "real harness: with the key from the sheet"; else not_ok "real harness: with the key from the sheet"; fi

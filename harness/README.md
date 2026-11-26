@@ -4276,6 +4276,12 @@ as installed, so this may be your case: `bwrap --unshare-user
 until the next restart: `sudo sysctl -w
 kernel.apparmor_restrict_unprivileged_userns=0`.
 
+**The microphone.** Recording a message needs GStreamer's "bad" plugin
+set, which Ubuntu's WebKitGTK package only suggests: `sudo apt install
+gstreamer1.0-plugins-bad`. Without it the web view has no recorder, and
+the microphone button says "The microphone isn't available." Hearing
+replies needs nothing more than WebKitGTK brings.
+
 **What Linux doesn't have.** WebKitGTK has no speech synthesis, so the
 desk speaks only through a provider (`speak =` a provider, or off),
 never the browser's own voice. And WebKitGTK doesn't tell the app which
