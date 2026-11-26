@@ -182,10 +182,19 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
-      # WebKitGTK starts its web process in a bubblewrap sandbox, which needs
-      # user namespaces (restricted on Ubuntu's runners, as for harness)
+      # The app asks WebKitGTK to run its web process in a bubblewrap sandbox
+      # wherever bubblewrap can make a user namespace (linux/desk.c,
+      # sandbox_works), and the smoke requires "sandbox on". Ubuntu's runners
+      # restrict user namespaces, as stock Ubuntu 24.04 does: what the app's
+      # own probe gets there is said first, as a notice on the run, then the
+      # restriction is lifted for the tests.
       - run: |
-          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb bubblewrap
+          if bwrap --unshare-user --unshare-pid --ro-bind / / true 2> /dev/null; then
+            echo "::notice::desk-app (Linux): with the runner's own settings bubblewrap makes a user namespace: the pages would be sandboxed"
+          else
+            echo "::notice::desk-app (Linux): with the runner's own settings bubblewrap can't make a user namespace: the pages would run unsandboxed (the app says sandbox off)"
+          fi
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: |
           set -o pipefail

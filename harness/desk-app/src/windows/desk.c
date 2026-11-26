@@ -14,6 +14,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -311,7 +312,11 @@ static HRESULT STDMETHODCALLTYPE on_nav_starting(void *self, ICoreWebView2 *send
         free(uri);
         return S_OK;
     }
-    int d = hdesk_on_navigate(uri, HDESK_FRAME_MAIN);
+    // (a person's click on a link, as WebView2 tells it: a script's click(),
+    // its location = and the app's own loads are not "user initiated")
+    BOOL user = FALSE;
+    ICoreWebView2NavigationStartingEventArgs_get_IsUserInitiated(args, &user);
+    int d = hdesk_on_navigate_from(uri, HDESK_FRAME_MAIN, user ? 1 : 0);
     if (d != HDESK_ALLOW) ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, TRUE);
     else {
         strncpy(nav_url, uri, sizeof nav_url - 1);
@@ -330,7 +335,9 @@ static HRESULT STDMETHODCALLTYPE on_frame_nav_starting(void *self, ICoreWebView2
     char *uri = utf8(wuri);
     free_co(wuri);
     if (!uri) return S_OK;
-    if (hdesk_on_navigate(uri, HDESK_FRAME_SUB) != HDESK_ALLOW) ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, TRUE);
+    BOOL user = FALSE;
+    ICoreWebView2NavigationStartingEventArgs_get_IsUserInitiated(args, &user);
+    if (hdesk_on_navigate_from(uri, HDESK_FRAME_SUB, user ? 1 : 0) != HDESK_ALLOW) ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, TRUE);
     free(uri);
     return S_OK;
 }
@@ -342,8 +349,10 @@ static HRESULT STDMETHODCALLTYPE on_new_window(void *self, ICoreWebView2 *sender
     wchar_t *wuri = NULL;
     ICoreWebView2NewWindowRequestedEventArgs_get_Uri(args, &wuri);
     ICoreWebView2NewWindowRequestedEventArgs_put_Handled(args, TRUE);
+    BOOL user = FALSE;
+    ICoreWebView2NewWindowRequestedEventArgs_get_IsUserInitiated(args, &user);
     char *uri = utf8(wuri);
-    if (uri && hdesk_on_navigate(uri, HDESK_FRAME_NEW_WINDOW) == HDESK_ALLOW) ICoreWebView2_Navigate(sender, wuri);
+    if (uri && hdesk_on_navigate_from(uri, HDESK_FRAME_NEW_WINDOW, user ? 1 : 0) == HDESK_ALLOW) ICoreWebView2_Navigate(sender, wuri);
     free(uri);
     free_co(wuri);
     return S_OK;
@@ -464,10 +473,16 @@ static void decide_permission(ICoreWebView2PermissionRequestedEventArgs *args, i
     }
 }
 
+// Set when a frame was made whose own requests this runtime can't hand to
+// on_frame_permission (no ICoreWebView2Frame3): they then arrive at the
+// window's handler looking like the desk page's, so from then on nobody is
+// given the microphone.
+static int frames_untold;
+
 static HRESULT STDMETHODCALLTYPE on_permission(void *self, ICoreWebView2 *sender, ICoreWebView2PermissionRequestedEventArgs *args) {
     (void)self;
     (void)sender;
-    decide_permission(args, 1);
+    decide_permission(args, frames_untold ? 0 : 1);
     return S_OK;
 }
 HANDLER(permission, ICoreWebView2PermissionRequestedEventHandler, on_permission);
@@ -498,6 +513,8 @@ static HRESULT STDMETHODCALLTYPE on_frame_created(void *self, ICoreWebView2 *sen
     if (SUCCEEDED(ICoreWebView2Frame_QueryInterface(frame, &IID_ICoreWebView2Frame3, (void **)&f3)) && f3) {
         ICoreWebView2Frame3_add_PermissionRequested(f3, (ICoreWebView2FramePermissionRequestedEventHandler *)&frame_permission, &tok);
         ICoreWebView2Frame3_Release(f3);
+    } else {
+        frames_untold = 1;
     }
     ICoreWebView2Frame_Release(frame);
     return S_OK;
@@ -588,6 +605,9 @@ static HRESULT STDMETHODCALLTYPE on_controller(void *self, HRESULT result, ICore
         ICoreWebView2Settings_put_AreDevToolsEnabled(settings, FALSE);
         ICoreWebView2Settings_put_IsZoomControlEnabled(settings, FALSE);
         ICoreWebView2Settings_put_AreHostObjectsAllowed(settings, FALSE);
+        // the web view's own menu (Print, Save as, Open link in new window)
+        // isn't the desk's
+        ICoreWebView2Settings_put_AreDefaultContextMenusEnabled(settings, FALSE);
         ICoreWebView2Settings2 *s2 = NULL;
         if (SUCCEEDED(ICoreWebView2Settings_QueryInterface(settings, &IID_ICoreWebView2Settings2, (void **)&s2)) && s2) {
             wchar_t *ua = NULL;
@@ -620,12 +640,19 @@ static HRESULT STDMETHODCALLTYPE on_controller(void *self, HRESULT result, ICore
     ICoreWebView2_add_WebMessageReceived(web, (ICoreWebView2WebMessageReceivedEventHandler *)&message, &tok);
     ICoreWebView2_add_PermissionRequested(web, (ICoreWebView2PermissionRequestedEventHandler *)&permission, &tok);
     ICoreWebView2_add_ProcessFailed(web, (ICoreWebView2ProcessFailedEventHandler *)&process_failed, &tok);
+    // Refusing downloads and telling a framed page from the desk's both
+    // need ICoreWebView2_4. A runtime without it (an old fixed one: the
+    // oldest the loader accepts, oldest_runtime, is older than this
+    // interface) would let downloads through and hear a frame as the desk
+    // page, so the app doesn't run on it.
     ICoreWebView2_4 *w4 = NULL;
-    if (SUCCEEDED(ICoreWebView2_QueryInterface(web, &IID_ICoreWebView2_4, (void **)&w4)) && w4) {
-        ICoreWebView2_4_add_FrameCreated(w4, (ICoreWebView2FrameCreatedEventHandler *)&frame_created, &tok);
-        ICoreWebView2_4_add_DownloadStarting(w4, (ICoreWebView2DownloadStartingEventHandler *)&download, &tok);
-        ICoreWebView2_4_Release(w4);
+    if (FAILED(ICoreWebView2_QueryInterface(web, &IID_ICoreWebView2_4, (void **)&w4)) || !w4) {
+        no_web_view(L"is too old for harness here");
+        return S_OK;
     }
+    ICoreWebView2_4_add_FrameCreated(w4, (ICoreWebView2FrameCreatedEventHandler *)&frame_created, &tok);
+    ICoreWebView2_4_add_DownloadStarting(w4, (ICoreWebView2DownloadStartingEventHandler *)&download, &tok);
+    ICoreWebView2_4_Release(w4);
     ICoreWebView2Controller_add_AcceleratorKeyPressed(ctl, (ICoreWebView2AcceleratorKeyPressedEventHandler *)&key, &tok);
     fit();
     ICoreWebView2Controller_put_IsVisible(ctl, TRUE);
@@ -911,11 +938,45 @@ void hdesk_reload(void) {
     if (web) ICoreWebView2_Reload(web);
 }
 
+static HRESULT STDMETHODCALLTYPE on_cdp_done(void *self, HRESULT result, LPCWSTR json) {
+    (void)self;
+    (void)result;
+    (void)json;
+    return S_OK;
+}
+HANDLER(cdp_done, ICoreWebView2CallDevToolsProtocolMethodCompletedHandler, on_cdp_done);
+
+// Run as a page's own script runs: through the DevTools protocol's
+// Runtime.evaluate, which gives it no user gesture. (ExecuteScript's
+// scripts count as the user's, and what they navigate to as clicked: a
+// test's script would then open the system browser as a click does.)
+// Only the test hooks call this.
 void hdesk_eval_js(const char *js) {
     if (!web) return;
     wchar_t *w = wide(js);
     if (!w) return;
-    ICoreWebView2_ExecuteScript(web, w, NULL);
+    size_t n = wcslen(w);
+    wchar_t *params = (wchar_t *)malloc((n * 6 + 32) * sizeof(wchar_t));
+    if (params) {
+        wchar_t *o = params;
+        o += swprintf(o, 32, L"{\"expression\":\"");
+        for (size_t i = 0; i < n; i++) {
+            wchar_t c = w[i];
+            if (c == L'"' || c == L'\\') {
+                *o++ = L'\\';
+                *o++ = c;
+            } else if (c < 0x20) {
+                o += swprintf(o, 7, L"\\u%04x", (unsigned)c);
+            } else {
+                *o++ = c;
+            }
+        }
+        *o++ = L'"';
+        *o++ = L'}';
+        *o = 0;
+        ICoreWebView2_CallDevToolsProtocolMethod(web, L"Runtime.evaluate", params, (ICoreWebView2CallDevToolsProtocolMethodCompletedHandler *)&cdp_done);
+        free(params);
+    }
     free(w);
 }
 
@@ -943,6 +1004,10 @@ void hdesk_alert(const char *title, const char *text) {
     }
 }
 
+// (A post that fails has nowhere else to go: `fn` may only run on the main
+// thread, and the only time the window can't take a message is after it
+// was destroyed, when the loop that would run it has ended and the process
+// is on its way out. What `arg` holds goes with the process.)
 void hdesk_post_main(void (*fn)(void *), void *arg) {
     PostMessageW(hwnd, WM_HD_CALL, (WPARAM)fn, (LPARAM)arg);
 }
@@ -1098,6 +1163,45 @@ int hdesk_test_key(int action) {
 #else
     (void)action;
     return -1;
+#endif
+}
+
+#ifdef HDESK_TEST_HOOKS
+// The element's place came back ("[x,y]", or "null"): a press and a
+// release there through the browser's own input (the DevTools protocol's
+// Input.dispatchMouseEvent), which the page gets as a person's click.
+static HRESULT STDMETHODCALLTYPE on_click_place(void *self, HRESULT result, LPCWSTR json) {
+    (void)self;
+    double x = 0, y = 0;
+    if (FAILED(result) || !json || !web || swscanf(json, L"[%lf,%lf]", &x, &y) != 2) return S_OK;
+    static const wchar_t *const kinds[2] = { L"mousePressed", L"mouseReleased" };
+    for (int i = 0; i < 2; i++) {
+        wchar_t params[200];
+        _snwprintf(params, 200, L"{\"type\":\"%ls\",\"x\":%.1f,\"y\":%.1f,\"button\":\"left\",\"buttons\":%d,\"clickCount\":1}", kinds[i], x, y, i == 0 ? 1 : 0);
+        params[199] = 0;
+        ICoreWebView2_CallDevToolsProtocolMethod(web, L"Input.dispatchMouseEvent", params, (ICoreWebView2CallDevToolsProtocolMethodCompletedHandler *)&cdp_done);
+    }
+    return S_OK;
+}
+HANDLER(click_place, ICoreWebView2ExecuteScriptCompletedHandler, on_click_place);
+#endif
+
+void hdesk_test_click(const char *element) {
+#ifdef HDESK_TEST_HOOKS
+    if (!web) return;
+    // (an id of letters, digits, - and _ only: it goes into a script)
+    for (const char *p = element; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_') return;
+    char js[420];
+    snprintf(js, sizeof js, "(function(){var e=document.getElementById('%.80s');if(!e)return null;"
+                            "e.scrollIntoView({block:'center'});var r=e.getBoundingClientRect();"
+                            "return [r.left+r.width/2,r.top+r.height/2];})()", element);
+    wchar_t *w = wide(js);
+    if (!w) return;
+    ICoreWebView2_ExecuteScript(web, w, (ICoreWebView2ExecuteScriptCompletedHandler *)&click_place);
+    free(w);
+#else
+    (void)element;
 #endif
 }
 
