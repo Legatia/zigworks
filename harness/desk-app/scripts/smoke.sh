@@ -484,7 +484,15 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     # one answer, asked for by the model's name with the key from the sheet
     if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
         cmd "js document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
-        desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60
+        if ! desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60; then
+            # why not: what the page holds, and what harness and the stand-in said
+            desk_probe unanswered "[location.href, 'field: ' + document.getElementById('msg').value, 'note: ' + document.getElementById('composeNote').textContent, Array.prototype.map.call(document.querySelectorAll('#log li'), function (e) { return e.className + ': ' + e.textContent; }).join(' / ')].join(' | ')"
+            echo "# the desk, unanswered: ${PROBE:-nothing}"
+            echo "# the app's and harness's output:" && tail -20 "$D/app.out" 2>/dev/null | sed 's/^/#   /'
+            echo "# the stand-in's requests: $(ls "$MODEL_DIR/requests" 2>/dev/null | tr '\n' ' ')"
+            echo "# harness's own log:" && tail -15 "$REAL_HOME/log/actions.jsonl" 2>/dev/null | cut -c1-400 | sed 's/^/#   /'
+            echo "# harness's state: $(tr '\n' ' ' < "$REAL_HOME/state/status" 2>/dev/null)"
+        fi
         expect_probe "$MODEL_SAYS" "real harness: a message typed in the desk is answered by the model"
         r=$MODEL_DIR/requests/001.json
         if grep -qF '"target":"/v1/chat/completions"' "$r" 2>/dev/null && grep -qF '"model":"smoke-model"' "$r" && grep -qF 'Are you the model?' "$r"; then ok "real harness: the provider was asked for smoke-model with the message"; else not_ok "real harness: the provider was asked for smoke-model with the message"; fi
