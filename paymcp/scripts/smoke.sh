@@ -86,6 +86,14 @@ sed -e "s|^who = .*|who = nowhere.csv|" "$T/pay.ini" >"$T/nofile.ini"
 check "a business's file that isn't there is named" '! "$B" audit "$T/nofile.ini" 2>"$T/err" && grep -q "can.t read the business.s file .*nowhere.csv" "$T/err"'
 check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>"$T/err" && grep -q "^usage: paymcp PAY.ini" "$T/err"'
 
+# the files for a Stripe sandbox (customers found by address, every "how
+# old" setting at 0), against the same business
+cp examples/sandbox-who.csv "$T/sandbox-who.csv"
+awk -v port="$PORT" '{ print } /^\[stripe\]/ { print "url = http://127.0.0.1:" port }' examples/sandbox.ini >"$T/sandbox.ini"
+check "the sandbox's files: found by address, nothing has to be old" '"$B" audit "$T/sandbox.ini" >"$T/s" && grep -qx "13 findings: 371.00 EUR a month and 755.00 EUR once; 1 with an amount this audit can.t know." "$T/s" && grep -q "Larch has been on a price of zero" "$T/s"'
+check "the seed script: a dry run sends nothing and lists what it would" 'python3 -I scripts/seed-sandbox.py --dry-run >"$T/seed" && grep -qx "57 requests would be sent. Nothing was sent." "$T/seed" && [ "$(grep -c "^POST /v1/subscriptions  " "$T/seed")" = 12 ] && ! grep -q "payment_method" "$T/seed"'
+check "the seed script takes a sandbox key only" '! STRIPE_SEED_KEY=sk_live_abc python3 -I scripts/seed-sandbox.py --yes 2>"$T/err" && grep -q "is not a sandbox key" "$T/err" && ! env -u STRIPE_SEED_KEY python3 -I scripts/seed-sandbox.py --yes 2>"$T/err" && grep -q "STRIPE_SEED_KEY isn.t set" "$T/err"'
+
 cat >"$T/mcp.py" <<'EOF'
 import json, queue, subprocess, sys, threading, time
 

@@ -1,0 +1,8 @@
+customer,email,plan,seats,usage,active
+,billing@alder.example,team,9,,yes
+,ola@birch.example,pro,4,,yes
+,accounts@cedar.example,pro,2,,yes
+,ap@fir.example,team,5,15300,yes
+,team@juniper.example,pro,1,,yes
+,nobody@maple.example,team,3,,yes
+,old@closed.example,team,2,,no

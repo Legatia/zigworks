@@ -64,6 +64,58 @@ Each is a question for a person, not a mistake found: a discount may be meant to
 examples/sim.ini` serves MCP on stdin and stdout, the way an agent starts
 it.
 
+## Against a Stripe sandbox
+
+The first run against Stripe itself, with nothing real in it.
+`scripts/seed-sandbox.py` fills a sandbox with the same made-up business
+(needs python3 and nothing else). It has not been run against Stripe
+either: the first run is the test of both.
+
+1. In the Stripe Dashboard: the account picker, **Switch to sandbox**,
+   **Create sandbox**. Give it a name of its own and turn off "Copy live
+   account to sandbox", so that it holds only the made-up business and can
+   be deleted whole afterwards.
+2. In that sandbox, under Developers, API keys: copy the **secret key**
+   (`sk_test_...`) for the script, and create a **restricted key**
+   (`rk_test_...`) that can only read ([The key](#the-key)) for paymcp.
+3. See what the script would send, then send it:
+
+   ```
+   $ python3 scripts/seed-sandbox.py --dry-run
+   $ STRIPE_SEED_KEY=sk_test_... python3 scripts/seed-sandbox.py
+   ```
+
+   It asks once before sending. 57 requests: 12 customers, 12
+   subscriptions, 4 invoices, 6 prices, 4 products, 3 coupons, a meter and
+   a meter event. No payment method is added to any customer, so nothing
+   is charged, and the customers' addresses end in `.example`.
+4. The audit, with the key that can only read:
+
+   ```
+   $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp check examples/sandbox.ini
+   $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp audit examples/sandbox.ini
+   13 findings: 371.00 EUR a month and 755.00 EUR once; 1 with an amount this audit can't know.
+   ```
+
+   `examples/sandbox.ini` sets every "how old" setting to 0, since nothing
+   in a new sandbox is old, and `examples/sandbox-who.csv` finds the
+   customers by address. The script prints the thirteen findings to
+   expect. Where Stripe's answer differs, the difference is what the run
+   is for.
+
+The script writes, so it has a key of its own, `STRIPE_SEED_KEY`, and
+takes only a sandbox key (`sk_test_...` or `rk_test_...`): a live key is
+refused before anything is sent. paymcp never sees that key. The script
+stops if the business is already in the sandbox; if it fails midway, the
+sandbox holds half the business, and the way back is a new sandbox. Delete
+the sandbox when you are done (account picker, Switch to sandbox, Manage
+sandboxes, Delete).
+
+Known to differ for a few minutes after seeding: Stripe counts meter
+events after a delay, so "Use that was never reported" may first say 0 was
+reported; and a subscription's first invoice may still be a draft, which
+the audit then lists as never sent.
+
 ## What it looks for
 
 From the billing account alone:
@@ -117,7 +169,7 @@ everything else:
 |---|---|
 | Customers | names and addresses of the customers in findings |
 | Subscriptions | plans, quantities, discounts, pauses |
-| Prices (and Products) | what each plan costs, which are withdrawn |
+| Prices | what each plan costs, which are withdrawn |
 | Coupons | what a discount takes off |
 | Invoices | drafts, open invoices, written-off invoices |
 | Billing meters, Billing meter events | use reported, for "Use that was never reported" (optional) |
