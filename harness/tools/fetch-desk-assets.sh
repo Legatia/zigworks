@@ -33,12 +33,12 @@ mediapipe/wasm/vision_wasm_nosimd_internal.wasm $npm/wasm/vision_wasm_nosimd_int
 mediapipe/face_landmarker.task $model 64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
 "
 
-# (the file on standard input, not by name: given a name with a backslash
-# in it, as a Windows folder has, sha256sum puts a backslash before the hash)
+# (the file on standard input: given a name with a backslash in it, as a
+# Windows path has, both tools put a backslash before the hash)
 if command -v sha256sum >/dev/null 2>&1; then
-	sha() { sha256sum <"$1" | cut -d' ' -f1; }
+	sha() { sha256sum < "$1" | cut -d' ' -f1; }
 elif command -v shasum >/dev/null 2>&1; then
-	sha() { shasum -a 256 <"$1" | cut -d' ' -f1; }
+	sha() { shasum -a 256 < "$1" | cut -d' ' -f1; }
 else
 	echo "needs sha256sum or shasum" >&2
 	exit 1
