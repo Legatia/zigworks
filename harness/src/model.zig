@@ -387,6 +387,8 @@ pub const Client = struct {
     /// The error message the provider gave with the last failure, if any.
     last_error: [256]u8 = undefined,
     last_error_len: usize = 0,
+    /// The status of the last answer (0: none came).
+    last_status: u16 = 0,
     /// Longest wait on a 429 (seconds).
     max_retry_wait: u32 = 60,
     /// Longest one call may take (ms), whatever the deadline.
@@ -466,6 +468,15 @@ pub const Client = struct {
             error.TimeUp => "Time limit reached for this turn.",
             error.Timeout => try std.fmt.allocPrint(a, "Model call failed{s}: Timeout {s}", .{ at, msg }),
             error.Rejected => try std.fmt.allocPrint(a, "The model API{s} refused the request: {s}", .{ at, msg }),
+            // a 404 from a provider of one's own: nearly always a model
+            // name it doesn't have (config.ini's defaults are omnigate's
+            // route names), so say what to change
+            error.Upstream => if (!omni and c.last_status == 404)
+                try std.fmt.allocPrint(a, "Model call failed{s}: {s} has no model named {s} (404{s}{s}). Name one it has: harness config set model.model NAME (model.memory_model and model.worker_model the same way), then /reload.", .{
+                    at, c.provider, c.model, if (msg.len > 0) ": " else "", msg,
+                })
+            else
+                try std.fmt.allocPrint(a, "Model call failed{s}: {s} {s}", .{ at, @errorName(e), msg }),
             else => try std.fmt.allocPrint(a, "Model call failed{s}: {s} {s}", .{ at, @errorName(e), msg }),
         };
         return out;
@@ -529,6 +540,7 @@ pub const Client = struct {
                 // it, and sent again it may be billed twice
                 else => return e,
             };
+            c.last_status = r.status;
             switch (r.status) {
                 200 => return switch (c.api) {
                     .anthropic => parseReply(arena, r.body),
@@ -1595,6 +1607,21 @@ test "each_status_maps_to_the_same_message_for_every_provider" {
             }
         }
     }
+    // a 404 from one's own provider says what to change; omnigate's words stay
+    for ([_]*Client{ &og, &local }) |c| {
+        n += 1;
+        try e.script(n, "{\"status\":404}");
+        try t.expectError(error.Upstream, c.send(a, "", hi, &.{}));
+        try t.expectEqualStrings(if (c == &og)
+            "Model call failed: Upstream scripted error"
+        else
+            "Model call failed at local: local has no model named gpt-test (404: scripted error). Name one it has: harness config set model.model NAME (model.memory_model and model.worker_model the same way), then /reload.", try c.failure(a, error.Upstream));
+    }
+    // and a 500 after it is an upstream error again
+    n += 1;
+    try e.script(n, "{\"status\":500}");
+    try t.expectError(error.Upstream, local.send(a, "", hi, &.{}));
+    try t.expectEqualStrings("Model call failed at local: Upstream scripted error", try local.failure(a, error.Upstream));
 }
 
 test "gemini_is_a_preset_for_speech_only" {
