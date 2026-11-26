@@ -118,6 +118,19 @@ key are there, commands say so and model calls are refused.
 `harness config set SECTION.KEY VALUE` writes one setting (see
 [Settings from the command line](#settings-from-the-command-line)).
 
+With your own key and no omnigate, name the provider and three models it
+has in one line (the names `config.ini` starts with are omnigate's
+routes, which no provider has), then store the key. For Anthropic, with
+the names the desk app's setup writes:
+
+```
+harness config set model.provider anthropic model.model claude-opus-4-8 model.memory_model claude-haiku-4-5 model.worker_model claude-haiku-4-5
+harness secret add anthropic
+```
+
+A model name the provider doesn't have is said at the first message and
+by `harness doctor`, with the command to change it.
+
 Telegram is optional, for your phone. With no bot token stored, or
 `[chat] telegram = off`, `harness run` runs with the desk as the only way
 in, says so at start, and everything meant for you goes to the desk. To

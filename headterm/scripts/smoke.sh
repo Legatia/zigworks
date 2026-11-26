@@ -200,13 +200,13 @@ check "run without steps is an error" sh -c '[ "$1" -eq 2 ] && printf "%s" "$2" 
 if [ -n "$WINDOWS" ]; then
     # No termios on Windows: the keys typed ahead are read and dropped.
     if command -v python >/dev/null 2>&1; then
-        out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python -c 'import msvcrt,time; time.sleep(0.4); [msvcrt.getwch() for _ in iter(msvcrt.kbhit, False)]; print("ready"); print("got", input())')
+        out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python -c 'import msvcrt,time; time.sleep(0.4); [msvcrt.getwch() for _ in iter(msvcrt.kbhit, False)]; print("ready"); print("got", input())' 2>&1) || fail "run with keys sent before the first output: exit $?: $out"
         check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
     else
         echo "skip - run waits for first output before sending (no python)"
     fi
 elif command -v python3 >/dev/null 2>&1; then
-    out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())')
+    out=$("$HT" run --send early --send '<Enter>' --wait-exit -- python3 -c 'import sys,termios,time; time.sleep(0.4); termios.tcflush(0, termios.TCIFLUSH); print("ready"); print("got", input())' 2>&1) || fail "run with keys sent before the first output: exit $?: $out"
     check "run waits for first output before sending" sh -c 'printf "%s\n" "$1" | grep -qx "got early"' _ "$out"
 fi
 
