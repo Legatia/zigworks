@@ -7071,10 +7071,13 @@ test "web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log" {
     // the owner was asked for the host and for the login, once each
     try t.expectEqual(2, f.asked);
     const req4 = try f.e.request(4);
-    // seen failing twice on the Windows runner (6270579, 45aa88a) with
-    // nothing to say why: what the page showed is printed when it does
+    // seen failing on the Windows runner (6270579, 45aa88a) and on the
+    // Linux one (2ec1fa0) with nothing to say why: what the last tool
+    // call answered is printed when it does (the request ends with the
+    // tools' descriptions, which say nothing)
     if (std.mem.indexOf(u8, req4, "welcome agent-bot typed [secret:login-agent-password]") == null) {
-        std.debug.print("request 4 ends: {s}\n", .{req4[req4.len -| 2500..]});
+        const at = std.mem.lastIndexOf(u8, req4, "\"tool_result\"") orelse 0;
+        std.debug.print("request 4's last tool result: {s}\n", .{req4[at..@min(req4.len, at + 700)]});
         return error.TestUnexpectedResult;
     }
     const lt = try f.logText();
