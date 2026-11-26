@@ -113,11 +113,13 @@ jobs:
       - run: sh ../scripts/pack-desk-assets.sh "$RUNNER_TEMP/desk-assets"
       - run: DESK_ASSETS="$RUNNER_TEMP/desk-assets" scripts/package-macos.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-macos.zip"
       # the smoke's setup runs once against the stand-in and once against
-      # this harness (a data folder and secrets of its own, no model called)
+      # this harness (a data folder and secrets of its own), whose provider
+      # is harness-fake: a message typed in the desk is answered through it,
+      # and no real model is called
       - run: |
           set -o pipefail
           (cd .. && zig build)
-          DESK_SMOKE_HARNESS="$PWD/../zig-out/bin/harness" zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+          DESK_SMOKE_HARNESS="$PWD/../zig-out/bin/harness" DESK_SMOKE_FAKE="$PWD/../zig-out/bin/harness-fake" zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       - if: failure()
         run: |
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do

@@ -11,7 +11,10 @@
 # out after. DESK_SMOKE_HARNESS=PATH runs the setup once more against that
 # real harness (its own data folder and file store under the smoke's temp
 # folder, HERMES_HOME nowhere, and a provider of its own on a dead local
-# address, so no model is ever called).
+# address, so no model is ever called). DESK_SMOKE_FAKE=PATH with it (the
+# harness-fake built beside that harness) is that provider instead: the
+# first message typed in the desk is answered by it, as a model would, and
+# the request it got carries the model's name and the key from the sheet.
 # usage: scripts/smoke.sh path/to/harness-desk.app  (built by `zig build smoke`)
 # Needs a window session (Aqua); says SKIP without one. WebGL 2, media and
 # speech without a click are required here, and only reported on CI, whose
@@ -47,6 +50,7 @@ APP_PID=
 cleanup() {
     [ -n "$APP_PID" ] && kill "$APP_PID" 2>/dev/null
     [ -f "$H/fake.pid" ] && kill "$(cat "$H/fake.pid")" 2>/dev/null
+    [ -n "${MODEL_PID:-}" ] && kill "$MODEL_PID" 2>/dev/null
     [ -n "${REAL_HOME:-}" ] && [ -f "$REAL_HOME/config.ini" ] && "$OWN" stop --home "$REAL_HOME" > /dev/null 2>&1
     rm -f "$OWN"
     # the smoke app's own leftovers, by its own id only
@@ -444,22 +448,48 @@ if [ -z "$leaked" ]; then ok "the key is in no log, output, setting or command l
 if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     REAL_HOME=$D/real-home
     cp "$DESK_SMOKE_HARNESS" "$OWN"
+    # the provider: nothing at all, or the stand-in with one answer ready
+    MODEL_URL=http://127.0.0.1:9/v1
+    MODEL_DIR=$D/model
+    MODEL_SAYS="The stand-in model answers."
+    if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        mkdir -p "$MODEL_DIR/model"
+        printf '{"choices":[{"message":{"role":"assistant","content":"%s"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5}}' "$MODEL_SAYS" > "$MODEL_DIR/model/001.json"
+        "$DESK_SMOKE_FAKE" --dir "$MODEL_DIR" > "$D/model.out" 2>&1 &
+        MODEL_PID=$!
+        if wait_for "$D/model.out" "port " 10; then
+            MODEL_URL=http://127.0.0.1:$(sed -n 's/^port //p' "$D/model.out")/v1
+            ok "real harness: the stand-in provider is up"
+        else
+            not_ok "real harness: the stand-in provider is up"
+        fi
+    fi
     launch "$REAL_HOME"
     expect_log "show setup" "real harness: the Set up screen" 30
     wait_page 1
-    cmd "js $(js_provider other) $(js_set model smoke-model) $(js_set url http://127.0.0.1:9/v1) $js_continue"
+    cmd "js $(js_provider other) $(js_set model smoke-model) $(js_set url $MODEL_URL) $js_continue"
     expect_log "ask key Key" "real harness: the key is asked for"
     cmd "key fill"
     expect_log "step $OWN init --home $REAL_HOME" "real harness: init"
-    expect_log "step $OWN config set provider other.api openai provider other.url http://127.0.0.1:9/v1 model.provider other model.model smoke-model" "real harness: config set"
+    expect_log "step $OWN config set provider other.api openai provider other.url $MODEL_URL model.provider other model.model smoke-model" "real harness: config set"
     expect_log "store $OWN secret add other --stdin --home $REAL_HOME" "real harness: secret add other --stdin"
     expect_again "stepped ok=1" 3 "real harness: init, config set and the key all succeed"
     expect_log "run $OWN run --home $REAL_HOME" "real harness: harness run is started" 15
     expect_log "load http://127.0.0.1:" "real harness: the app enters by a one-time code" 30
     expect_log "state in" "real harness: the app is in" 30
     if grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$T/log"; then ok "real harness: the desk page loads"; else in_log "finish http://127.0.0.1:" 15; grep -q "^finish http://127.0.0.1:[0-9]*/desk" "$T/log" && ok "real harness: the desk page loads" || not_ok "real harness: the desk page loads"; fi
-    [ "$("$OWN" config get model.provider --home "$REAL_HOME")" = other ] && [ "$("$OWN" config get "provider other.url" --home "$REAL_HOME")" = http://127.0.0.1:9/v1 ] && ok "real harness: config.ini has them" || not_ok "real harness: config.ini has them"
+    [ "$("$OWN" config get model.provider --home "$REAL_HOME")" = other ] && [ "$("$OWN" config get "provider other.url" --home "$REAL_HOME")" = $MODEL_URL ] && ok "real harness: config.ini has them" || not_ok "real harness: config.ini has them"
     if [ -e "$HARNESS_STORE/other" ]; then ok "real harness: the key is in its store (the smoke's own folder)"; else not_ok "real harness: the key is in its store (the smoke's own folder)"; fi
+    # a message typed in the desk is answered by the model: the stand-in's
+    # one answer, asked for by the model's name with the key from the sheet
+    if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        cmd "js document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
+        desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60
+        expect_probe "$MODEL_SAYS" "real harness: a message typed in the desk is answered by the model"
+        r=$MODEL_DIR/requests/001.json
+        if grep -qF '"target":"/v1/chat/completions"' "$r" 2>/dev/null && grep -qF '"model":"smoke-model"' "$r" && grep -qF 'Are you the model?' "$r"; then ok "real harness: the provider was asked for smoke-model with the message"; else not_ok "real harness: the provider was asked for smoke-model with the message"; fi
+        if grep -qF "Bearer $FAKE_KEY" "$r" 2>/dev/null; then ok "real harness: with the key from the sheet"; else not_ok "real harness: with the key from the sheet"; fi
+    fi
     # the conversation at its tallest: the message field is still inside the
     # window, at the size the app opens at and at its smallest
     tries=0
