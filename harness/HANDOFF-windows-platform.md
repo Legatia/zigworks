@@ -5,16 +5,49 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: history was rewritten — re-make your branch before you push (2026-11-26)
+
+- The owner asked for their mail address to be taken out of the
+  repository. It was in `mailmcp/src/mime.zig`'s test messages in every
+  commit from "mailmcp 0.1.0" on, so those commits were rewritten and
+  `main`, `harness-logins` and `platform/desk-win-linux` were force-pushed.
+  Everything from that commit on (now 2930e63) has a new id; nothing else
+  about the commits changed (same authors, dates, messages, order), and
+  the only files that differ are `mime.zig` and two plans that held a
+  scratch path with the owner's user name. Your 16ac9e9 is now 9bbe767.
+- Your clone holds the old commits. **Don't `git pull`, don't merge, don't
+  push with force**: any of them puts the old commits, and the address,
+  back on GitHub. Do this instead:
+
+      git fetch origin
+      git merge-base --is-ancestor 2930e63 HEAD && echo new || echo old
+
+  On "old" with nothing unpushed:
+
+      git checkout platform/desk-win-linux
+      git reset --hard origin/platform/desk-win-linux
+
+  On "old" with commits of yours that aren't pushed: `git branch mine`,
+  reset as above, then `git cherry-pick` those commits from `mine` and
+  delete `mine`. Other local branches made from the old history go the
+  same way or are deleted. A push that is refused as not a fast-forward
+  means the branch is still the old one.
+- Commit ids quoted in this file, the ledger, the plans and one comment in
+  `agent.zig` were pointed at the new commits (311 of them), so an id you
+  remember from before may no longer resolve; the subject line finds it.
+- I check before each merge of your branch that 2930e63 is an ancestor of
+  it and refuse it otherwise.
+
 ## For you: `main` takes `harness-logins`; no real addresses in test files (2026-11-26)
 
 - The owner asked for the finished work to be merged. `main` is
   fast-forwarded to `harness-logins` once CI is green on the commit that
-  carries this note; your a401c39 (the fintech spec's revision) is merged
+  carries this note; your 0e73236 (the fintech spec's revision) is merged
   in. Keep working as before: branch from `harness-logins`, and I merge
   `origin/platform/desk-win-linux` when it moves. No tag and no release
   were made; those stay the owner's.
 - `mailmcp/src/mime.zig`'s test messages held the owner's personal mail
-  address (since 4cd728f). It is now `owner.name@example.pl` everywhere.
+  address (since 2930e63). It is now `owner.name@example.pl` everywhere.
   Don't put the owner's real address, or a path with a user name in it, in
   a test, a plan or the ledger: this repository is public. Made-up people
   go on `example.com`, `example.pl` and the like.
@@ -25,8 +58,8 @@ environments (gap 2), the open Windows items and the hosted design notes.
 ## For you: the Windows browser test that fails now and then (2026-11-26)
 
 `web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`
-failed again on `test (windows-latest, harness)` (2562460; a rerun of the
-job passed, 34/34). You saw it once on 354a8cb and put it down to a sharing
+failed again on `test (windows-latest, harness)` (45aa88a; a rerun of the
+job passed, 34/34). You saw it once on 6270579 and put it down to a sharing
 violation. That is not the failure:
 
 - The `SHARING_VIOLATION` dumps in the log come from
@@ -77,7 +110,7 @@ otherwise.
 
 ## For you: the one red job on your merge was a test race (2026-11-25, night)
 
-CI on ff3262d (your merge of the desk apps) failed in `test (macos-15,
+CI on 46bb273 (your merge of the desk apps) failed in `test (macos-15,
 harness)`: `a_text_reply_to_an_approval_denies_it_and_the_agent_gets_the_reason`
 timed out. Nothing in your merge caused it. The test replied to the
 approval's message the moment its buttons were sent, before the worker had
@@ -332,7 +365,7 @@ The macOS screen and its controller code land after `platform/desk-alone`
 and `platform/desk-fit-files`. As with the rest of the app, the shared
 part will be in `desk-app/src/` for you to reuse.
 
-### The desk's voice (merged, aea003e)
+### The desk's voice (merged, e9addff)
 
 Nothing changes in your apps. For the record:
 
@@ -371,13 +404,13 @@ Nothing changes in your apps. For the record:
 
 ## From the Windows session, 2026-11-25, evening: your merges on Windows, and what "Set up" still needs
 
-On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
+On `platform/desk-win-linux` (merged with `harness-logins` at 231fe68).
 
-- **Your CI is red on Windows at e5a743c, and it is the smoke script, not
+- **Your CI is red on Windows at 231fe68, and it is the smoke script, not
   harness.** The three fit-file checks pass `/desk/assets/…` as arguments,
   and Git Bash turns an argument that starts with `/` into
   `C:/Program Files/Git/desk/assets/…`. You fixed it your way since
-  (2057083, 3f97af9); my branch now has yours and mine is gone. With it
+  (b452c31, fcbf945); my branch now has yours and mine is gone. With it
   all three pass here, the bundle place (`Contents/MacOS` beside
   `Contents/Resources`) included.
 - **`utc_offset = auto` on Windows: checked.** A fresh folder starts with
@@ -386,7 +419,7 @@ On `platform/desk-win-linux` (merged with `harness-logins` at e5a743c).
   holds `localNow` to the local clock less the UTC clock. Here: +01:00.
   Not checked: a daylight-saving change (I did not move this computer's
   clock), and the desk's shown times in the app.
-- **354a8cb's Windows failure was one test,**
+- **6270579's Windows failure was one test,**
   `web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log`,
   with a sharing violation; the same code passed one commit earlier. Seen
   once.
@@ -437,7 +470,7 @@ What I found the "Set up" screen and the one download still need:
 
 ## From the Windows session, 2026-11-25, night: the Windows and Linux apps on your set-up code
 
-On `platform/desk-win-linux` (merged with `harness-logins` at 8c4130a).
+On `platform/desk-win-linux` (merged with `harness-logins` at ebc60e6).
 Plan `2026-11-22-windows-platform.md` section 13, rulings R61 to R68.
 
 Done, against your interface:
@@ -489,10 +522,10 @@ Your list for Windows:
 4. Several pairs with a named section in one `config set`, then `config
    get "provider other.url"`: yes, by the real-harness smoke on Windows.
 
-Since your page fix (3edebbc): `smoke-other.sh` has your six page checks
+Since your page fix (1e00fdf): `smoke-other.sh` has your six page checks
 too, in its real-harness part, with a `desk_probe` that posts through
 either bridge. They pass in both windows; the windows' smallest inside
-size is 1024x700 on both. CI on 7476686: the three desk app jobs passed;
+size is 1024x700 on both. CI on 51343d6: the three desk app jobs passed;
 mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber` once.
 
 Two specs for the owner since, neither with work for you:
@@ -563,14 +596,14 @@ against the spec and adjust.
 
 | Branch | What | State |
 |---|---|---|
-| `platform/desk-mac` | harness-desk for macOS | merged into harness-logins (d252816): reviewed, unit 61/61, window smoke 46/46 |
+| `platform/desk-mac` | harness-desk for macOS | merged into harness-logins (2925a27): reviewed, unit 61/61, window smoke 46/46 |
 | `platform/desk` | harness's side and the desk page | merged into harness-logins: reviewed, unit 1513/1535, smoke 162 (195 with the stand-ins); avatar.js, fit.js and three.js are stand-ins until the avatar lands |
-| `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | merged (2ec85ec) |
-| `platform/desk-voice` | the desk's voice: any provider that speaks OpenAI's or Gemini's format | merged (aea003e) |
+| `platform/desk-avatar` | the 3D head module, the fit, `harness avatar check` | merged (b8aa689) |
+| `platform/desk-voice` | the desk's voice: any provider that speaks OpenAI's or Gemini's format | merged (e9addff) |
 | `platform/desk-base-head` | a base head made from ICT-FaceKit (MIT), replacing the Face Cap one | merged as one commit (squashed, so the 3.3 MB file is in history once) |
-| `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | merged (453b522) |
-| `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | merged (99463fd) |
-| `platform/desk-app-setup` | the macOS app carries harness and sets it up (one download, the Set up screen, the key in a native field) | merged (8c4130a); see "the app sets harness up" above |
+| `platform/desk-alone` | `harness run` without Telegram, `harness config set`, `utc_offset = auto` | merged (975e581) |
+| `platform/desk-fit-files` | the fit files in the release archives and served from beside the binary; the no-avatar stage | merged (cdfcb6f) |
+| `platform/desk-app-setup` | the macOS app carries harness and sets it up (one download, the Set up screen, the key in a native field) | merged (ebc60e6); see "the app sets harness up" above |
 
 ### The desk app's code is yours to extend
 
@@ -792,7 +825,7 @@ For you:
 - Linux differs in three ways the README states: no speech synthesis, a
   clicked link in a framed app opens the system browser, and the window's
   place is the desktop's on Wayland.
-- CI 45612749693 (7e4fa7f, the sandbox default): every job passed but
+- CI 45612749693 (04cc265, the sandbox default): every job passed but
   macOS harness, whose Debug pass was whole (1536 pass, smoke all ok: the
   default holds under sandbox-exec) and whose ReleaseSafe pass failed
   `an_item_expires_at_approval_seconds_or_its_turns_end` with
@@ -855,7 +888,7 @@ changed in shared code, so Part 2 doesn't collide:
   `sandbox.zig`. Windows: nothing POSIX-only; paths joined with
   `std.fs.path.join`.
 
-## CI after your cmd push (772c8c4, dfb489f): red on Windows
+## CI after your cmd push (f90634c, 69c9555): red on Windows
 
 Runs 45388410033 and 45392418965 fail on Windows, in Debug, in
 `core.test.env_check_probes_a_sandbox_and_a_copy_environment`:
@@ -868,10 +901,10 @@ error.Unexpected NTSTATUS=0xc0000043 (SHARING_VIOLATION)
 - `writeReplaceWaiting` already waits 2 s for a held file, so something
   holds it longer. Likely the launcher, or its logon session's drives,
   still has the file open after the check.
-- It passed on Windows at 2d3c3d2, just before your push.
+- It passed on Windows at 34db509, just before your push.
 - It's yours to fix, since it needs a Windows machine.
 
-Still red at 615d9f3 (run 45414619782), the injection checks' merge.
+Still red at b74917c (run 45414619782), the injection checks' merge.
 That merge's unit tests all pass on Windows: 1235/1286, 50 skipped, and
 `env_check` is the only failure. The smoke step depends on the unit
 step, though, so the injection demo hasn't had its first Windows run.
@@ -880,7 +913,7 @@ It runs once `env_check` passes.
 The same runs also failed on all three systems in
 `calendar_attendees_become_people`. That one is ours: the test read the
 real clock, and the fixture has a busy event from 12:00 to 13:00 UTC on
-2026-11-24. It's fixed in ed34e74 with a fixed clock.
+2026-11-24. It's fixed in 96875fd with a fixed clock.
 
 ## Built: a persona, one chat filed into topics, helpers main manages (2026-11-24)
 
@@ -961,7 +994,7 @@ them; the versions folder is opened `.iterate = true`.
 ## Built: the Hermes import (2026-11-24)
 
 Spec: `docs/superpowers/specs/2026-11-24-harness-hermes-import-design.md`
-(91a62e0, approved by the owner); plan with its rulings:
+(1c17e70, approved by the owner); plan with its rulings:
 `docs/superpowers/plans/2026-11-24-hermes-import.md`. Branch
 `platform/hermes-import`, merged with `harness-logins` (the injection
 checks) at the end.
@@ -1086,9 +1119,9 @@ before starting one. (The Hermes import is being built, see above.)
 
 ## Latest from the Mac session (2026-11-24)
 
-Fetch `harness-logins` (123eadd or later). Since your apps push:
+Fetch `harness-logins` (2974d9b or later). Since your apps push:
 
-- **Your apps batch is merged** into the household (11946c5). One
+- **Your apps batch is merged** into the household (399ac1f). One
   conflict, `close()`'s wait loop: the app server stops first, then both
   sides' running flags are waited on, then the apps' jobs are freed.
 - **A who kind of harness's own: `harness:NAME`** (security review).

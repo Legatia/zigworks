@@ -490,7 +490,7 @@ smoke all ok; Linux (WSL, user tester) 999 pass, 19 skip, smoke all ok
 run alone, and the one failure this machine's WSL always has
 (`mcp_list_says_each_servers_kind_sign_in_and_tools`).
 
-## 9. cmd's own commands in a Windows sandbox (2026-11-24, branch `win/cmd`, on `harness-logins` 2d3c3d2)
+## 9. cmd's own commands in a Windows sandbox (2026-11-24, branch `win/cmd`, on `harness-logins` 34db509)
 
 The owner's decision on 7.4: fix it.
 
@@ -600,7 +600,7 @@ nothing; a real drive's root still refused),
 `the_sandbox_launcher_starts_nothing_it_was_not_told_to`,
 `env_check_probes_a_sandbox_and_a_copy_environment` (its new line).
 
-At 772c8c4: Windows 11 1172 pass, 48 skip, smoke all ok; Linux (WSL, user
+At f90634c: Windows 11 1172 pass, 48 skip, smoke all ok; Linux (WSL, user
 tester) 1198 pass, 21 skip, smoke all ok run alone, and the one failure
 this machine's WSL always has. With the built binary: `harness env check
 box` says "cmd's own dir, del, ren, copy, move: yes"; `harness
@@ -609,7 +609,7 @@ sandbox-launch` by hand starts nothing (exit 125).
 Left: GitHub's Windows runners were not tried before the push; if the
 service is off there, the tests that need the drives say so in CI.
 
-## 10. Unattended runs in a sandbox (2026-11-25, branch `win/sandbox-default`, on `harness-logins` 693ee01)
+## 10. Unattended runs in a sandbox (2026-11-25, branch `win/sandbox-default`, on `harness-logins` 4b6fe0b)
 
 Part 2 of `docs/superpowers/specs/2026-11-24-harness-money-budget-and-sandbox-default-design.md`
 (the owner: "Sandbox on priority"; approved as "Approve 1"). Part 1 is the
@@ -709,11 +709,11 @@ with "Allow for this task" (`shell@sandbox`), as on the host before.
 
 Also changed: `/env rm sandbox` says the built-in one stays; smoke has two
 checks (`harness env list` names the built-in sandbox; doctor's line).
-After the merge of the Mac session's desk (2f458ff), its test
+After the merge of the Mac session's desk (9f71e2f), its test
 `enter_sets_a_session_cookie_once` failed on Windows (it walks a folder
-not opened for listing): the fixture opens it so (5594b23).
+not opened for listing): the fixture opens it so (556b019).
 
-Numbers, on the merge with origin 2f458ff (5594b23):
+Numbers, on the merge with origin 9f71e2f (556b019):
 
 - Windows 11: 1502 pass, 56 skip, 0 fail; smoke all ok.
 - Linux (WSL, user tester): 1536 pass, 21 skip, and the one failure this
@@ -916,7 +916,7 @@ Rulings:
 - R66. **CI packs without the fit files** (`DESK_ASSETS=none`), as the
   macOS job does; the release steps pack strictly and fail without them,
   as harness's own archive does. (The base head came into the repository
-  later the same night, ff54518.)
+  later the same night, 77d75a5.)
 - R67. **The data folder's parents are made on Windows** (a new computer
   has no `%LOCALAPPDATA%\harness` yet).
 - R68. **The usual models stay as the Mac session named them;** what the
@@ -934,11 +934,11 @@ Verification (2026-11-25):
   111 of 111 on Linux. init, config set with a named section, secret add,
   harness run with no Telegram, the real desk entered, "Provider and
   key…" reading the settings back, Stop; and, taken from `smoke.sh` after
-  the Mac session's page fix (3edebbc), the real desk page in these
+  the Mac session's page fix (1e00fdf), the real desk page in these
   windows: a long conversation leaves the message field inside the window
   at the size it opens at and at its smallest (1024x700 inside on both),
   the newest message stays shown, the sound button draws waves or a cross.
-- On GitHub (run 45681862540, 7476686): `desk-app-windows`,
+- On GitHub (run 45681862540, 51343d6): `desk-app-windows`,
   `desk-app-linux` and `desk-app-macos` passed, with every other job but
   one: mailmcp on Linux failed `idle_pushes_new_mail_to_a_subscriber`,
   which nothing here touches.

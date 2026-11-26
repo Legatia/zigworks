@@ -8,7 +8,7 @@
 
 **Tech Stack:** Zig 0.17.1, std only; the desk is plain HTML/CSS/JS in the binary; POSIX sh for the packing script; GitHub Actions.
 
-**Spec:** `docs/superpowers/specs/2026-11-24-harness-desktop-app-design.md`, "First run, and the desk alone (added 2026-11-25)" › "The fit files and an empty stage" (as of 9ad4fe3, binding).
+**Spec:** `docs/superpowers/specs/2026-11-24-harness-desktop-app-design.md`, "First run, and the desk alone (added 2026-11-25)" › "The fit files and an empty stage" (as of 3ceecf8, binding).
 
 ## Global Constraints
 
@@ -120,11 +120,11 @@
 
 ## Done
 
-- Base (9ad4fe3), Debug: unit 1560/1582 (22 skipped); smoke all ok but for this branch's 3 new checks (written before the code).
+- Base (3ceecf8), Debug: unit 1560/1582 (22 skipped); smoke all ok but for this branch's 3 new checks (written before the code).
 - Head, Debug and ReleaseSafe: unit 1573/1595 (22 skipped), smoke all ok (the 3 new fit-file checks among them). Cross builds and unit-builds for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl ok.
 - Seen once under load (screenshots and builds beside the suite): core `a_quick_reply_counts_once_and_not_after_a_restart` timed out; 5/5 alone and green in both later full runs; this branch doesn't touch it.
 - `desk_settings_written_one_at_a_time` passed before its fix too: the lost update isn't reproducible on demand; kept as a guard.
 - The packing run locally from a temp copy holding the licence-held base head (never committed): a real fetch; kept files by hash; a changed pinned hash (exit 1, the fetch's own line); no base head, no notice beside it, a colliding NOTICE.txt, a failing fetch (exit 1, one line each). The archive laid out as the workflow does (aarch64-macos, ReleaseSafe). The workflow itself is unrun (it needs a tag).
 - Checked in headless Chrome against a throwaway harness and the stand-in: the empty stage and the no-fit-files Settings at 820 and 1456 px, under light and dark emulation; reduced motion stops the breathing; a pack that fails to load gives the outline; with the fit files, an upload and fit in the page loads one avatar (two before the review fix).
-- Final review (fresh reviewer): no Critical; 3 Important fixed (424d071); its 6 Minor all fixed there too.
+- Final review (fresh reviewer): no Critical; 3 Important fixed (d4ae0e0); its 6 Minor all fixed there too.
 - Left: replies aren't read aloud while there's no avatar (speech plays through the avatar module); THIRD-PARTY-mediapipe.txt not checked against MediaPipe 0.10.14's build files; the desk app's bundle doesn't carry desk-assets/ yet (desk-app/ is another builder's).

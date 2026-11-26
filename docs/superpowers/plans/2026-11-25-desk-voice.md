@@ -8,7 +8,7 @@
 
 **Tech Stack:** Zig 0.17.1, std only; the desk page is plain JS/HTML/CSS in the binary.
 
-**Spec:** `docs/superpowers/specs/2026-11-24-harness-desktop-app-design.md`, section "Speech" (as of 479ceea, binding).
+**Spec:** `docs/superpowers/specs/2026-11-24-harness-desktop-app-design.md`, section "Speech" (as of dad9cea, binding).
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
 - Defaults (checked 2026-11-25): openai `tts-1`, `alloy`; gemini `gemini-3.8-flash-lite-tts`, voice `Schedar`. Gemini preset url `https://generativelanguage.googleapis.com/v1beta`, key in `x-goog-api-key`.
 - Request: `POST {url}/models/MODEL:generateContent`, body `{"contents":[{"parts":[{"text":TEXT}]}],"generationConfig":{"responseModalities":["AUDIO"],"speechConfig":{"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":VOICE}}}}}`.
 - Never a real key, never Google's or OpenAI's real API: the stand-in only.
-- Baseline (479ceea): measured at the start (Done). From `harness/`: `.superpowers/suite.sh TAG [Debug|ReleaseSafe]` (stand-ins built into `.superpowers/bin`, `--cache-dir .superpowers/cache`); `-Dtest-filter=NAME` while iterating; cross builds `zig build` and `zig build unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl.
+- Baseline (dad9cea): measured at the start (Done). From `harness/`: `.superpowers/suite.sh TAG [Debug|ReleaseSafe]` (stand-ins built into `.superpowers/bin`, `--cache-dir .superpowers/cache`); `-Dtest-filter=NAME` while iterating; cross builds `zig build` and `zig build unit-build` for x86_64-windows, x86_64-linux-musl, aarch64-linux-musl.
 
 ## Checked against Google's docs (2026-11-25)
 
@@ -154,13 +154,13 @@
 
 ## Done
 
-- Commits: the plan (6bf57fa); api = gemini, x-goog-api-key, the preset, chat refused (74dd14a); the Speaker's Gemini format and WAV, the stand-in (4b54dc0); speak names any voice, defaults per kind (3cb9c86); Model and Voice in the settings (b3e0369); the page (9a90900); README, smoke (f0a683e); review fixes (5a6a20c).
-- Base (6bf57fa = 479ceea + the plan), Debug with the four stand-ins: unit 1536/1558 (22 skipped); smoke all ok, 197.
-- Head (5a6a20c; the merge of origin/harness-logins was "Already up to date"), Debug and ReleaseSafe with the four stand-ins: unit 1560/1582 (22 skipped); smoke all ok, 200 (the 3 new among them). Cross builds and unit-builds for x86_64-windows, x86_64-linux-musl and aarch64-linux-musl ok.
-- origin/harness-logins had nothing past 479ceea at the end (fetched): the merge was "Already up to date".
+- Commits: the plan (6153f79); api = gemini, x-goog-api-key, the preset, chat refused (ab7cf34); the Speaker's Gemini format and WAV, the stand-in (3ff92d6); speak names any voice, defaults per kind (2a85881); Model and Voice in the settings (52665df); the page (570475b); README, smoke (0f304e8); review fixes (7cc2052).
+- Base (6153f79 = dad9cea + the plan), Debug with the four stand-ins: unit 1536/1558 (22 skipped); smoke all ok, 197.
+- Head (7cc2052; the merge of origin/harness-logins was "Already up to date"), Debug and ReleaseSafe with the four stand-ins: unit 1560/1582 (22 skipped); smoke all ok, 200 (the 3 new among them). Cross builds and unit-builds for x86_64-windows, x86_64-linux-musl and aarch64-linux-musl ok.
+- origin/harness-logins had nothing past dad9cea at the end (fetched): the merge was "Already up to date".
 - Tests changed on purpose: config `desk_section_reads_and_checks` (speak_model/speak_voice default ""; speak = gemini and api = gemini sections read; speak = openrouter refused); voice `speaker_posts_json_and_returns_audio` (reads `.bytes`, checks `audio/mpeg`); model `provider_presets_resolve_and_old_settings_still_reach_omnigate` (the gemini preset row). No other existing test changed.
 - New tests: model `gemini_is_a_preset_for_speech_only`, `key_headers_follow_auth`; config `providers_take_api_gemini_and_its_key_header`, `a_chat_model_on_gemini_is_refused`, `speakers_are_the_two_presets_and_speaking_sections`, `an_old_inits_openai_lines_never_reach_gemini`, `a_preset_made_to_speak_another_format_is_no_voice`; hermes `a_hermes_model_on_gemini_is_left_to_set_by_hand`; voice `gemini_speech_posts_generate_content_and_wraps_pcm_as_wav`, `gemini_wav_passes_through_and_pcm_is_wrapped`, `gemini_without_audio_says_why`, `gemini_errors_are_said_in_the_providers_words`, `gemini_takes_auth_and_headers_as_its_section_says`, `a_model_name_is_one_path_segment`, `wav_header_is_mono_16_bit`, `pcm_rate_reads_the_mime_type`, `speak_defaults_per_kind`; mail `unset_key_removes_only_that_key`; core `desk_speech_reads_aloud_through_gemini_as_wav`, `desk_speech_uses_each_kinds_defaults_and_the_desks_choice`, `desk_model_and_voice_are_checked_then_written`, `choosing_another_kind_clears_model_and_voice`, `desk_settings_list_every_speaker_with_its_defaults`, `the_desk_state_reads_whatever_the_voices_are`; appserver's page test extended; smoke 3 checks.
 - Checked by eye in headless Chrome against a throwaway harness and the stand-in (deleted after): gemini chosen (Model/Voice with gemini-3.8-flash-lite-tts and Schedar greyed in, where replies go, the free-tier line), openai (tts-1/alloy, "No openai key is stored (harness secret add openai)."), Off (fields hidden, the free-tier line shown); typing a voice writes it; a bad model is refused with the line; a reply's speech came back 200 `audio/wav` and `decodeAudioData` (the avatar's path) decoded it.
-- Final review (fresh reviewer, opus): no Critical; 2 Important and one Minor re-graded Important, fixed test-first (5a6a20c); 5 Minor deferred (the ledger's `Final: minor` lines).
+- Final review (fresh reviewer, opus): no Critical; 2 Important and one Minor re-graded Important, fixed test-first (7cc2052); 5 Minor deferred (the ledger's `Final: minor` lines).
 - Seen once under load: core `a_text_reply_to_an_approval_denies_it_and_the_agent_gets_the_reason` timed out while the reviewer ran beside the suite; 6/6 alone and green in every later run; it touches nothing this branch changed.
 - Left: OpenAI shuts its Speech API models down on 2027-01-06 (the spec's openai defaults stop then); the deferred minors; speech with the real Gemini and OpenAI APIs is untried (no key here, by rule).

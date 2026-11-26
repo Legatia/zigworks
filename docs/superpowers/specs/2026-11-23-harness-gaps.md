@@ -298,7 +298,7 @@ tried against Telegram yet:
 
 **llmcheck hangs on Windows CI (2026-11-24).** It hung three times in one day:
 
-- at 2d3c3d2, failed after 8 minutes;
+- at 34db509, failed after 8 minutes;
 - run 45414619782, 52 minutes with no log;
 - run 45485959370, 59 minutes with no log.
 
