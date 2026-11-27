@@ -1215,6 +1215,25 @@ test "a_by_section_allows_for_that_origins_runs" {
     try t.expectEqual(.ask, f.act(.fetch, u, .{}));
 }
 
+test "a_client_section_reaches_that_client_only" {
+    var f: Fixture = undefined;
+    try f.init("[client:one]\nallow mcp fake/echo *\n[client]\ndeny mcp fake/drop *\n");
+    defer f.deinit();
+    const one: Who = .{ .by = "client:one", .agent = "" };
+    const two: Who = .{ .by = "client:two", .agent = "" };
+    try t.expectEqual(.allow, f.act(.mcp, "fake/echo {}", .{ .who = one }));
+    try t.expectEqual(.ask, f.act(.mcp, "fake/echo {}", .{ .who = two }));
+    // every client's section
+    try t.expectEqual(.deny, f.act(.mcp, "fake/drop {}", .{ .who = one }));
+    try t.expectEqual(.deny, f.act(.mcp, "fake/drop {}", .{ .who = two }));
+    try t.expectEqual(.ask, f.act(.mcp, "fake/drop {}", .{}));
+    // a day's grant is one client's
+    try f.grants.addFor(.mcp, "", "fake/list", "client:two", 5000);
+    try t.expectEqual(.allow, f.act(.mcp, "fake/list {}", .{ .who = two }));
+    try t.expectEqual(.ask, f.act(.mcp, "fake/list {}", .{ .who = one }));
+    try t.expectEqual(.ask, f.act(.mcp, "fake/list {}", .{}));
+}
+
 test "a_harness_section_never_reaches_a_schedule_of_the_same_name" {
     var f: Fixture = undefined;
     try f.init("[harness:away]\nallow mcp home/home_set {\"action\":\"on\",\"device\":\"living_room_light\"}\n[harness:people]\ndeny search *\n");

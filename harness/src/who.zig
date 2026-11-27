@@ -13,6 +13,7 @@ pub const Who = struct {
     /// `schedule:NAME`, `trigger:NAME`, `workflow:NAME/STEP`, `app:NAME`,
     /// `member:NAME` (a household member's message), `room:NAME` (speech
     /// in a room of the house, through Home Assistant's voice satellites),
+    /// `client:NAME` (an outside agent's call through the proxy),
     /// `harness:NAME` (harness's own jobs: away mode, the people's pass;
     /// no settings file names one into being, so no task, brief, schedule
     /// or trigger the owner names the same ever has its rules).
@@ -31,7 +32,7 @@ pub const Who = struct {
 };
 
 /// The kinds of a who: what started a run, and `agent` for definitions.
-const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member", "room", "harness" };
+const kinds = [_][]const u8{ "owner", "schedule", "trigger", "workflow", "app", "agent", "member", "room", "harness", "client" };
 
 /// A household member's (`member:NAME`), or a pattern of members' (`member`,
 /// `member:a*`).
@@ -205,6 +206,22 @@ test "who_patterns_match_by_and_definitions" {
     try t.expect(matchesAgent("agent", "coder"));
     try t.expect(!matchesAgent("owner", "main"));
     try t.expect(!matchesAgent("agent:coder", "main"));
+}
+
+test "client_is_a_who" {
+    try t.expect(isValue("client:claude-code"));
+    try t.expect(isPattern("client"));
+    try t.expect(isPattern("client:c*"));
+    try t.expect(!isValue("client:c*"));
+    try t.expect(matchesBy("client:c*", "client:claude-code"));
+    try t.expect(matchesBy("client", "client:codex"));
+    try t.expect(!matchesBy("client", "app:codex"));
+    try t.expect(!matchesBy("client:codex", "client:claude-code"));
+    // someone is there to ask: an outside agent's call waits for its answer
+    const w: Who = .{ .by = "client:codex", .agent = "" };
+    try t.expect(!w.unattended());
+    try t.expectEqual(Reach{ .by = true }, reach("client:codex", w));
+    try t.expectEqual(Reach{}, reach("agent:main", w));
 }
 
 test "a_pattern_reaches_the_definition_its_delegators_or_the_origin" {

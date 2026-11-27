@@ -72,9 +72,11 @@ jobs:
       # canmcp's bus checks need vcan0; they are skipped without it
       - if: matrix.project == 'canmcp'
         run: sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0 || echo "no vcan on this runner"
+      # harness's tests that start a browser are not run here but in the
+      # harness-browser job below (-Dbrowser-tests=false skips them)
       - run: |
           set -o pipefail
-          zig build test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
+          zig build test --summary all ${{ matrix.project == 'harness' && '-Dbrowser-tests=false' || '' }} 2>&1 | tee "$RUNNER_TEMP/test.log"
       # The log can't be read without signing in; annotations can. Put the
       # lines of a failed run that say what failed onto the run.
       - if: failure()
@@ -84,8 +86,43 @@ jobs:
           done
       # Optimized code with safety checks on: catches overflow that only shows
       # up after optimization (headsight's diff did, on Zig 0.15.1 and 0.17.1).
-      - run: zig build test -Doptimize=ReleaseSafe
+      - run: zig build test -Doptimize=ReleaseSafe ${{ matrix.project == 'harness' && '-Dbrowser-tests=false' || '' }}
       - run: zig build -Doptimize=ReleaseFast
+
+  # harness's tests that start a browser (the runner's Chrome; Chrome or
+  # Edge on Windows), as a job of their own: one of them fails on a runner
+  # now and then, cause not found, and this job can be run again without
+  # the rest of harness's suite. `zig build browser-test` first checks that
+  # every test that starts a browser is among the ones it runs
+  # (harness/scripts/check-browser-tests.sh).
+  harness-browser:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: harness
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.17.1
+      # user namespaces, as the test job has them for harness (the browser's
+      # own sandbox uses them)
+      - if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - run: |
+          set -o pipefail
+          zig build browser-test --summary all 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - if: failure()
+        run: |
+          grep -a -E "FAIL|failed|expected|error:|starts a browser" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
+            echo "::error::harness (browser): ${line:0:500}"
+          done
+      - run: zig build browser-test -Doptimize=ReleaseSafe
 
   # harness-desk, the desk's macOS app: the one piece built with the
   # system's own libraries (Cocoa, WebKit), so it has a job of its own. Its

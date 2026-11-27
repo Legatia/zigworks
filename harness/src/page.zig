@@ -2065,9 +2065,7 @@ test "render_example_com_with_a_real_browser" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const env_chrome: []const u8 = if (t.environ.getPosix("HARNESS_CHROME")) |v| v else "";
-    const env_path: []const u8 = if (t.environ.getPosix("PATH")) |v| v else "";
-    const browser = (try findBrowser(a, t.io, "", env_chrome, env_path)) orelse return error.SkipZigTest;
+    const browser = (try @import("cdp.zig").testBrowser(a)) orelse return error.SkipZigTest;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(t.io, ".", a);

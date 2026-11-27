@@ -58,10 +58,11 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1189 unit tests (20 of
-them don't run on macOS: Windows or Linux only), among them the browser
+**State: 0.4.0, tested on macOS by its own tests: 1716 unit tests (25 of
+them don't run on macOS: Windows or Linux only, or asking for the
+network), among them the browser
 and login tests against headless Chrome and local pages, and an
-end-to-end script of 109 checks that drives the real binary against
+end-to-end script of 183 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, three
 MCP servers run as programs (one a shop, ordered from on a tap), and MCP
@@ -83,8 +84,8 @@ Medication reminders, bedtime, habits, the evening message and the
 butler's manner are tested by unit tests with a fake clock, a written log
 and the stand-ins only: no real household or week of habits yet. Away
 mode, trips and the doorbell are tested against stand-ins only (no real
-doorbell, trip, airline or flight-status server yet). An earlier build
-of 0.3.0 also passed its tests in CI on Linux and Windows. Emergencies
+doorbell, trip, airline or flight-status server yet). 0.4.0 also passed
+its tests in CI on Linux and Windows. Emergencies
 (escalation to the household, the leak's fallback, the smoke routine)
 are tested against stand-ins only: no real household, alarm or valve
 yet. Warming the car is tested against a stand-in of carcloud with a
@@ -95,9 +96,12 @@ Credential Manager and process-cleanup checks of HANDOFF-windows-audit.md
 were run by hand. With environments, apps, clones and safe state files
 added, Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their
 unit tests and the end-to-end script; on macOS 15.7 the sandbox
-(sandbox-exec) and APFS clone tests run with the rest. Nothing has run
-yet against a real omnigate or model provider, Telegram bot,
-transcription service, MCP server, authorization server, website, Home
+(sandbox-exec) and APFS clone tests run with the rest. One day's use on
+Windows 11, in `harness chat` and the desk app, was with a real model
+(Anthropic's). Nothing has run
+yet against a real omnigate, Telegram bot,
+transcription service, MCP server, other agent at the proxy (Claude Code,
+Codex, Hermes), authorization server, website, Home
 Assistant, Smartcar or mail server; mail (the butler's address and your
 mailbox) is tested against a stand-in of mailmcp, and mailmcp against
 its own stand-in IMAP and SMTP server.** See [Limits](#limits).
@@ -463,6 +467,7 @@ every call.
 | `[agent:helper]` | helpers' calls |
 | `[agent:NAME]` | the calls of definition NAME (`agents/NAME.md`), wherever it runs |
 | `[room]`, `[room:NAME]` | speech in the house, through Home Assistant's voice satellites (see Home Assistant's voice) |
+| `[client]`, `[client:NAME]` | another agent's calls of your MCP servers' tools, through the proxy (see MCP, "For other agents") |
 | `[harness:NAME]` | harness's own jobs, which nobody watches: `away` and `trips` (Away and travel), `warm-car`, `people`, `lists`, `reorder`, `deliveries`, `upkeep`, `habits`, `evening`. No task, brief, schedule or trigger is ever one, so a task you call `away` never gets `[harness:away]`'s lines |
 
 A kind alone covers all its names (`[schedule]`), and `*` works as in
@@ -1881,7 +1886,8 @@ and on macOS and Windows `Notes/A`, are `notes/a`; `notes2` is not in
 `notes`. `/folders` shows the sections (variable names and the secrets
 they come from, never values); `/access WHO` says where WHO may read,
 write and start commands (`/access agent:helper`, `/access
-schedule:NAME`, `/access agent:main trigger:NAME`).
+schedule:NAME`, `/access agent:main trigger:NAME`, `/access
+client:NAME`).
 
 Roles bind harness's own file tools and where a command starts. On this
 machine an approved command still runs as you and can `cd` anywhere (see
@@ -3036,6 +3042,121 @@ section, a per-tool `amount` names only tools listed there, and `none` is
 said per tool, never alone. A server whose `money =` names a tool it does
 not have is not started.
 
+### For other agents (the proxy)
+
+Another agent on this machine (Claude Code, Codex, Hermes, a script) can
+be given harness as its one MCP server instead of your servers and their
+keys. Each of its calls is decided by the gate as a call of that agent,
+asked of you where a rule or the default says ask, logged, and only then
+passed to the real server. The other agent never holds the server's key.
+
+```ini
+; config.ini
+[proxy]
+listen = 127.0.0.1:8766     ; off: no proxy
+
+[client claude-code]
+servers = github, notes     ; mcp.ini's servers this client may reach
+; token = client-claude-code  ; the stored secret holding its token
+; money = off                 ; on: it may call tools that move money (asked every time)
+```
+
+```
+harness secret add client-claude-code     # a token of 32 characters or more, yours to make up
+```
+
+The proxy runs inside `harness run`, at `http://127.0.0.1:8766/mcp`
+(Streamable HTTP, a bearer token, this machine only: an address that is
+not 127.0.0.1 or ::1 is refused when the file is read; an agent on
+another machine reaches it through an SSH tunnel). harness never prints
+the token; you paste it into the other agent's settings:
+
+```
+# Claude Code
+claude mcp add --transport http harness http://127.0.0.1:8766/mcp \
+  --header "Authorization: Bearer THE-TOKEN"
+```
+
+```toml
+# Codex: ~/.codex/config.toml, with the token in the variable HARNESS_TOKEN
+[mcp_servers.harness]
+url = "http://127.0.0.1:8766/mcp"
+bearer_token_env_var = "HARNESS_TOKEN"
+tool_timeout_sec = 660
+```
+
+```yaml
+# Hermes: ~/.hermes/config.yaml
+mcp_servers:
+  harness:
+    url: "http://127.0.0.1:8766/mcp"
+    headers:
+      Authorization: "Bearer THE-TOKEN"
+    timeout: 660
+```
+
+- **What a client sees.** The tools of the servers its section names,
+  under the names harness's own agent sees (`github__list_issues`), with
+  their descriptions and input schemas. A server that is not named is not
+  there for it, and there is no `servers = *`: a new server in mcp.ini
+  reaches no outside agent until you name it. harness's own tools (files,
+  shell, web, send, memory) are not offered. Tools that move money are
+  listed only with `money = on`.
+- **A call is that client's.** It runs as `client:NAME`, with no agent
+  definition, no model call and no conversation of its own: hard limits,
+  deny rules, grants, the default for MCP tools (ask), allow and ask
+  rules. Rules for it go in `[client:NAME]` or `[client]` sections of
+  rules.ini (see The gate); `/access client:NAME` answers as `/access
+  app:NAME` does.
+- **Asking.** A call the gate asks about is an approval in your inbox
+  (conversation `main`), its text starting `[client:NAME] `. The other
+  agent's request waits for your answer, at most `[limits]
+  approval_seconds`. "Allow 24 h" covers that tool for that client only.
+  A denial, no answer in time, or a refusal comes back as the tool's
+  result with `isError` and the gate's sentence ("refused by the gate:
+  ...").
+- **The other agent's own timeout.** Set it above `approval_seconds`
+  (10 minutes unless you changed it), as `tool_timeout_sec = 660` and
+  `timeout: 660` do above: Codex waits 60 seconds for a tool by default
+  and Hermes 300, Claude Code long enough as it is. When the other agent
+  gives up first or you stop it, it hangs up: the approval is withdrawn
+  ("its run stopped") and the call is not made, also when you press
+  "Allow once" a moment later. `/stop` ends waiting calls too. The log
+  says of such a call "stopped (its client hung up, or /stop)": harness
+  can't tell which of the two it was.
+- **Money.** Without `money = on` a money tool is refused for a client.
+  With it, each call is asked every time (there is no "Allow 24 h"),
+  within the caps of `[money]` and the server, and written to the money
+  record.
+- **What goes back** is the server's answer as text, with your stored
+  secrets masked, as harness's own agent would get it.
+- **The log** has each decision and call with `"run":"client NAME"`,
+  `"by":"client:NAME"`, never the token. While `main` is private
+  (`/private on`), a client's calls are logged as every run's are then:
+  the tool, the decision and who, with sizes and hashes in place of the
+  arguments and the answer.
+
+A client's name uses a-z, 0-9, - and _, up to 32; at most 16 clients. A
+client whose token is not stored, is shorter than 32 characters, or is the
+same as an earlier client's is not served: `/status` says which and why
+on its `Proxy:` line (with the servers a client names that mcp.ini doesn't
+have), and you are told once. With no `[client NAME]` section nothing
+listens. `harness config set client claude-code.servers "github, notes"`
+works as for the provider sections.
+
+`/reload` applies changes: the proxy restarts, and its connections end,
+only when its address or a served client's name, token, servers or money
+changed. While a client's call goes or waits for your answer, `/reload`
+answers "Busy; send /reload again when nothing is running." and
+`/status`'s `Proxy:` line ends "Clients' requests going or waiting: 1.";
+a request
+that arrives while the servers restart waits up to 3 seconds, then is
+answered with an error to ask again. After a reload that changes the
+tools, a client learns of it when it lists again. A client may have 4
+calls going at once; the proxy takes 32 connections, bodies up to 1 MiB,
+and refuses a request a web page sends (one with a foreign `Origin`).
+MCP resources and prompts are not passed.
+
 ## Skills
 
 Skills are folders in the agentskills.io format (`skills/NAME/SKILL.md`
@@ -4111,7 +4232,7 @@ only while `harness run` holds the folder and has ticked in the last 90 s;
   below it; a site needs a dot (except `localhost`), but harness doesn't
   know the public suffix list, so set the site no wider than needed.
 
-Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
+Not in 0.4.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, email, WhatsApp, Slack and voice as conversations
 (voice notes in Telegram and Home Assistant's voice satellites are in;
 spoken replies in Telegram are not), a reply in the room after you allow
@@ -4221,7 +4342,7 @@ zig build                     # zig-out/harness-desk.app, for this Mac
 zig build test --summary all  # unit tests
 zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py);
                               # DESK_SMOKE_HARNESS=PATH sets up a real harness once more
-scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
+scripts/package-macos.sh 0.4.0 harness-desk-0.4.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
 ```
 
 The package needs the fit files: `harness/scripts/pack-desk-assets.sh`
@@ -4297,7 +4418,7 @@ and SHA-256 in the script, which downloads and checks it):
     zig build test                             # the decisions: no window needed
     zig build app -Dwebview2=../../webview2    # zig-out/harness-desk/
     zig build smoke -Dwebview2=../../webview2  # in a window, against a stand-in harness (Git Bash, python)
-    scripts/package-windows.sh 0.3.0 harness-desk-0.3.0-windows.zip ../../webview2   # with harness.exe and the fit files
+    scripts/package-windows.sh 0.4.0 harness-desk-0.4.0-windows.zip ../../webview2   # with harness.exe and the fit files
 
 `DESK_SMOKE_HARNESS=PATH\harness.exe` adds the setup once more against
 that real harness (a data folder and a file store of the smoke's own, a
@@ -4367,7 +4488,7 @@ desktop's to choose.
     zig build test     # the decisions: no window needed
     zig build app      # zig-out/harness-desk/harness-desk
     zig build smoke    # in a window (under xvfb-run where there is no display), against a stand-in harness
-    scripts/package-linux.sh 0.3.0 harness-desk-0.3.0-linux-x86_64.tar.gz   # with harness and the fit files
+    scripts/package-linux.sh 0.4.0 harness-desk-0.4.0-linux-x86_64.tar.gz   # with harness and the fit files
 
 `DESK_SMOKE_HARNESS=PATH/harness` and `DESK_ASSETS=none` as on Windows.
 
@@ -4376,7 +4497,13 @@ desktop's to choose.
 ```
 zig build                     # zig-out/bin/harness, and harness-fake (the stand-ins)
 zig build test --summary all  # unit tests, then scripts/smoke.sh end to end
+zig build browser-test        # only the unit tests that start a browser
 ```
+
+The tests that start a browser (headless Chrome; Chrome or Edge on
+Windows) run with the rest, and are skipped where there is none.
+`zig build test -Dbrowser-tests=false` leaves them out; CI does, and runs
+`zig build browser-test` as a job of its own.
 
 The end-to-end script's home and butler checks run when homemcp and
 carcloud are built next to harness (`zig build` in `../homemcp` and

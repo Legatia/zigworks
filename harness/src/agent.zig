@@ -590,6 +590,9 @@ pub const Run = struct {
     /// Tools of the MCP servers that are running.
     mcp: []const McpTool = &.{},
     money: config.Config.Money = .{},
+    /// An outside agent's call (`client:NAME`) may move money: its
+    /// section's `money = on`.
+    client_money: bool = false,
     /// What money tools moved today; shared by all runs.
     money_ledger: ?*MoneyLedger = null,
     /// Where each automated spend is told (main, with a pause button);
@@ -2466,6 +2469,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
+    // an outside agent's calls move money only when its section says so
+    if (tool == .money and std.mem.startsWith(u8, r.who.by, "client:") and !r.client_money) {
+        const why = try std.fmt.allocPrint(a, "a client's calls move no money ([client {s}] money = on)", .{r.who.by["client:".len..]});
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
     // the house's speakers: at night only urgent triggers and workflows
     if (mt) |m| if (std.mem.eql(u8, m.tool, "announce")) {
         var from: ?*const Run = r;
@@ -3834,7 +3843,8 @@ fn decideAndAskWith(r: *Run, a: std.mem.Allocator, tool: gate.Tool, name: []cons
             .deny => why = try ownerSaid(a, "denied by the owner", got.text, got.item),
             .timeout => why = try ownerSaid(a, "no answer from the owner in time", "", got.item),
             .unsent => why = try ownerSaid(a, "the question could not be sent to the owner", "", got.item),
-            .withdrawn => why = try ownerSaid(a, if (r.env.stop.load(.acquire)) "stopped by the owner" else "withdrawn: no one is left to answer", "", got.item),
+            // a client's run stops when it hangs up, too: the flag is the same
+            .withdrawn => why = try ownerSaid(a, if (!r.env.stop.load(.acquire)) "withdrawn: no one is left to answer" else if (std.mem.startsWith(u8, r.who.by, "client:")) "stopped (its client hung up, or /stop)" else "stopped by the owner", "", got.item),
             .full => why = if (got.text.len > 0) got.text else "no place in the inbox until the turn's end",
             .answered => why = try ownerSaid(a, "not an answer to this question", "", got.item),
             .deferred => {
@@ -4483,6 +4493,12 @@ fn callMcp(r: *Run, a: std.mem.Allocator, m: *const McpTool, arg: []const u8, in
     if (m.money and dry) {
         releaseMoney(r, m, reserved);
         return .{ .text = try std.fmt.allocPrint(a, "dry run: would call {s}", .{arg}) };
+    }
+    // allowed, and its run stopped meanwhile (/stop, or a client of the
+    // proxy hung up as the owner answered): nothing is sent
+    if (r.env.stop.load(.acquire)) {
+        releaseMoney(r, m, reserved);
+        return .{ .text = "not called: its run stopped", .is_error = true };
     }
     // what is left of the turn, no more
     const full_ms: i64 = @as(i64, r.limits.turn_seconds) * 1000;
@@ -9101,6 +9117,50 @@ test "app_save_asked_every_time" {
     try t.expectEqual(1, desk.dropped);
     try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate") != null);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"tool\":\"app_save\"") != null);
+}
+
+test "a_clients_money_call_is_refused_without_money_on" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.who = .{ .by = "client:cc", .agent = "" };
+    f.run.money = .{ .max_per_call = 10 };
+    var got = try stepCall(&f.run, f.e.arena.allocator(), "fake__echo", "{\"text\":\"one\",\"amount\":1}");
+    try t.expect(got.is_error);
+    try t.expectEqualStrings("refused by the gate: a client's calls move no money ([client cc] money = on)", got.text);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"decision\":\"deny\",\"why\":\"a client's calls move no money ([client cc] money = on)\"") != null);
+    // switched on: asked every time, never for a day
+    f.run.client_money = true;
+    f.answer = .day;
+    got = try stepCall(&f.run, f.e.arena.allocator(), "fake__echo", "{\"text\":\"two\",\"amount\":1}");
+    try t.expect(!got.is_error);
+    try t.expectEqual(1, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(0, f.grants.items.items.len);
+    try t.expectEqual(@as(f64, 1), f.ledger.sum());
+}
+
+test "a_call_allowed_as_its_run_stops_is_not_made" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.who = .{ .by = "client:cc", .agent = "" };
+    f.run.money = .{ .max_per_call = 10 };
+    f.run.client_money = true;
+    // the client hangs up in the moment the owner allows
+    f.on_ask = &f.stop;
+    f.answer = .once;
+    const got = try stepCall(&f.run, f.e.arena.allocator(), "fake__echo", "{\"text\":\"one\",\"amount\":1}");
+    try t.expectEqual(1, f.asked);
+    try t.expect(got.is_error);
+    try t.expectEqualStrings("not called: its run stopped", got.text);
+    // nothing was sent, so nothing stays counted
+    try t.expectEqual(@as(f64, 0), f.ledger.sum());
 }
 
 test "an_apps_acts_and_runs_move_no_money" {

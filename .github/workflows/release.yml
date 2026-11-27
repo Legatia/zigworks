@@ -87,7 +87,11 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version in tag: $version"; exit 1; }
           grep -q "\"$version\"" "$project/build.zig.zon" || { echo "tag version $version not in $project/build.zig.zon"; exit 1; }
           cd "$project"
-          zig build test
+          # harness's tests that start a browser are CI's (ci.yml,
+          # harness-browser), not a release build's
+          test_flags=
+          if [ "$project" = harness ]; then test_flags=-Dbrowser-tests=false; fi
+          zig build test $test_flags
           if [ "${{ matrix.target }}" = native ]; then target_flag=-Dcpu=apple_m1; else target_flag=-Dtarget=${{ matrix.target }}; fi
           optimize=ReleaseFast
           case "$project" in harness|homemcp|carcloud) optimize=ReleaseSafe ;; esac

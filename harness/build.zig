@@ -47,22 +47,31 @@ pub fn build(b: *std.Build) void {
 
     // The unit tests get their own module so they can know where harness-fake
     // is (the MCP tests start it as a server).
-    const test_options = b.addOptions();
-    test_options.addOption([]const u8, "version", @import("build.zig.zon").version);
-    test_options.addOptionPath("fake_path", fake.getEmittedBin());
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = target.result.os.tag == .macos,
-    });
-    test_mod.addOptions("build_options", test_options);
-    test_mod.addImport("butler_files", butler_files);
-    linkSystem(b, test_mod, target);
+    // -Dbrowser-tests=false: the tests that start a browser (Chrome or Edge)
+    // are skipped here; the browser-test step below always runs them.
+    const browser_tests = b.option(bool, "browser-tests", "Run the tests that start a browser among the unit tests (default: true)") orelse true;
     // -Dtest-filter=NAME (more than once for more): only the unit tests whose name has it
     const filters = b.option([]const []const u8, "test-filter", "Run only the unit tests whose names contain this") orelse &.{};
-    const unit = b.addTest(.{ .root_module = test_mod, .filters = filters });
+    const tests: UnitTests = .{ .b = b, .target = target, .optimize = optimize, .fake = fake, .butler_files = butler_files };
+    const unit = tests.add(browser_tests, filters);
     const run_unit = b.addRunArtifact(unit);
+
+    // The tests that start a browser, alone (CI runs them as a job of their
+    // own: they wait on a real browser, and one fails there now and then,
+    // cause not found). A part of a test's full name each, FILE.test.NAME; a
+    // new test that calls cdp.testBrowser goes here, and
+    // scripts/check-browser-tests.sh fails this step until it does.
+    const browser_filters: []const []const u8 = &.{
+        "web.test.",
+        "cdp.test.chrome_over_a_pipe_evaluates_and_closes_without_leftovers",
+        "cdp.test.a_stop_ends_chrome_at_once",
+        "cdp.test.chrome_ends_when_harness_goes_away",
+        "cdp.test.chrome_is_never_signalled_after_it_was_reaped",
+        "page.test.render_loads_nothing_from_another_host",
+        "page.test.render_of_a_download_saves_nothing_and_says_so",
+        "page.test.render_example_com_with_a_real_browser",
+        "agent.test.web_fill_through_a_turn_keeps_the_value_out_of_requests_and_the_log",
+    };
 
     // The CLI end to end against a local stand-in upstream; no real keys.
     const sh = if (@import("builtin").os.tag == .windows) "sh" else "/bin/sh";
@@ -81,7 +90,41 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests and the CLI smoke tests");
     test_step.dependOn(&run_unit.step);
     test_step.dependOn(&smoke.step);
+
+    const listed = b.addSystemCommand(&.{ sh, "scripts/check-browser-tests.sh" });
+    listed.addArgs(browser_filters);
+    const run_browser = b.addRunArtifact(tests.add(true, browser_filters));
+    run_browser.step.dependOn(&listed.step);
+    b.step("browser-test", "Run only the unit tests that start a browser").dependOn(&run_browser.step);
 }
+
+/// The unit tests' program: with or without the tests that start a browser,
+/// and only the tests the filters name (all of them when there are none).
+const UnitTests = struct {
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    fake: *std.Build.Step.Compile,
+    butler_files: *std.Build.Module,
+
+    fn add(u: UnitTests, browser: bool, filters: []const []const u8) *std.Build.Step.Compile {
+        const b = u.b;
+        const options = b.addOptions();
+        options.addOption([]const u8, "version", @import("build.zig.zon").version);
+        options.addOptionPath("fake_path", u.fake.getEmittedBin());
+        options.addOption(bool, "browser_tests", browser);
+        const mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = u.target,
+            .optimize = u.optimize,
+            .link_libc = u.target.result.os.tag == .macos,
+        });
+        mod.addOptions("build_options", options);
+        mod.addImport("butler_files", u.butler_files);
+        linkSystem(b, mod, u.target);
+        return b.addTest(.{ .root_module = mod, .filters = filters });
+    }
+};
 
 fn linkSystem(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     switch (target.result.os.tag) {

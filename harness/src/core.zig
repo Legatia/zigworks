@@ -58,6 +58,7 @@ const household = @import("household.zig");
 const people_mod = @import("people.zig");
 const speech = @import("speech.zig");
 const voiceagent = @import("voiceagent.zig");
+const mcpserve = @import("mcpserve.zig");
 const butler = @import("butler.zig");
 const alerts_mod = @import("alerts.zig");
 const mail_mod = @import("mail.zig");
@@ -936,6 +937,25 @@ pub const Core = struct {
     voice_warn_buf: [300]u8,
     /// The address and token it runs with (SHA-256), for /reload.
     voice_key: [32]u8,
+    /// The MCP proxy for other agents (mcpserve.zig), while `harness run`
+    /// serves at least one client.
+    proxy: ?*mcpserve.Server,
+    /// Clients' listings and calls that go or wait for an approval: they
+    /// read the MCP servers' tool lists, so /reload is Busy meanwhile.
+    proxy_active: std.atomic.Value(u32),
+    /// What it runs with (SHA-256 over its address and each served
+    /// client's name, token, servers and money), for /reload.
+    proxy_key: [32]u8,
+    /// Guards `proxy_note`.
+    proxy_mutex: Io.Mutex,
+    /// What /status says of it ("": nothing); the gpa's.
+    proxy_note: []u8,
+    /// The last warning said of it (SHA-256): not said again at a /reload.
+    proxy_warned: [32]u8,
+    /// How long a client's request waits for servers that are restarting.
+    proxy_wait_ms: u32,
+    /// mcp.ini's servers by name (in `mcp_arena`), started or not.
+    mcp_names: []const []const u8,
     /// Speech's contexts, one per Home Assistant conversation.
     speech_contexts: speech.Contexts,
     /// A speech turn is going: one at a time.
@@ -1257,6 +1277,14 @@ pub const Core = struct {
         c.voice_note_len = 0;
         @memset(&c.voice_warn_buf, 0);
         c.voice_key = @splat(0);
+        c.proxy = null;
+        c.proxy_active = .init(0);
+        c.proxy_key = @splat(0);
+        c.proxy_mutex = .init;
+        c.proxy_note = &.{};
+        c.proxy_warned = @splat(0);
+        c.proxy_wait_ms = 3000;
+        c.mcp_names = &.{};
         c.speech_contexts = .init(gpa);
         errdefer c.speech_contexts.deinit();
         c.speech_busy = .init(false);
@@ -1413,10 +1441,12 @@ pub const Core = struct {
         if (c.worker) |w| w.join();
         // no speech from now on; its requests going end (their runs stopped)
         c.stopVoiceAgent();
+        // no call of another agent's from now on; those waiting are withdrawn
+        c.stopProxy();
         // no call of an app from now on; those going end (their runs stopped)
         if (c.app_server) |s| s.stop();
         c.app_server = null;
-        while (c.bg_active.load(.acquire) > 0 or c.app_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire) or c.habits_running.load(.acquire) or c.evening_running.load(.acquire) or c.away.job.load(.acquire) or c.trips.job.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while (c.bg_active.load(.acquire) > 0 or c.app_active.load(.acquire) > 0 or c.proxy_active.load(.acquire) > 0 or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.people_running.load(.acquire) or c.mail_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire) or c.habits_running.load(.acquire) or c.evening_running.load(.acquire) or c.away.job.load(.acquire) or c.trips.job.load(.acquire)) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         for (c.app_jobs.items) |j| {
             j.arena.deinit();
             c.gpa.destroy(j);
@@ -1429,6 +1459,8 @@ pub const Core = struct {
         c.log.write(.config, false, .{ .event = "stop" }) catch {};
         c.writeStatus() catch {};
         c.stopMcp();
+        c.gpa.free(c.proxy_note);
+        c.proxy_note = &.{};
         for (c.queue.items) |q| q.deinit(c.gpa);
         c.queue.deinit(c.gpa);
         c.run_flags.deinit(c.gpa);
@@ -1628,7 +1660,7 @@ pub const Core = struct {
         c.queue_mutex.lockUncancelable(c.io);
         var queue_locked = true;
         defer if (queue_locked) c.queue_mutex.unlock(c.io);
-        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
+        if (c.busy.load(.acquire) or c.queue.items.len > 0 or c.bg_active.load(.acquire) > 0 or c.proxy_active.load(.acquire) > 0 or c.restarting.load(.acquire) or c.polling.load(.acquire) or c.summary_job.running.load(.acquire) or c.diary.reading.load(.acquire) or c.errands.running.load(.acquire)) return "Busy; send /reload again when nothing is running.";
         var fresh: std.heap.ArenaAllocator = .init(c.gpa);
         const saved_cfg = c.cfg;
         const saved_rules = c.rule_list;
@@ -1723,6 +1755,8 @@ pub const Core = struct {
         defer c.restarting.store(false, .release);
         c.stopMcp();
         c.startMcp();
+        // other agents' proxy, before their requests are let in again
+        c.startProxy();
         // the calendar's server may be new: read it again at the next tick
         c.diary.next_read.store(0, .release);
         try c.log.write(.config, false, .{ .event = "reload" });
@@ -3147,6 +3181,264 @@ pub const Core = struct {
         if (c.voice_agent) |s| return std.fmt.allocPrint(a, "\nVoice agent: Home Assistant's requests on {s}.", .{s.address()});
         if (c.voice_note_len == 0) return "";
         return std.fmt.allocPrint(a, "\nVoice agent: {s}.", .{c.voice_note_buf[0..c.voice_note_len]});
+    }
+
+    // ---- the MCP proxy for other agents (mcpserve.zig) ----
+
+    /// Starts, keeps or stops the proxy as config.ini's `[proxy]` and
+    /// `[client NAME]` sections and the stored tokens say now; `harness
+    /// run` only. Called while nothing of a client's goes (at start, and in
+    /// a /reload while `restarting` is set), after the MCP servers started.
+    pub fn startProxy(c: *Core) void {
+        if (!std.mem.eql(u8, c.role, "run")) return;
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const listen = c.cfg.proxy.listen;
+        // no client: nothing runs and nothing is said
+        if (c.cfg.clients.len == 0) {
+            c.stopProxy();
+            c.proxyWarn("");
+            return c.setProxyNote("");
+        }
+        if (std.mem.eql(u8, listen, "off")) {
+            c.stopProxy();
+            c.proxyWarn("");
+            return c.setProxyNote("off ([proxy] listen = off)");
+        }
+        var served: std.ArrayList(mcpserve.ClientToken) = .empty;
+        var who: std.ArrayList(u8) = .empty;
+        var not: std.ArrayList(u8) = .empty;
+        var key = std.crypto.hash.sha2.Sha256.init(.{});
+        key.update(listen);
+        for (c.cfg.clients) |cl| {
+            const token: ?[]const u8 = if (c.store) |store| (store.get(c.io, a, cl.token) catch null) else null;
+            // masked wherever harness writes, served or not
+            if (token) |tk| c.masks.add(cl.token, tk) catch {};
+            const why: ?[]const u8 = blk: {
+                const tk = token orelse break :blk std.fmt.allocPrint(a, "is not stored (harness secret add {s})", .{cl.token}) catch "is not stored";
+                if (tk.len < mcpserve.min_token) break :blk std.fmt.allocPrint(a, "is shorter than {d} characters", .{mcpserve.min_token}) catch "is too short";
+                for (served.items) |s| if (std.mem.eql(u8, s.token, tk)) break :blk std.fmt.allocPrint(a, "is the same as {s}'s", .{s.name}) catch "is another client's";
+                break :blk null;
+            };
+            if (why) |w| {
+                not.print(a, "{s}{s}: its token ({s}) {s}", .{ if (not.items.len > 0) "; " else "", cl.name, cl.token, w }) catch return;
+                continue;
+            }
+            served.append(a, .{ .name = cl.name, .token = token.? }) catch return;
+            key.update("\x00c\x00");
+            key.update(cl.name);
+            key.update("\x00");
+            key.update(token.?);
+            key.update(if (cl.money) "\x00m" else "\x00-");
+            // "cc (fake; not in mcp.ini: github)"
+            who.print(a, "{s}{s} (", .{ if (who.items.len > 0) ", " else "", cl.name }) catch return;
+            var known: usize = 0;
+            for (cl.servers) |name| {
+                key.update("\x00s\x00");
+                key.update(name);
+                if (!c.hasMcpName(name)) continue;
+                who.print(a, "{s}{s}", .{ if (known > 0) ", " else "", name }) catch return;
+                known += 1;
+            }
+            if (known < cl.servers.len) {
+                who.appendSlice(a, if (known > 0) "; not in mcp.ini: " else "not in mcp.ini: ") catch return;
+                var missing: usize = 0;
+                for (cl.servers) |name| {
+                    if (c.hasMcpName(name)) continue;
+                    who.print(a, "{s}{s}", .{ if (missing > 0) ", " else "", name }) catch return;
+                    missing += 1;
+                }
+            }
+            who.appendSlice(a, if (cl.servers.len == 0) "no servers)" else ")") catch return;
+        }
+        const not_served: []const u8 = if (not.items.len > 0) (std.fmt.allocPrint(a, " Not served: {s}", .{not.items}) catch "") else "";
+        if (served.items.len == 0) {
+            // nothing listens without a client that can be served
+            c.stopProxy();
+            c.setProxyNote(std.fmt.allocPrint(a, "not running.{s}", .{not_served}) catch "not running");
+            return c.proxyWarn(std.fmt.allocPrint(a, "The MCP proxy doesn't serve every client: {s}.", .{not.items}) catch "");
+        }
+        const want = key.finalResult();
+        if (c.proxy == null or !std.mem.eql(u8, &c.proxy_key, &want)) {
+            c.stopProxy();
+            const s = mcpserve.Server.start(c.gpa, c.io, .{ .listen = listen, .clients = served.items, .backend = .{ .ctx = c, .list = proxyList, .call = proxyCall }, .log = &c.log }) catch |e| {
+                const why = switch (e) {
+                    error.AddressInUse => std.fmt.allocPrint(a, "another program listens on {s}", .{listen}) catch "its port is taken",
+                    else => std.fmt.allocPrint(a, "it can't listen on {s} ({s})", .{ listen, @errorName(e) }) catch "it can't listen there",
+                };
+                c.log.write(.config, false, .{ .event = "proxy not started", .address = listen, .why = @errorName(e) }) catch {};
+                c.setProxyNote(std.fmt.allocPrint(a, "not running: {s}", .{why}) catch "not running");
+                return c.proxyWarn(std.fmt.allocPrint(a, "The MCP proxy didn't start: {s}.", .{why}) catch "");
+            };
+            c.proxy = s;
+            c.proxy_key = want;
+        }
+        c.setProxyNote(std.fmt.allocPrint(a, "MCP for other agents on {s}: {s}.{s}", .{ c.proxy.?.address(), who.items, not_served }) catch "running");
+        c.proxyWarn(if (not.items.len > 0) (std.fmt.allocPrint(a, "The MCP proxy doesn't serve every client: {s}.", .{not.items}) catch "") else "");
+    }
+
+    /// Stops the proxy: its connections end, a call that waits is withdrawn.
+    fn stopProxy(c: *Core) void {
+        const s = c.proxy orelse return;
+        c.proxy = null;
+        c.proxy_key = @splat(0);
+        s.stop();
+    }
+
+    /// Whether mcp.ini has a server `name` (started or not).
+    fn hasMcpName(c: *const Core, name: []const u8) bool {
+        for (c.mcp_names) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    /// What /status says of the proxy ("": nothing); a last "." is left
+    /// to `proxyStatus`.
+    fn setProxyNote(c: *Core, text: []const u8) void {
+        const note = std.mem.trimEnd(u8, text, ".");
+        const copy = c.gpa.dupe(u8, note) catch return;
+        c.proxy_mutex.lockUncancelable(c.io);
+        defer c.proxy_mutex.unlock(c.io);
+        c.gpa.free(c.proxy_note);
+        c.proxy_note = copy;
+    }
+
+    /// Says `text` (what is wrong with the proxy) to the owner, once: the
+    /// same words are not said again at the next /reload. "": nothing is
+    /// wrong now.
+    fn proxyWarn(c: *Core, text: []const u8) void {
+        if (text.len == 0) {
+            c.proxy_warned = @splat(0);
+            return;
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+        if (std.mem.eql(u8, &digest, &c.proxy_warned)) return;
+        c.proxy_warned = digest;
+        c.sayAtStart(text);
+    }
+
+    /// /status's line: where the proxy answers and whom, or why it doesn't
+    /// (nothing when no client is set up).
+    fn proxyStatus(c: *Core, a: std.mem.Allocator) ![]const u8 {
+        c.proxy_mutex.lockUncancelable(c.io);
+        defer c.proxy_mutex.unlock(c.io);
+        if (c.proxy_note.len == 0) return "";
+        // what /reload waits for, and /stop ends
+        const going = c.proxy_active.load(.acquire);
+        if (going > 0) return std.fmt.allocPrint(a, "\nProxy: {s}. Clients' requests going or waiting: {d}.", .{ c.proxy_note, going });
+        return std.fmt.allocPrint(a, "\nProxy: {s}.", .{c.proxy_note});
+    }
+
+    /// A client's listing or call takes its claim on the MCP servers and
+    /// their tool lists, which /reload frees: /reload is Busy while one is
+    /// held. False (nothing held) when harness is quitting, when the
+    /// client is gone, or when the servers were restarting for
+    /// `proxy_wait_ms`. Counted apart from the background runs: a call
+    /// that waits for its approval takes no scheduled run's place.
+    fn proxyClaim(c: *Core, gone: *std.atomic.Value(bool)) bool {
+        const until = util.nowMs(c.io) + c.proxy_wait_ms;
+        while (true) {
+            {
+                c.settings_mutex.lockUncancelable(c.io);
+                defer c.settings_mutex.unlock(c.io);
+                if (c.quitting.load(.acquire)) return false;
+                if (!c.restarting.load(.acquire)) {
+                    _ = c.proxy_active.fetchAdd(1, .acq_rel);
+                    return true;
+                }
+            }
+            if (gone.load(.acquire) or util.nowMs(c.io) >= until) return false;
+            c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
+
+    /// config.ini's client `name` (while a claim is held).
+    fn proxyClient(c: *const Core, name: []const u8) ?config.Config.Client {
+        for (c.cfg.clients) |cl| if (std.mem.eql(u8, cl.name, name)) return cl;
+        return null;
+    }
+
+    /// Whether `cl`'s section names the server `server`.
+    fn clientNames(cl: config.Config.Client, server: []const u8) bool {
+        for (cl.servers) |s| if (std.mem.eql(u8, s, server)) return true;
+        return false;
+    }
+
+    /// The proxy's `tools/list` for a client: the tools of the servers its
+    /// section names, under the names harness's own agent sees; those that
+    /// move money only with `money = on`.
+    fn proxyList(ctx: *anyopaque, a: std.mem.Allocator, client_name: []const u8, gone: *std.atomic.Value(bool)) mcpserve.Listed {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (!c.proxyClaim(gone)) return .busy;
+        defer _ = c.proxy_active.fetchSub(1, .acq_rel);
+        const cl = c.proxyClient(client_name) orelse return .{ .tools = "[]" };
+        var out: std.ArrayList(u8) = .empty;
+        out.append(a, '[') catch return .busy;
+        var n: usize = 0;
+        for (c.mcp_tools) |mt| {
+            if (!clientNames(cl, mt.server.name)) continue;
+            if (mt.money and !cl.money) continue;
+            const name = std.json.Stringify.valueAlloc(a, mt.def.name, .{}) catch return .busy;
+            const about = std.json.Stringify.valueAlloc(a, mt.def.description, .{}) catch return .busy;
+            const schema = if (std.mem.trim(u8, mt.def.schema_json, " \t\r\n").len == 0) "{\"type\":\"object\"}" else mt.def.schema_json;
+            out.print(a, "{s}{{\"name\":{s},\"description\":{s},\"inputSchema\":{s}}}", .{ if (n > 0) "," else "", name, about, schema }) catch return .busy;
+            n += 1;
+        }
+        out.append(a, ']') catch return .busy;
+        return .{ .tools = out.items };
+    }
+
+    /// A client's questions: the call's, `[client:NAME] ` in front, in
+    /// main.
+    const ClientAsk = struct {
+        chat: ChatAsk,
+        name: []const u8,
+
+        fn ask(ctx: *anyopaque, a: std.mem.Allocator, q: agent.Question) agent.Reply {
+            const x: *ClientAsk = @ptrCast(@alignCast(ctx));
+            var tagged = q;
+            tagged.text = std.fmt.allocPrint(a, "[client:{s}] {s}", .{ x.name, q.text }) catch q.text;
+            return askOwner(&x.chat, a, tagged);
+        }
+    };
+
+    /// The proxy's `tools/call` for a client: a call of `client:NAME` with
+    /// no definition, through the gate as an app's act goes (hard limits,
+    /// rules, grants, the owner's answer), then to the real server. No
+    /// model is called. A tool that is not among the client's is unknown
+    /// to it before the gate sees anything.
+    fn proxyCall(ctx: *anyopaque, a: std.mem.Allocator, client_name: []const u8, name: []const u8, args_json: []const u8, gone: *std.atomic.Value(bool)) mcpserve.Called {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        if (!c.proxyClaim(gone)) return .busy;
+        defer _ = c.proxy_active.fetchSub(1, .acq_rel);
+        const cl = c.proxyClient(client_name) orelse return .unknown;
+        const offered = for (c.mcp_tools) |mt| {
+            if (std.mem.eql(u8, mt.def.name, name) and clientNames(cl, mt.server.name)) break true;
+        } else false;
+        if (!offered) return .unknown;
+        const failed: mcpserve.Called = .{ .result = .{ .text = "harness could not make the call", .is_error = true } };
+        // never called: a run needs a client
+        var client = c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens) catch return failed;
+        defer client.deinit();
+        // /stop reaches it, as the client's hanging up does
+        c.register(gone, "");
+        defer c.unregister(gone);
+        const by = std.fmt.allocPrint(a, "client:{s}", .{cl.name}) catch return failed;
+        const label = std.fmt.allocPrint(a, "client {s}", .{cl.name}) catch return failed;
+        var ask: ClientAsk = .{ .chat = .{ .core = c, .flag = gone, .conv = "main" }, .name = cl.name };
+        var run = c.runIn(&client, label, .{ .by = by, .agent = "" }, "main", gone);
+        // someone waits for the answer: its question can wait
+        run.scheduled = false;
+        run.asker = .{ .ctx = &ask, .ask = ClientAsk.ask };
+        run.client_money = cl.money;
+        var outbox: RunOut = .{ .core = c, .agent = "", .run = &run, .tag = std.fmt.allocPrint(a, "[client:{s}] ", .{cl.name}) catch "" };
+        run.outbox = outbox.outbox();
+        const got = agent.stepCall(&run, a, name, args_json) catch |e| {
+            c.log.write(.chat, false, .{ .event = "client call failed", .client = cl.name, .tool = name, .why = @errorName(e) }) catch {};
+            return failed;
+        };
+        return .{ .result = .{ .text = c.masks.scrubAlloc(a, got.text) catch return failed, .is_error = got.is_error } };
     }
 
     /// The voice agent's answerer: what was said in a room, answered as a
@@ -5700,6 +5992,8 @@ pub const Core = struct {
         c.startMcp();
         // Home Assistant's conversation agent: with `harness run` only
         if (std.mem.eql(u8, c.role, "run")) c.startVoiceAgent();
+        // other agents' proxy over the servers just started
+        c.startProxy();
     }
 
     /// Starts the app server ([apps] on); returns the link to its page,
@@ -5844,6 +6138,10 @@ pub const Core = struct {
             c.mcp_warn = if (std.mem.startsWith(u8, c.mcp_note, "mcp.ini ")) c.mcp_note["mcp.ini ".len..] else c.mcp_note;
             return;
         };
+        if (a.alloc([]const u8, cfgs.len)) |names| {
+            for (cfgs, names) |sc, *n| n.* = sc.name;
+            c.mcp_names = names;
+        } else |_| {}
         var flag: std.atomic.Value(bool) = .init(false);
         // harness's own work: no definition's, so only /stop reaches it
         c.register(&flag, "");
@@ -6020,6 +6318,7 @@ pub const Core = struct {
         mcp.stopAll(servers.items);
         servers.deinit(c.gpa);
         c.mcp_tools = &.{};
+        c.mcp_names = &.{};
         c.mcp_note = "";
         c.mcp_warn = "";
         c.mcp_arena.deinit();
@@ -6842,6 +7141,8 @@ pub const Core = struct {
     pub fn stopAll(c: *Core) []const u8 {
         const chat_busy = c.busy.load(.acquire);
         const bg = c.bg_active.load(.acquire);
+        // the proxy's clients' requests (their calls wait for an approval)
+        const clients = c.proxy_active.load(.acquire);
         var dropped: usize = 0;
         {
             c.queue_mutex.lockUncancelable(c.io);
@@ -6853,13 +7154,13 @@ pub const Core = struct {
         c.stopRuns();
         // by the clock: a 20 ms sleep lasts longer than that on Windows
         const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.stop_wait_ms) * std.time.ns_per_ms;
-        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0 or c.proxy_active.load(.acquire) > 0) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         // Commands and their processes end at once. A model call under way
         // cannot be cut off: the owner is not kept waiting for it, and is
         // told (the run's stop flag stays set, so nothing follows it).
         const still = c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0;
-        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .queued_dropped = dropped, .still_ending = still }) catch {};
-        if (!chat_busy and bg == 0 and dropped == 0) return "Nothing was running.";
+        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .client_requests = clients, .queued_dropped = dropped, .still_ending = still }) catch {};
+        if (!chat_busy and bg == 0 and clients == 0 and dropped == 0) return "Nothing was running.";
         if (still) return "Stopped. A model call already under way ends on its own; its answer is dropped and nothing it asked for runs.";
         return "Stopped everything that was running.";
     }
@@ -12926,7 +13227,7 @@ pub const Core = struct {
             var snap_note = std.mem.trimEnd(u8, try c.snaps.note(a), "\n");
             snap_note = try std.mem.replaceOwned(u8, a, snap_note, "\n", "; ");
             const mcp_text = try c.mcpStatus(a);
-            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}{s}{s}", .{
+            return std.fmt.allocPrint(a, "Chat: {s}. Background runs: {d}. Queued: {d}.\nAutomatic recall: {s}. Private: {s}. Dry run: {s}.\nBrowser: {s}. Logins: {d}.\nProviders: {s}.{s}{s}{s}{s}{s}{s}{s}", .{
                 if (c.busy.load(.acquire)) "working" else "idle", c.bg_active.load(.acquire), c.queue.items.len,
                 onOff(c.switches.auto_recall.load(.acquire)), onOff(c.convPrivate(conv)),
                 onOff(c.switches.dry_run.load(.acquire)),
@@ -12938,6 +13239,7 @@ pub const Core = struct {
                 if (snap_note.len > 0) "\nSnapshots: " else "",
                 snap_note,
                 try c.voiceStatus(a),
+                try c.proxyStatus(a),
                 try c.personaStatus(a),
             });
         }
@@ -13305,7 +13607,7 @@ pub const Core = struct {
     /// you or ORIGIN started) or what starts runs (their runs of main; an
     /// app's own reads and acts) may read, write and start commands.
     fn accessCommand(c: *Core, a: std.mem.Allocator, rest: []const u8) ![]const u8 {
-        const usage = "Use /access WHO: /access agent:main, /access agent:main trigger:NAME, /access schedule:NAME or /access app:NAME.";
+        const usage = "Use /access WHO: /access agent:main, /access agent:main trigger:NAME, /access schedule:NAME, /access app:NAME or /access client:NAME.";
         var words = std.mem.tokenizeAny(u8, rest, " \t");
         const first = words.next() orelse return usage;
         const second = words.next();
@@ -13326,6 +13628,10 @@ pub const Core = struct {
                 // an app's own call has no definition
                 w.agent = "";
                 heading = try std.fmt.allocPrint(a, "{s}, its own reads and acts:", .{first});
+            } else if (std.mem.startsWith(u8, first, "client:")) {
+                // an outside agent's call has no definition either
+                w.agent = "";
+                heading = try std.fmt.allocPrint(a, "{s}, its calls:", .{first});
             } else heading = try std.fmt.allocPrint(a, "agent:main, in a run {s} started:", .{if (std.mem.eql(u8, first, "owner")) "you" else first});
         }
         const real = if (c.gate.folders) |fs| c.gate.realFolders(a, fs) else null;
@@ -17671,6 +17977,7 @@ const t = std.testing;
 test {
     _ = @import("speech.zig");
     _ = @import("voiceagent.zig");
+    _ = @import("mcpserve.zig");
 }
 
 const Recorder = struct {
@@ -22630,7 +22937,9 @@ test "a_scheduled_run_waits_for_its_definitions_place" {
     defer f.deinit();
     try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: R.\nparallel: 1\n---\nR.\n");
     try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[a]\nevery = 5m\nagent = researcher\ndo = Task a.\n[b]\nevery = 5m\nagent = researcher\ndo = Task b.\n"));
-    try f.e.script(1, comptime "{\"delay_ms\":800," ++ model.textReply("first done")[1..]);
+    // long enough that five ticks fit inside it on a slow runner too (at
+    // 800 ms the first run had ended by the check there, once in a while)
+    try f.e.script(1, comptime "{\"delay_ms\":2500," ++ model.textReply("first done")[1..]);
     try f.e.script(2, model.textReply("second done"));
     f.core.tick();
     try waitFile(&f.e, "requests/001.json");
@@ -38327,4 +38636,450 @@ test "a_change_of_offset_tells_the_desk" {
     f.core.fixed_now = util.nowSeconds(t.io) + 61;
     f.core.tick();
     try expectHas(deskCall(&f, .GET, "events", try std.fmt.allocPrint(f.e.arena.allocator(), "after={d}&wait=0", .{before}), "").body, "\"type\":\"facts\"");
+}
+
+// ---- the MCP proxy for other agents ----
+
+const cc_token = "cc-token-for-the-proxy-tests-0123456789";
+const dd_token = "dd-token-for-the-proxy-tests-0123456789";
+const tools_list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+
+/// A stored secret, as `harness secret add` leaves it.
+fn storeSecret(f: *Fix, name: []const u8, value: []const u8) !void {
+    if (f.core.store == null) f.core.store = .{ .dir = try std.fs.path.join(f.e.arena.allocator(), &.{ f.e.dir, "secrets" }) };
+    try f.core.store.?.put(t.io, name, value);
+}
+
+/// config.ini with `[proxy]` on a free port and `clients` (its
+/// `[client NAME]` sections) in place of what it had of them; not applied.
+fn setClients(f: *Fix, clients: []const u8) !void {
+    const a = f.e.arena.allocator();
+    const old = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.config, a, .unlimited);
+    const base = old[0 .. std.mem.indexOf(u8, old, "[proxy]\n") orelse old.len];
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.fmt.allocPrint(a, "{s}[proxy]\nlisten = 127.0.0.1:0\n{s}", .{ base, clients }) });
+}
+
+/// `harness run`'s proxy over the stand-in MCP server (`fake`), with
+/// client `cc` and `extra` (more of config.ini's client lines); cc's token
+/// stored, the settings applied. Its port.
+fn startClient(f: *Fix, extra: []const u8) !u16 {
+    _ = try withFake(f, false);
+    try setClients(f, try std.fmt.allocPrint(f.e.arena.allocator(), "[client cc]\nservers = fake\n{s}", .{extra}));
+    try storeSecret(f, "client-cc", cc_token);
+    f.core.role = "run";
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    return (f.core.proxy orelse return error.NoProxy).port;
+}
+
+/// One request of the client holding `token`.
+fn clientPost(a: std.mem.Allocator, port: u16, token: []const u8, body: []const u8) !mcpserve.Reply {
+    return mcpserve.request(t.io, a, "127.0.0.1", port, .{ .auth = try std.fmt.allocPrint(a, "Bearer {s}", .{token}), .body = body });
+}
+
+/// A `tools/call` of `name` with `args` (JSON).
+fn toolCall(f: *Fix, name: []const u8, args: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.e.arena.allocator(), "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",\"arguments\":{s}}}}}", .{ name, args });
+}
+
+/// An outside agent's request on a thread of its own: it waits while the
+/// owner is asked.
+const ClientCaller = struct {
+    arena: std.heap.ArenaAllocator,
+    thread: ?std.Thread = null,
+    got: ?mcpserve.Reply = null,
+
+    fn start(c: *ClientCaller, port: u16, token: []const u8, body: []const u8) !void {
+        c.* = .{ .arena = .init(t.allocator) };
+        c.thread = try std.Thread.spawn(.{}, run, .{ c, port, token, body });
+    }
+
+    fn run(c: *ClientCaller, port: u16, token: []const u8, body: []const u8) void {
+        c.got = clientPost(c.arena.allocator(), port, token, body) catch null;
+    }
+
+    fn join(c: *ClientCaller) !mcpserve.Reply {
+        if (c.thread) |th| th.join();
+        c.thread = null;
+        return c.got orelse error.NoAnswer;
+    }
+
+    /// Ends it whatever the test did: a call that still waits is stopped.
+    fn deinit(c: *ClientCaller, f: *Fix) void {
+        if (c.thread) |th| {
+            f.core.stopRuns();
+            th.join();
+        }
+        c.arena.deinit();
+    }
+};
+
+test "a_clients_call_is_asked_as_the_client_and_made" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startClient(&f, "");
+    var call: ClientCaller = undefined;
+    try call.start(port, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"from the client\"}"));
+    defer call.deinit(&f);
+    // asked of the owner in main, as the client's
+    try f.rec.waitFor("[client:cc] fake__echo: fake/echo {\"text\":\"from the client\"}");
+    try waitInbox(&f, "\"by\":\"client:cc\"");
+    try f.press("once");
+    const got = try call.join();
+    try t.expectEqual(200, got.status);
+    try expectHas(got.body, "\"text\":\"from the client\"");
+    try expectHas(got.body, "\"isError\":false");
+    const lt = try logText(&f);
+    try expectHas(lt, "\"run\":\"client cc\",\"by\":\"client:cc\"");
+    try expectHas(lt, "\"tool\":\"fake__echo\",\"decision\":\"allow\",\"why\":\"allowed once by the owner (item 1)\"");
+    // the token is in no line of it
+    try t.expect(std.mem.indexOf(u8, lt, cc_token) == null);
+    try t.expectEqual(0, f.core.proxy_active.load(.acquire));
+}
+
+test "a_denied_call_comes_back_as_the_gates_refusal" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startClient(&f, "");
+    var call: ClientCaller = undefined;
+    try call.start(port, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"not this\"}"));
+    defer call.deinit(&f);
+    try f.rec.waitFor("[client:cc] fake__echo: fake/echo {\"text\":\"not this\"}");
+    try f.press("deny");
+    const got = try call.join();
+    try t.expectEqual(200, got.status);
+    try expectHas(got.body, "\"isError\":true");
+    try expectHas(got.body, "refused by the gate");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"decision\":\"allow\"") == null);
+}
+
+test "a_client_rule_allows_without_asking" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.rules, .data = "[client:cc]\nallow mcp fake/echo *\ndeny mcp fake/fail *\n" });
+    try storeSecret(&f, "client-dd", dd_token);
+    const now = try startClient(&f, "[client dd]\nservers = fake\n");
+    const got = try clientPost(a, now, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"by a rule\"}"));
+    try expectHas(got.body, "\"text\":\"by a rule\"");
+    try expectHas(got.body, "\"isError\":false");
+    // a deny rule refuses, unasked
+    const no = try clientPost(a, now, cc_token, try toolCall(&f, "fake__fail", "{}"));
+    try expectHas(no.body, "\"isError\":true");
+    try expectHas(no.body, "refused by the gate");
+    try t.expectEqual(0, f.core.itemsWaiting());
+    try t.expectEqual(0, f.rec.count("BUTTONS Allow this?"));
+    // the section is that client's alone: another's same call asks
+    var call: ClientCaller = undefined;
+    try call.start(now, dd_token, try toolCall(&f, "fake__echo", "{\"text\":\"by a rule\"}"));
+    defer call.deinit(&f);
+    try f.rec.waitFor("[client:dd] fake__echo: fake/echo {\"text\":\"by a rule\"}");
+    try f.press("deny");
+    try expectHas((try call.join()).body, "refused by the gate");
+}
+
+test "a_days_grant_covers_one_client_only" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try storeSecret(&f, "client-dd", dd_token);
+    const port = try startClient(&f, "[client dd]\nservers = fake\n");
+    const body = try toolCall(&f, "fake__echo", "{\"text\":\"granted\"}");
+    {
+        var call: ClientCaller = undefined;
+        try call.start(port, cc_token, body);
+        defer call.deinit(&f);
+        try f.rec.waitFor("[client:cc] fake__echo: fake/echo {\"text\":\"granted\"}");
+        try f.press("day");
+        try expectHas((try call.join()).body, "\"isError\":false");
+    }
+    // the same call again from that client: not asked
+    try expectHas((try clientPost(a, port, cc_token, body)).body, "\"text\":\"granted\"");
+    try t.expectEqual(1, f.rec.count("BUTTONS Allow this?"));
+    // from another client: asked
+    var other: ClientCaller = undefined;
+    try other.start(port, dd_token, body);
+    defer other.deinit(&f);
+    try f.rec.waitFor("[client:dd] fake__echo: fake/echo {\"text\":\"granted\"}");
+    try f.press("deny");
+    try expectHas((try other.join()).body, "refused by the gate");
+    const grants = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.grants, a, .unlimited);
+    try expectHas(grants, "\tfake/echo\tclient:cc\n");
+    try t.expect(std.mem.indexOf(u8, grants, "client:dd") == null);
+}
+
+test "a_client_lists_only_the_servers_it_names" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const port = try startClient(&f, "");
+    // a second server in mcp.ini, which the client's section doesn't name
+    const fake = try Io.Dir.cwd().realPathFileAlloc(t.io, @import("build_options").fake_path, a);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.mcp, .data = try std.fmt.allocPrint(a, "[fake]\ncommand = \"{s}\" --mcp\n[other]\ncommand = \"{s}\" --mcp\n", .{ fake, fake }) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try expectHas(try f.core.command(a, "/status"), "other (3 tools)");
+    // nothing of the proxy's changed: it was not started again
+    try t.expectEqual(port, f.core.proxy.?.port);
+    const listed = try clientPost(a, port, cc_token, tools_list);
+    try t.expectEqual(200, listed.status);
+    try expectHas(listed.body, "{\"tools\":[{\"name\":\"fake__echo\",\"description\":\"");
+    try expectHas(listed.body, "\"inputSchema\":{");
+    try expectHas(listed.body, "\"name\":\"fake__fail\"");
+    try t.expect(std.mem.indexOf(u8, listed.body, "other__") == null);
+    // called by its full name all the same: no such tool for it, nothing asked
+    const got = try clientPost(a, port, cc_token, try toolCall(&f, "other__echo", "{\"text\":\"x\"}"));
+    try expectHas(got.body, "\"code\":-32602");
+    try t.expectEqual(0, f.core.itemsWaiting());
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "other__echo") == null);
+    // a name that is no tool at all, the same
+    try expectHas((try clientPost(a, port, cc_token, try toolCall(&f, "shell", "{\"command\":\"id\"}"))).body, "\"code\":-32602");
+}
+
+test "money_tools_are_listed_and_called_only_with_money_on" {
+    var f: Fix = undefined;
+    try f.init("[money]\nmax_per_call = 10\n", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try storeSecret(&f, "client-dd", dd_token);
+    _ = try startClient(&f, "[client dd]\nservers = fake\nmoney = on\n");
+    // the stand-in's echo moves money now
+    _ = try withFake(&f, true);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const port = f.core.proxy.?.port;
+    const buy = try toolCall(&f, "fake__echo", "{\"text\":\"buy\",\"amount\":5}");
+    // without money = on: not listed, and refused unasked when called
+    const plain = (try clientPost(a, port, cc_token, tools_list)).body;
+    try t.expect(std.mem.indexOf(u8, plain, "\"name\":\"fake__echo\"") == null);
+    try expectHas(plain, "\"name\":\"fake__fail\"");
+    const no = (try clientPost(a, port, cc_token, buy)).body;
+    try expectHas(no, "\"isError\":true");
+    try expectHas(no, "a client's calls move no money ([client cc] money = on)");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    // with it: listed, and asked every time (no day's grant offered)
+    try expectHas((try clientPost(a, port, dd_token, tools_list)).body, "\"name\":\"fake__echo\"");
+    var call: ClientCaller = undefined;
+    try call.start(port, dd_token, buy);
+    defer call.deinit(&f);
+    try f.rec.waitFor("[client:dd] ");
+    const b = f.lastButtons();
+    try t.expect(b.get("day") == null);
+    try f.press("once");
+    const got = (try call.join()).body;
+    try expectHas(got, "\"isError\":false");
+    try expectHas(got, "buy");
+}
+
+test "hanging_up_withdraws_the_approval" {
+    const sock = @import("sock.zig");
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startClient(&f, "");
+    const body = try toolCall(&f, "fake__echo", "{\"text\":\"never made\"}");
+    const h = try sock.connect(t.io, "127.0.0.1", port, 2000);
+    var rbuf: [1024]u8 = undefined;
+    var wbuf: [2048]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(t.io, h, &rbuf, &wbuf, 5000);
+    try sk.writer.print("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nAuthorization: Bearer {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ port, cc_token, body.len, body });
+    try sk.writer.flush();
+    try f.rec.waitFor("[client:cc] fake__echo: fake/echo {\"text\":\"never made\"}");
+    // the client gives up (its own timeout, its user's stop)
+    sk.close();
+    try f.rec.waitFor("\nWithdrawn: its run stopped.");
+    try waitInbox(&f, "\"text\":\"its run stopped\"");
+    // "Allow once" pressed a moment later allows nothing
+    _ = f.core.answerItem(1, "once", null, .terminal);
+    var waited: u32 = 0;
+    while (f.core.proxy_active.load(.acquire) > 0 and waited < 3000) : (waited += 10) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try t.expectEqual(0, f.core.proxy_active.load(.acquire));
+    try t.expectEqual(0, f.core.itemsWaiting());
+    // the server was not called
+    const lt = try logText(&f);
+    try t.expect(std.mem.indexOf(u8, lt, "\"decision\":\"allow\"") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "allowed once by the owner") == null);
+    // and the log doesn't say the owner stopped it
+    try t.expect(std.mem.indexOf(u8, lt, "stopped by the owner") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "stopped (its client hung up, or /stop)") != null);
+}
+
+test "stop_ends_a_clients_waiting_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startClient(&f, "");
+    var call: ClientCaller = undefined;
+    try call.start(port, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"held\"}"));
+    defer call.deinit(&f);
+    try waitInbox(&f, "\"by\":\"client:cc\"");
+    try f.rec.waitFor("[client:cc] fake__echo");
+    try t.expectEqualStrings("Stopped everything that was running.", f.core.stopAll());
+    const got = try call.join();
+    try t.expectEqual(200, got.status);
+    try expectHas(got.body, "\"isError\":true");
+    try expectHas(got.body, "refused by the gate");
+    try t.expectEqual(0, f.core.itemsWaiting());
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "\"decision\":\"allow\"") == null);
+}
+
+test "reload_waits_for_a_clients_call" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const port = try startClient(&f, "");
+    var call: ClientCaller = undefined;
+    try call.start(port, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"held\"}"));
+    defer call.deinit(&f);
+    try f.rec.waitFor("[client:cc] fake__echo");
+    try t.expectEqualStrings("Busy; send /reload again when nothing is running.", try f.core.reload());
+    // /status says what /reload waits for
+    try expectHas(try f.core.command(f.e.arena.allocator(), "/status"), "). Clients' requests going or waiting: 1.");
+    try f.press("once");
+    try expectHas((try call.join()).body, "\"text\":\"held\"");
+    try t.expect(std.mem.indexOf(u8, try f.core.command(f.e.arena.allocator(), "/status"), "going or waiting") == null);
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+}
+
+test "a_request_during_a_restart_waits_then_is_told_to_ask_again" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const port = try startClient(&f, "");
+    // the servers are being started again (a /reload's second half)
+    f.core.proxy_wait_ms = 300;
+    f.core.restarting.store(true, .release);
+    const late = try clientPost(a, port, cc_token, tools_list);
+    try expectHas(late.body, "\"code\":-32000");
+    try expectHas(late.body, "harness is reloading its servers; ask again in a moment");
+    try expectHas((try clientPost(a, port, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"x\"}"))).body, "harness is reloading its servers");
+    try t.expectEqual(0, f.core.itemsWaiting());
+    // one that arrives a moment before they are back waits, and is answered
+    f.core.proxy_wait_ms = 3000;
+    var call: ClientCaller = undefined;
+    try call.start(port, cc_token, tools_list);
+    defer call.deinit(&f);
+    t.io.sleep(.fromMilliseconds(150), .awake) catch {};
+    f.core.restarting.store(false, .release);
+    try expectHas((try call.join()).body, "\"name\":\"fake__echo\"");
+}
+
+test "a_reload_changes_what_a_client_lists" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try storeSecret(&f, "client-dd", dd_token);
+    const port = try startClient(&f, "[client dd]\nservers = fake\n");
+    try expectHas((try clientPost(a, port, cc_token, tools_list)).body, "\"name\":\"fake__echo\"");
+    // cc's servers go; the proxy starts again with what the file says now
+    try setClients(&f, "[client cc]\nservers =\n[client dd]\nservers = fake\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const second = f.core.proxy.?.port;
+    try t.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}", (try clientPost(a, second, cc_token, tools_list)).body);
+    try expectHas((try clientPost(a, second, dd_token, tools_list)).body, "\"name\":\"fake__echo\"");
+    try expectHas((try clientPost(a, second, cc_token, try toolCall(&f, "fake__echo", "{\"text\":\"x\"}"))).body, "\"code\":-32602");
+    // cc's section goes: its token answers nothing any more
+    try setClients(&f, "[client dd]\nservers = fake\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    const third = f.core.proxy.?.port;
+    try t.expectEqual(401, (try clientPost(a, third, cc_token, tools_list)).status);
+    try expectHas((try clientPost(a, third, dd_token, tools_list)).body, "\"name\":\"fake__echo\"");
+    // the last client goes: nothing listens
+    try setClients(&f, "");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.proxy == null);
+    if (clientPost(a, third, dd_token, tools_list)) |_| return error.StillListening else |_| {}
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/status"), "Proxy:") == null);
+}
+
+test "clients_without_a_good_token_are_not_served" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try storeSecret(&f, "client-short", "a-token-too-short");
+    try storeSecret(&f, "client-same", cc_token);
+    const port = try startClient(&f, "[client short]\nservers = fake\n[client same]\nservers = fake\n[client none]\nservers = fake\ntoken = kept-elsewhere\n");
+    const reasons = "short: its token (client-short) is shorter than 32 characters; same: its token (client-same) is the same as cc's; none: its token (kept-elsewhere) is not stored (harness secret add kept-elsewhere)";
+    try expectHas(try f.core.command(a, "/status"), try std.fmt.allocPrint(a, "\nProxy: MCP for other agents on 127.0.0.1:{d}: cc (fake). Not served: {s}.", .{ port, reasons }));
+    // the owner is told, once
+    try f.rec.waitFor("The MCP proxy doesn't serve every client: " ++ reasons ++ ".");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expectEqual(1, f.rec.count("The MCP proxy doesn't serve every client"));
+    try t.expectEqual(port, f.core.proxy.?.port);
+    // the one with a good token is served; the short one's answers nothing
+    try t.expectEqual(200, (try clientPost(a, port, cc_token, tools_list)).status);
+    try t.expectEqual(401, (try clientPost(a, port, "a-token-too-short", tools_list)).status);
+    // a refused token is a stored secret all the same: masked like the others
+    const scrubbed = try f.core.masks.scrubAlloc(t.allocator, "a-token-too-short in room 1234");
+    defer t.allocator.free(scrubbed);
+    try t.expectEqualStrings("[secret:client-short] in room 1234", scrubbed);
+    // none that can be served: nothing listens, and /status says why
+    try setClients(&f, "[client none]\nservers = fake\n");
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.proxy == null);
+    try expectHas(try f.core.command(a, "/status"), "\nProxy: not running. Not served: none: its token (client-none) is not stored (harness secret add client-none).");
+    try f.rec.waitFor("The MCP proxy doesn't serve every client: none: its token (client-none) is not stored (harness secret add client-none).");
+    // the token is nowhere in what was said or logged
+    try t.expectEqual(0, f.rec.count(cc_token));
+    try t.expect(std.mem.indexOf(u8, try logText(&f), cc_token) == null);
+}
+
+test "the_proxy_is_in_status" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    // no [client] section: nothing runs, nothing is said of it
+    f.core.role = "run";
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.proxy == null);
+    try t.expect(std.mem.indexOf(u8, try f.core.command(a, "/status"), "Proxy:") == null);
+    try storeSecret(&f, "client-dd", dd_token);
+    const port = try startClient(&f, "[client dd]\nservers = fake, github, notes\n[client ee]\ntoken = client-dd\n");
+    // who is served what, and the servers mcp.ini doesn't have
+    try expectHas(try f.core.command(a, "/status"), try std.fmt.allocPrint(a, "\nProxy: MCP for other agents on 127.0.0.1:{d}: cc (fake), dd (fake; not in mcp.ini: github, notes). Not served: ee: its token (client-dd) is the same as dd's.", .{port}));
+    // only on this machine's own address, whatever the file says
+    try expectHas(try logText(&f), try std.fmt.allocPrint(a, "\"event\":\"proxy listening\",\"address\":\"127.0.0.1:{d}\"", .{port}));
+    // switched off
+    const cfg_text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.config, a, .unlimited);
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.mem.replaceOwned(u8, a, cfg_text, "listen = 127.0.0.1:0", "listen = off") });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.proxy == null);
+    try expectHas(try f.core.command(a, "/status"), "\nProxy: off ([proxy] listen = off).");
+}
+
+test "a_taken_port_is_said_and_the_proxy_does_not_run" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const port = try startClient(&f, "");
+    // another program holds the port the file names
+    const cfg_text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.config, a, .unlimited);
+    f.core.proxy.?.stop();
+    f.core.proxy = null;
+    const blocker = try @import("sock.zig").Listener.openExclusive(port);
+    defer blocker.close();
+    try Io.Dir.cwd().writeFile(t.io, .{ .sub_path = f.core.paths.config, .data = try std.mem.replaceOwned(u8, a, cfg_text, "listen = 127.0.0.1:0", try std.fmt.allocPrint(a, "listen = 127.0.0.1:{d}", .{port})) });
+    try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
+    try t.expect(f.core.proxy == null);
+    const why = try std.fmt.allocPrint(a, "another program listens on 127.0.0.1:{d}", .{port});
+    try expectHas(try f.core.command(a, "/status"), try std.fmt.allocPrint(a, "\nProxy: not running: {s}.", .{why}));
+    try f.rec.waitFor(try std.fmt.allocPrint(a, "The MCP proxy didn't start: {s}.", .{why}));
+}
+
+test "access_answers_for_a_client" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    try expectHas(try f.core.command(a, "/access client:cc"), "client:cc, its calls:");
+    try expectHas(try f.core.command(a, "/access"), "/access app:NAME or /access client:NAME.");
 }
