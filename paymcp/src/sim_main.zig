@@ -4,7 +4,7 @@ const sim = @import("sim.zig");
 const model = @import("model.zig");
 
 const usage =
-    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes] [--write-key KEY2] [--cloud KEY3] [--with-stdin]
+    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes] [--write-key KEY2] [--cloud KEY3] [--books SECRET] [--with-stdin]
     \\
     \\A made-up software business (twelve customers, their subscriptions,
     \\prices and invoices) behind a stand-in for the billing provider's API on
@@ -21,6 +21,10 @@ const usage =
     \\reports of Anthropic and OpenAI (KEY3 is the admin key both take) and
     \\AWS's Cost Explorer (requests signed for the access key
     \\AKIASIMSIMSIMSIMSIM0 with KEY3 as its secret).
+    \\With --books it also stands in for the books (Xero's accounting API):
+    \\suppliers, bills awaiting payment and payments on bills, for the app
+    \\xero_sim_app with SECRET. From the second reading on, one supplier's
+    \\bank details are different.
     \\With --with-stdin it ends when its standard input ends (for a program
     \\that starts it and should take it along when it goes).
     \\examples/who.csv is the business's own file that goes with it.
@@ -49,6 +53,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, args[i], "--cloud") and i + 1 < args.len) {
             i += 1;
             opts.cloud_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--books") and i + 1 < args.len) {
+            i += 1;
+            opts.books_secret = args[i];
         } else if (std.mem.eql(u8, args[i], "--disputes")) {
             opts.disputes = .some;
         } else if (std.mem.eql(u8, args[i], "--no-disputes")) {

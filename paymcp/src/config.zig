@@ -45,6 +45,11 @@
 //!   invoices = ksef                 ; Poland: a folder of KSeF invoice files (XML), to set each payment beside
 //!   whitelist = no                  ; Poland: yes asks the tax office's list of VAT payers about each account
 //!
+//!   [ledger]                        ; the books, read for the payment-run check (nothing is exported)
+//!   provider = xero                 ; the one there is
+//!   history_days = 730              ; how far back payments on bills are read
+//!   changed_days = 90               ; a change of bank details in the books is asked about for this long
+//!
 //!   [bills]                         ; the bill watch: what cloud services and AI models cost
 //!   read = anthropic, openai, aws   ; which are read (the default: all three; one with no key is said)
 //!   days = 35                       ; how far back (14 to 90)
@@ -56,7 +61,7 @@
 //!
 //! The keys are never in the file: STRIPE_KEY in the environment; for the
 //! bill watch ANTHROPIC_ADMIN_KEY, OPENAI_ADMIN_KEY, AWS_ACCESS_KEY_ID and
-//! AWS_SECRET_ACCESS_KEY.
+//! AWS_SECRET_ACCESS_KEY; for the books XERO_CLIENT_ID and XERO_CLIENT_SECRET.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -64,6 +69,7 @@ const ini = @import("ini.zig");
 const audit = @import("audit.zig");
 const payrun = @import("payrun.zig");
 const bills = @import("bills.zig");
+const ledger = @import("ledger.zig");
 
 pub const Mode = enum { sandbox, live };
 
@@ -97,6 +103,9 @@ pub const Config = struct {
     payrun_invoices: []const u8 = "",
     payrun_whitelist: bool = false,
     whitelist_url: []const u8 = "https://wykazpodatnikowvat.mf.gov.pl",
+    /// The books: the pay file has a [ledger] section.
+    ledger_on: bool = false,
+    ledger: ledger.Settings = .{},
     /// The bill watch: the pay file has a [bills] section; which providers
     /// are read, where they are (the stand-in: on this computer), the rules.
     bills_on: bool = false,
@@ -236,6 +245,19 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 if (!safeUrl(e.value)) return bad(diag, e.line, "whitelist_url is https://..., or http:// on this computer only (the stand-in)");
                 c.whitelist_url = e.value;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[payrun] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "ledger")) {
+            c.ledger_on = true;
+            if (eql(e.key, "provider")) {
+                if (!eql(e.value, "xero")) return bad(diag, e.line, "provider is xero: the one accounting program paymcp reads");
+            } else if (eql(e.key, "url") or eql(e.key, "token_url")) {
+                if (!safeUrl(e.value)) return bad(diag, e.line, "an address is https://..., or http:// on this computer only (the stand-in): a secret isn't sent in the clear");
+                if (eql(e.key, "url")) c.ledger.url = e.value else c.ledger.token_url = e.value;
+            } else if (eql(e.key, "history_days")) {
+                c.ledger.history_days = try days(a, diag, e);
+                if (c.ledger.history_days < 30 or c.ledger.history_days > 3650) return bad(diag, e.line, "history_days is 30 to 3650");
+            } else if (eql(e.key, "changed_days")) {
+                c.ledger.changed_days = try days(a, diag, e);
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[ledger] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "bills")) {
             c.bills_on = true;
             if (eql(e.key, "read")) {
@@ -291,7 +313,7 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters], [changes], [payrun] and [bills]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters], [changes], [payrun], [ledger] and [bills]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;

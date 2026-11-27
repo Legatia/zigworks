@@ -258,7 +258,7 @@ fn open(a: Allocator, text_in: []const u8, diag: *Diag) !Table {
     return tb;
 }
 
-fn sha(a: Allocator, r: Row) ![]const u8 {
+pub fn sha(a: Allocator, r: Row) ![]const u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{ r.id, r.bill, r.currency, r.account }) |part| {
         h.update(part);
@@ -352,7 +352,7 @@ pub const History = struct {
     seen: []const Seen = &.{},
 
     pub const Check = struct { batch: []const u8, at: i64, shas: []const []const u8 };
-    pub const Seen = struct { id: []const u8, supplier: []const u8, account: []const u8, at: i64 };
+    pub const Seen = struct { id: []const u8, supplier: []const u8, account: []const u8, phone: []const u8 = "", at: i64 };
 
     pub fn checkOf(h: History, batch: []const u8) ?Check {
         var found: ?Check = null;
@@ -405,6 +405,7 @@ pub fn history(a: Allocator, text: []const u8, diag: *Diag) !History {
                 .id = jv.str(jv.get(v, "id")) orelse return fail(diag, n, "isn't a line paymcp wrote"),
                 .supplier = jv.str(jv.get(v, "supplier")) orelse "",
                 .account = jv.str(jv.get(v, "account")) orelse "",
+                .phone = jv.str(jv.get(v, "phone")) orelse "",
                 .at = jv.int(jv.get(v, "at")) orelse 0,
             });
         } else if (std.mem.eql(u8, event, "whitelist")) {

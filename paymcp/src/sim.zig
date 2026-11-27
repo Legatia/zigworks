@@ -16,6 +16,7 @@ const sock = @import("sock.zig");
 const model = @import("model.zig");
 const sim_cloud = @import("sim_cloud.zig");
 const sim_pl = @import("sim_pl.zig");
+const sim_books = @import("sim_books.zig");
 
 pub const Options = struct {
     port: u16 = 0,
@@ -34,6 +35,9 @@ pub const Options = struct {
     /// stand-ins for Anthropic and OpenAI take, and the secret AWS's
     /// requests are signed with; "": they aren't served.
     cloud_key: []const u8 = "",
+    /// The books (sim_books.zig): the secret of the app the stand-in for
+    /// Xero gives tokens to; "": the books aren't served.
+    books_secret: []const u8 = "",
 };
 
 pub const customer_count = 12;
@@ -88,6 +92,8 @@ pub const Sim = struct {
     refused: u32 = 0,
     /// Answer 429 to this many requests before answering again.
     busy: u32 = 0,
+    /// Tokens the stand-in for the books gave out.
+    book_tokens: u32 = 0,
     listener: sock.Listener = undefined,
 };
 
@@ -505,6 +511,8 @@ fn decode(a: Allocator, v: []const u8) ![]const u8 {
 fn handle(s: *Sim, a: Allocator, req: Req) !Res {
     // Poland's list of VAT payers takes questions without a key
     if (sim_pl.handles(req)) return sim_pl.handle(a, req);
+    // the books: a token for the app's id and secret, then lists
+    if (s.opts.books_secret.len > 0 and sim_books.handles(req)) return sim_books.handle(a, s.opts.books_secret, s.opts.now, &s.book_tokens, req);
     // the bill watch's providers, each with its own key and its own errors
     if (s.opts.cloud_key.len > 0 and sim_cloud.handles(req)) return sim_cloud.handle(a, s.opts.cloud_key, s.opts.now, req);
     if (!std.mem.startsWith(u8, req.auth, "Bearer ")) return err(a, 401, "invalid_request_error", "", "Invalid API Key provided.");

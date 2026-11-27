@@ -15,6 +15,7 @@ const record = @import("record.zig");
 const report = @import("report.zig");
 const ksef = @import("ksef.zig");
 const whitelist = @import("whitelist.zig");
+const ledger = @import("ledger.zig");
 
 pub const Verb = enum { check, paid, history, lookback, draft };
 
@@ -179,6 +180,64 @@ pub fn inFolder(a: Allocator, cfg: *const config.Config, name: []const u8) !?[]c
     var it = std.mem.tokenizeAny(u8, name, "/\\");
     while (it.next()) |part| if (std.mem.eql(u8, part, "..")) return null;
     return try std.fs.path.join(a, &.{ cfg.dir, name });
+}
+
+/// The payment-run check from the books: the bills awaiting payment as
+/// the batch, the books' suppliers, and the payments on bills added to
+/// paymcp's list. And what changed in a supplier's bank details since the
+/// reading before.
+pub fn books(a: Allocator, io: Io, cfg: *const config.Config, keys: ledger.Keys, now: i64) !Out {
+    if (!cfg.ledger_on) return stop(a, "The pay file has no [ledger] section: the books aren't read here.", .{});
+    var l = try load(a, io, cfg);
+    if (l.problem) |why| return stop(a, "{s}", .{why});
+    var why: []const u8 = "";
+    const b = ledger.read(a, a, io, cfg.ledger, keys, now, &why) catch |e| {
+        if (e != error.Failed) return e;
+        return stop(a, "The books weren't read: {s}. Nothing was checked.", .{why});
+    };
+    var added: usize = 0;
+    const paid_lines = try payrun.paidLines(a, l.hist, "the books", b.paid, now, &added);
+    const ch = try ledger.changes(a, b, l.hist, cfg.ledger, now);
+    if (try append(a, io, cfg.payrun_history, l.raw, try std.mem.concat(a, u8, &.{ paid_lines, ch.lines }))) |problem| return stop(a, "{s}", .{problem});
+    l = try load(a, io, cfg);
+    if (l.problem) |problem| return stop(a, "{s}", .{problem});
+    var all: std.ArrayList(audit.Finding) = .empty;
+    try all.appendSlice(a, try payrun.check(a, b.bills, b.suppliers, l.hist, cfg.payrun, "books", now));
+    try all.appendSlice(a, ch.findings);
+    std.mem.sort(audit.Finding, all.items, {}, payrun.larger);
+    const fs = all.items;
+    var kept = try keep(a, io, cfg, fs, now);
+    const book: ?*const record.Book = if (kept.book) |*x| x else null;
+
+    var with_details: usize = 0;
+    for (b.suppliers) |s| {
+        if (s.account.len > 0) with_details += 1;
+    }
+    var o: std.ArrayList(u8) = .empty;
+    try o.print(a, "The books (Xero), read {s}. Nothing was paid and nothing was changed: paymcp read suppliers, bills and payments ({d} requests), and asked no bank.\n", .{ try model.day(a, now), b.requests });
+    try o.print(a, "Read: {s}, {d} of them suppliers ({d} with bank details); {s} awaiting payment{s}{s}; {s} on bills since {s}, {d} new to paymcp's list.\n", .{
+        try count(a, b.contacts, "contact"),
+        b.suppliers.len,
+        with_details,
+        try count(a, b.bills.len, "bill"),
+        if (b.bills.len > 0) ", " else "",
+        if (b.bills.len > 0) try sums(a, b.bills) else "",
+        try count(a, b.paid.len, "payment"),
+        try model.day(a, now - @as(i64, cfg.ledger.history_days) * 86400),
+        added,
+    });
+    if (ch.first_seen > 0) try o.print(a, "The bank details of {s} were written down for the first time: a change is found from the next reading on.\n", .{try count(a, ch.first_seen, "supplier")});
+    var hidden: usize = 0;
+    var body: std.ArrayList(u8) = .empty;
+    try blocks(a, &body, fs, book, &hidden);
+    const open_n = fs.len - hidden;
+    if (open_n == 0) {
+        try o.appendSlice(a, "\nNothing to look at by these rules.");
+    } else try o.print(a, "\n{s} to look at before paying. Each is a question, not a mistake found.\n", .{try count(a, open_n, "thing")});
+    try o.appendSlice(a, body.items);
+    if (hidden > 0) try o.print(a, "\n{d} dismissed as intended {s} not listed.", .{ hidden, if (hidden == 1) "is" else "are" });
+    try o.appendSlice(a, "\nThat is no promise the rest is right: the books don't say which account a past payment went to, paymcp can't tell who owns an account, and it can't stop a payment at the bank.\n");
+    return .{ .text = o.items };
 }
 
 pub fn run(a: Allocator, io: Io, cfg: *const config.Config, verb: Verb, file: []const u8, anyway: bool, now: i64) !Out {

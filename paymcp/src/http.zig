@@ -87,6 +87,8 @@ pub const Request = struct {
     content_type: []const u8 = "application/json",
     /// Sent as "Authorization: Bearer ...".
     key: ?[]const u8 = null,
+    /// What kind of answer is wanted (some servers answer XML unless told).
+    accept: []const u8 = "*/*",
     /// More headers, sent after the defaults.
     headers: []const std.http.Header = &.{},
     limits: Limits = .{},
@@ -311,7 +313,7 @@ fn writeHead(w: *Io.Writer, t: Target, req: Request, user_agent: []const u8) !vo
     const v6 = std.mem.indexOfScalar(u8, t.host, ':') != null;
     try w.print("Host: {s}{s}{s}", .{ if (v6) "[" else "", t.host, if (v6) "]" else "" });
     if (t.port != default_port) try w.print(":{d}", .{t.port});
-    try w.print("\r\nUser-Agent: {s}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{user_agent});
+    try w.print("\r\nUser-Agent: {s}\r\nAccept: {s}\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n", .{ user_agent, req.accept });
     if (req.key) |k| try w.print("Authorization: Bearer {s}\r\n", .{k});
     for (req.headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
     if (req.body) |b| try w.print("Content-Type: {s}\r\nContent-Length: {d}\r\n", .{ req.content_type, b.len });

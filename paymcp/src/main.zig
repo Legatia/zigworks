@@ -16,6 +16,7 @@ const change = @import("change.zig");
 const payrun_cmd = @import("payrun_cmd.zig");
 const bills_cmd = @import("bills_cmd.zig");
 const cloud = @import("cloud.zig");
+const ledger = @import("ledger.zig");
 
 const usage =
     \\usage: paymcp PAY.ini                        serve MCP on stdin and stdout (what an agent starts)
@@ -34,6 +35,7 @@ const usage =
     \\       paymcp payrun PAY.ini history FILE.csv  give paymcp past payments, and search them for payments made twice
     \\       paymcp payrun PAY.ini lookback          search the past payments again
     \\       paymcp payrun PAY.ini draft KEY         the draft of a message to the supplier about a payment made twice
+    \\       paymcp payrun PAY.ini books             the same check from the books (Xero): the bills awaiting payment
     \\       paymcp bills PAY.ini                  the bill watch: what cloud services and AI models cost, and what moved
     \\       paymcp version
     \\
@@ -43,11 +45,17 @@ const usage =
     \\is taken, with a note. decide, record and payrun need no key: they read
     \\and write only files on this computer. The bill watch has keys of its
     \\own: ANTHROPIC_ADMIN_KEY, OPENAI_ADMIN_KEY, and for AWS
-    \\AWS_ACCESS_KEY_ID with AWS_SECRET_ACCESS_KEY.
+    \\AWS_ACCESS_KEY_ID with AWS_SECRET_ACCESS_KEY. The books are read with
+    \\XERO_CLIENT_ID and XERO_CLIENT_SECRET.
     \\
 ;
 
 const Cmd = enum { serve, check, audit, decide, record, draft, evidence, change, stage, payrun, bills };
+
+/// The id and secret of the business's own app at its accounting program.
+fn ledgerKeys(env: *const std.process.Environ.Map) ledger.Keys {
+    return .{ .id = env.get("XERO_CLIENT_ID") orelse "", .secret = env.get("XERO_CLIENT_SECRET") orelse "" };
+}
 
 /// The bill watch's keys, from the environment.
 fn cloudKeys(env: *const std.process.Environ.Map) cloud.Keys {
@@ -103,6 +111,13 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const now: i64 = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 
+    if (cmd == .payrun and eql(args[3], "books")) {
+        if (args.len != 4) return fail(io, usage, 2);
+        const got = try payrun_cmd.books(a, io, &cfg, ledgerKeys(init.environ_map), now);
+        if (!got.ok) return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{got.text}), 1);
+        try out(io, got.text);
+        return 0;
+    }
     if (cmd == .payrun) {
         const verb = std.meta.stringToEnum(payrun_cmd.Verb, args[3]) orelse return fail(io, usage, 2);
         const rest = args[4..];
@@ -145,11 +160,11 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const key = init.environ_map.get("STRIPE_KEY") orelse "";
-    if (cmd == .serve and key.len == 0 and (cfg.payrun_on or cfg.bills_on)) {
+    if (cmd == .serve and key.len == 0 and (cfg.payrun_on or cfg.bills_on or cfg.ledger_on)) {
         // a pay file for the payment-run check or the bill watch only: no account is read
         var none = stripe.Client.init(init.gpa, io, &cfg, "") catch return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}: url isn't an address paymcp can reach\n", .{path}), 1);
         defer none.deinit();
-        try server.runWith(init.gpa, io, &cfg, &none, false, cloudKeys(init.environ_map));
+        try server.runWith(init.gpa, io, &cfg, &none, false, cloudKeys(init.environ_map), ledgerKeys(init.environ_map));
         return 0;
     }
     if (config.keyProblem(&cfg, key)) |why| return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{why}), 1);
@@ -168,7 +183,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (cmd == .serve) {
-        try server.runWith(init.gpa, io, &cfg, &client, true, cloudKeys(init.environ_map));
+        try server.runWith(init.gpa, io, &cfg, &client, true, cloudKeys(init.environ_map), ledgerKeys(init.environ_map));
         return 0;
     }
     var why: []const u8 = "";
@@ -257,6 +272,7 @@ test {
     _ = @import("payrun.zig");
     _ = @import("payrun_cmd.zig");
     _ = @import("ksef.zig");
+    _ = @import("ledger.zig");
     _ = @import("whitelist.zig");
     _ = @import("bills.zig");
     _ = @import("cloud.zig");
