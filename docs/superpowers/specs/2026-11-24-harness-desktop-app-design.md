@@ -931,6 +931,9 @@ This section closes them. It is my call throughout, not the owner's (see
     that host's; it isn't sent to a new one unasked). A new port or path on
     the same host doesn't ask, and neither does a provider set to take no
     key.
+  - "Provider and key…" also has the private model, for a keyless server
+    of one's own: `2026-11-27-harness-private-model-design.md`, "In the
+    desk app's setup screen".
   - A change while harness runs: `harness config set`'s own line ("send
     /reload to use it.") in an alert, then the desk again. The app doesn't
     restart harness, which would end the owner's turn in progress. When
