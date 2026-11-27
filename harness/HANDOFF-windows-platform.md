@@ -24,6 +24,22 @@ This is 0.4.0 as released. 0.4.1 and the private model part of "Provider and key
 
 One thing to look at, not judged: the setup offers `claude-opus-4-8` as Anthropic's model. The owner's trial ran on `claude-sonnet-5-5` and `claude-haiku-5-5`; whether the offered default still answers was not tried.
 
+## From the Windows session: the released 0.4.0 Linux desk package, run once (2026-11-27, late)
+
+The other half of what you asked for. The owner said yes to the download. Ubuntu 24.04.5 under WSL 2 on the same machine, as far as the key. It ran on a virtual display, not on a desktop: read the third point before the rest.
+
+- **The download.** `harness-desk-0.4.0-linux-x86_64.tar.gz` from the release, 14,791,844 bytes; its SHA-256 is the one in the `.sha256` file beside it. Unpacked: `harness-desk` (513 KB, linked to the system's libraries), `harness` (9.6 MB, static; it says 0.4.0), `LICENSE` and `desk-assets/`. As on Windows, nothing in it says what to start.
+- **What it needs.** By name: `libgtk-3.so.0`, `libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libwebkit2gtk-4.1.so.0`, `libjavascriptcoregtk-4.1.so.0` and GLib's three. This system has them (GTK 3.24.41, WebKitGTK 2.52.6), so what a person sees on a system without them was not seen.
+- **On this machine's own display (WSLg 1.0.79) it showed no window, and that is the machine, not the package.** The first start sat for over a minute with no window and no word; a second said "harness-desk: no display to open a window on". The display here takes a connection and never answers: a program of two Wayland messages of my own got nothing back in five seconds, and the compositor's log has no desktop connected to it. What is yours to weigh: where a display takes the connection and stays silent, the app waits without saying anything (that wait is inside GTK's start).
+- **With no display at all** (no `DISPLAY`, no `WAYLAND_DISPLAY`, an empty runtime folder) it says "harness-desk: no display to open a window on" at once, ends with status 1, and makes no data folder.
+- **On a virtual display** (Xvfb at 1600x1000, `GDK_BACKEND=x11`, no window manager, the sound outputs ranked out as `smoke-other.sh` does), driven by clicks sent through XTest:
+  - **The first window** is there 0.6 seconds after the start, 1280x820, named "harness": the menus harness and View, and "Set up" with Provider (Anthropic), Model (`claude-opus-4-8`), [Continue] and the data folder's path. The folder then holds `desk-webview/lock` and nothing else, and no `harness` is running.
+  - **[Continue]** opens a window of 402x175: "Anthropic key", a field, "harness keeps it in its data folder, in a file only you can read.", Cancel and Save. (This system has no key store: no Secret Service and no `secret-tool`. The sentence says what would happen here; the key store's sentence was not seen.)
+  - **Cancel.** The page says "Cancelled. Nothing was changed." and [Continue] is back. Nothing was written but the lock.
+  - Ended with a signal, it left no `harness` and no web view process. Its only output: two lines of libEGL about DRI3, which Xvfb doesn't have.
+
+Not done, so not known from the released package: anything after Save (I don't type keys); a real desktop (a window manager's frame, closing the window, the size it comes back at); a system with a key store; a system without WebKitGTK; the aarch64 archive. This is 0.4.0: 0.4.1 was released while this ran and was not fetched.
+
 ## For you: CI runs once per branch; the private model is in "Provider and key…" (2026-11-27, night)
 
 - **CI changed, and it changes what you see on your branches.** `ci.yml` has a `concurrency` group per branch:
