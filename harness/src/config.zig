@@ -14,7 +14,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk, SpeechOnlyModel };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk, SpeechOnlyModel, BadPrivateModel };
 
 pub const Config = struct {
     model: Model = .{},
@@ -53,6 +53,9 @@ pub const Config = struct {
         memory_model: []const u8 = "claude-haiku",
         /// Route for helpers started with `delegate`.
         worker_model: []const u8 = "claude-haiku",
+        /// The model of private conversations (`/private on`), as
+        /// PROVIDER:MODEL; "": the same models as elsewhere.
+        private_model: []const u8 = "",
         key: []const u8 = "omnigate",
         max_tokens: u32 = 4096,
     };
@@ -383,6 +386,15 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         const colon = std.mem.indexOfScalar(u8, value, ':') orelse continue;
         if (providerApi(cfg, value[0..colon]) == .gemini) return error.SpeechOnlyModel;
     }
+    // private conversations' model names its provider: a mistyped name is
+    // never read as a model of the default provider
+    if (cfg.model.private_model.len > 0) {
+        const value = cfg.model.private_model;
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.BadPrivateModel;
+        const api = providerApi(cfg, value[0..colon]) orelse return error.BadPrivateModel;
+        if (api == .gemini) return error.SpeechOnlyModel;
+        if (colon + 1 == value.len) return error.BadPrivateModel;
+    }
     const va = cfg.voice_agent;
     if (!std.mem.eql(u8, va.listen, "off") and parseListen(va.listen) == null) return error.BadVoiceAgent;
     if (va.seconds < 5 or va.seconds > 60 or !secretName(va.token)) return error.BadVoiceAgent;
@@ -496,6 +508,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
         error.SpeechOnlyModel => "api = gemini is for speech only for now ([desk] speak); a model needs a provider with api = anthropic or openai",
+        error.BadPrivateModel => "[model] private_model = PROVIDER:MODEL, where PROVIDER is a preset or a [provider NAME] section with api = anthropic or openai (the provider's name is required here, so that a mistyped one is never read as a model of the default provider)",
         error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -); speak = off, browser, openai, gemini, or a [provider NAME] with api = openai or gemini; speak_model and speak_voice are that provider's (unset: its default)",
         else => null,
     };
@@ -616,8 +629,9 @@ fn setField(sec: anytype, l: Line) Error!void {
                 @field(sec.*, fname) = l.value;
             } else switch (ftype) {
                 []const u8 => {
-                    // only omnigate's address may be left empty (not set yet)
-                    const may_be_empty = comptime (T == Config.Model and std.mem.eql(u8, fname, "url"));
+                    // only omnigate's address (not set yet) and the model of
+                    // private conversations (switched off again) may be left empty
+                    const may_be_empty = comptime (T == Config.Model and (std.mem.eql(u8, fname, "url") or std.mem.eql(u8, fname, "private_model")));
                     if (l.value.len == 0 and !may_be_empty) return error.BadConfig;
                     @field(sec.*, fname) = l.value;
                 },
@@ -851,6 +865,7 @@ pub const defaults_ini =
     \\model = claude-sonnet               ; the agent's model (PROVIDER:MODEL picks another provider)
     \\memory_model = claude-haiku         ; for writing memories
     \\worker_model = claude-haiku         ; for helpers (delegate)
+    \\; private_model = local:llama3.1:8b  ; the model of private conversations (/private on): PROVIDER:MODEL; unset: the same models as elsewhere
     \\key = omnigate                      ; secret holding the omnigate key
     \\max_tokens = 4096
     \\; Other gateways: a [provider NAME] section each (README: Models and providers),
@@ -1497,6 +1512,32 @@ test "a_chat_model_on_gemini_is_refused" {
         std.debug.print("got: {s}\n", .{why});
         return error.TestUnexpectedResult;
     }
+}
+
+test "private_model_names_its_provider" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const local = "[provider local]\napi = openai\nurl = http://127.0.0.1:11434/v1\nauth = none\n";
+    const c = try parse(a, local ++ "[model]\nprivate_model = local:llama3.1:8b\n");
+    try t.expectEqualStrings("local:llama3.1:8b", c.model.private_model);
+    try t.expectEqualStrings("", (try parse(a, local)).model.private_model);
+    // a preset is a provider too
+    _ = try parse(a, "[model]\nprivate_model = anthropic:claude-x\n");
+    // set and cleared again
+    try t.expectEqualStrings("", (try parse(a, local ++ "[model]\nprivate_model =\n")).model.private_model);
+    for ([_][]const u8{
+        // no provider's name: never a model of the default provider
+        local ++ "[model]\nprivate_model = llama3.1:8b\n",
+        local ++ "[model]\nprivate_model = llama3\n",
+        local ++ "[model]\nprivate_model = nowhere:x\n",
+        local ++ "[model]\nprivate_model = local:\n",
+    }) |text| try t.expectError(error.BadPrivateModel, parse(a, text));
+    try t.expectError(error.SpeechOnlyModel, parse(a, "[model]\nprivate_model = gemini:x\n"));
+    try t.expect(std.mem.indexOf(u8, reason(error.BadPrivateModel).?, "PROVIDER:MODEL") != null);
+    // the starting file names it, commented out
+    try t.expect(std.mem.indexOf(u8, defaults_ini, "; private_model = ") != null);
+    _ = try parse(a, defaults_ini);
 }
 
 test "old_task_and_brief_files_run_as_before" {
