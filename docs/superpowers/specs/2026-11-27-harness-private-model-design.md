@@ -104,6 +104,48 @@ later choice if wanted.
 What was said while it was on is left out of what MODEL is sent." (MODEL:
 the conversation's usual model.)
 
+## In the desk app's setup screen
+
+Added 2026-11-27, after the rest was built. The owner was not asked;
+each choice here is the builder's call.
+
+"Provider and key…" (the app's menu; not the first setup) has a part
+"Private model" under the provider's rows: Model, Address, Format (OpenAI
+Chat Completions or Anthropic Messages). It is for a server of the
+owner's own that takes no key, like Ollama. Continue writes it in the
+same `harness config set` call as the provider's values:
+
+```
+provider local.api openai  provider local.url http://127.0.0.1:11434/v1
+provider local.auth none   model.private_model local:llama3.1:8b
+```
+
+- The section is always `[provider local]`. No key is asked for and none
+  is stored.
+- The rows can be changed when the provider in use isn't `local`, the
+  `[provider local]` section is absent or takes no key, and
+  `private_model` is empty or names `local:`. Otherwise the part shows
+  the value in use and "Set in config.ini.": the screen never rewrites a
+  private model or a `local` section the owner wrote by hand for another
+  purpose.
+- Emptying Model writes `model.private_model ""` and leaves the section.
+  With no model, the Address and Format are not written.
+- A model with no address, or an address that isn't `http://` or
+  `https://`, is said on the screen and nothing is written.
+- An `http://` address that isn't this computer shows, under the
+  address and before Continue: "http:// is not encrypted: what is said
+  in a private conversation can be read on the network on its way to
+  this address."
+- What the setting does is behind the part's "i" button.
+- A provider that takes a key stays config.ini's to set.
+
+Tests: the page's rows and their values, the read-only form, the argv
+with and without a private model, clearing, the refusals
+(`setup.zig`, `pages.zig`, `controller.zig`); the macOS smoke fills the
+part in the real window, checks the warning and the bubble, the argv, and
+that no key is asked for, and with a real harness reads the three values
+back with `harness config get`.
+
 ## Not in this
 
 - Tools are unchanged: a private conversation's agent can still fetch a

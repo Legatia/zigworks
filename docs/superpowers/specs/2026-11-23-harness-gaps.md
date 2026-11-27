@@ -68,8 +68,9 @@ on. Update it when something lands.
   call of a run in a private conversation goes there, with no fallback,
   and what was said while private is left out of what the other models
   are sent. Spec `2026-11-27-harness-private-model-design.md`, plan
-  `docs/superpowers/plans/2026-11-27-private-model.md`. Not yet: the
-  desk's setup screen doesn't offer the setting.
+  `docs/superpowers/plans/2026-11-27-private-model.md`. The desk app's
+  "Provider and key…" screen sets it for a server of one's own that
+  takes no key (the spec's "In the desk app's setup screen").
 
 ## Left out by builders (small)
 

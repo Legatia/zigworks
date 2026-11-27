@@ -469,9 +469,18 @@ const DeskTee = struct {
 
     fn send(ctx: *anyopaque, place: Place, text: []const u8) anyerror!Sent {
         const d = of(ctx);
-        const sent = try d.inner.send(d.inner.ctx, place, text);
+        const sent = d.inner.send(d.inner.ctx, place, text) catch |e| return d.unpaired(e, place, text);
         d.core.deskNoteAs(place.name, text, 0, false, d.chanOf(sent.first), &.{});
         return sent;
+    }
+
+    /// A post Telegram has nobody to send to yet (error.NotPaired): once
+    /// the owner has written on the desk, one in a conversation the desk
+    /// shows is delivered there. Anything else stays the error it was.
+    fn unpaired(d: *DeskTee, e: anyerror, place: Place, text: []const u8) anyerror!Sent {
+        if (e != error.NotPaired or !d.core.desk_written.load(.acquire) or !d.core.deskShows(place.name)) return e;
+        d.core.deskNoteAs(place.name, text, 0, false, 0, &.{});
+        return .{ .count = 1 };
     }
 
     /// The channel's id of a message the desk keeps: the desk alone's
@@ -482,7 +491,7 @@ const DeskTee = struct {
 
     fn rich(ctx: *anyopaque, place: Place, text: []const u8, entities: []const topics_mod.Entity) anyerror!Sent {
         const d = of(ctx);
-        const sent = try d.inner.rich.?(d.inner.ctx, place, text, entities);
+        const sent = d.inner.rich.?(d.inner.ctx, place, text, entities) catch |e| return d.unpaired(e, place, text);
         d.core.deskNoteAs(place.name, text, 0, false, d.chanOf(sent.first), &.{});
         return sent;
     }
@@ -920,6 +929,9 @@ pub const Core = struct {
     /// `desk_only` is the channel behind the tee.
     alone: bool = false,
     desk_only: DeskOnly,
+    /// The owner has written on the desk since harness started: until
+    /// an owner is paired, that is where they are (DeskTee.unpaired).
+    desk_written: std.atomic.Value(bool) = .init(false),
     owner: ?i64 = null,
     /// The conversations (state/conversations).
     convs: conversations.List,
@@ -4447,7 +4459,13 @@ pub const Core = struct {
             if (sent.count == 0) sent.first = s.first;
             sent.count += s.count;
         }
-        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse return error.ButtonsNotSent;
+        const id = ch.buttons(ch.ctx, r.place, parts[parts.len - 1], bs) orelse blk: {
+            // nobody paired yet and the owner on the desk: the words go
+            // there without their buttons (DeskTee.unpaired)
+            if (c.alone or r.place.chat != 0 or !c.desk_written.load(.acquire)) return error.ButtonsNotSent;
+            const s = ch.send(ch.ctx, r.place, parts[parts.len - 1]) catch return error.ButtonsNotSent;
+            break :blk s.first;
+        };
         if (labels.len > 0) c.quickShown(n, id, r.place);
         if (sent.count == 0) sent.first = id;
         sent.count += 1;
@@ -15683,6 +15701,7 @@ pub const Core = struct {
         // a token pasted here isn't sent on to Telegram
         if (c.cfg.desk.echo and !butler.anyTokenLike(text)) c.deskEcho(a, conv, text);
         c.deskOwner(conv, text, "desk");
+        c.desk_written.store(true, .release);
         try c.textIn(conv, text);
         return .{ .body = "{\"ok\":true}" };
     }
@@ -37606,6 +37625,38 @@ test "a_desk_turn_goes_to_its_conversation_with_telegrams_echo" {
         _ = try f.core.convs.add(.{ .name = "family", .chat = -100123, .audience = .shared });
     }
     try t.expectEqual(std.http.Status.not_found, deskCall(&f, .POST, "send", "", "{\"conv\":\"family\",\"text\":\"x\"}").status);
+}
+
+test "until_an_owner_is_paired_what_is_written_on_the_desk_is_answered_on_the_desk" {
+    var f: Fix = undefined;
+    try f.open("", "", "");
+    defer f.deinit();
+    // a bot token and nobody paired: Telegram has no one to send to
+    f.core.attach(f.rec.channel());
+    f.rec.setFail(error.NotPaired);
+    // before the owner wrote on the desk a post is not delivered, as ever
+    f.core.sayIn("main", "Said before the desk was used.");
+    try t.expect(std.mem.indexOf(u8, deskCall(&f, .GET, "history", "conv=main", "").body, "Said before the desk was used.") == null);
+    try f.e.script(1, model.textReply("Three flats match."));
+    try f.core.startWorker();
+    const got = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"Find me a flat\"}");
+    try t.expectEqual(std.http.Status.ok, got.status);
+    const h = try waitDesk(&f, "history", "conv=main", "Three flats match.");
+    try expectHas(h, "\"from\":\"harness\",\"text\":\"Three flats match.\"");
+    waitIdle(f.core);
+    // delivered: not kept as an item to send again
+    const inbox: []const u8 = inboxFile(&f) catch "";
+    try t.expect(std.mem.indexOf(u8, inbox, "\"kind\":\"delivery\"") == null);
+    // a reply with quick replies: its words, without the buttons
+    f.rec.buttons_fail = true;
+    try f.e.script(2, model.toolReply("tu_1", "send", "{\"text\":\"Book the first one?\",\"buttons\":[\"Book it\",\"Not now\"],\"final\":true}"));
+    _ = deskCall(&f, .POST, "send", "", "{\"conv\":\"main\",\"text\":\"Which one?\"}");
+    try expectHas(try waitDesk(&f, "history", "conv=main", "Book the first one?"), "\"from\":\"harness\",\"text\":\"Book the first one?");
+    waitIdle(f.core);
+    try t.expect(std.mem.indexOf(u8, inboxFile(&f) catch "", "\"kind\":\"delivery\"") == null);
+    // a group's conversation is not the desk's: still not delivered
+    try addGroup(&f, "family", -1001);
+    try t.expectError(error.NotPaired, f.core.deliverIn("family", "Dinner at 7."));
 }
 
 test "a_desk_press_answers_the_item_via_the_bar" {

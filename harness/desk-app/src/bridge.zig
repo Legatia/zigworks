@@ -75,7 +75,7 @@ fn formOf(a: std.mem.Allocator, v: std.json.Value) ?setup.Form {
         .string => |s| std.meta.stringToEnum(setup.Provider, s) orelse return null,
         else => return null,
     };
-    inline for (.{ "model", "url" }) |name| if (o.get(name)) |x| switch (x) {
+    inline for (.{ "model", "url", "private_model", "private_url" }) |name| if (o.get(name)) |x| switch (x) {
         .string => |s| {
             if (s.len > max_field) return null;
             @field(f, name) = a.dupe(u8, s) catch return null;
@@ -83,6 +83,10 @@ fn formOf(a: std.mem.Allocator, v: std.json.Value) ?setup.Form {
         else => return null,
     };
     if (o.get("api")) |x| f.api = switch (x) {
+        .string => |s| std.meta.stringToEnum(setup.Api, s) orelse return null,
+        else => return null,
+    };
+    if (o.get("private_api")) |x| f.private_api = switch (x) {
         .string => |s| std.meta.stringToEnum(setup.Api, s) orelse return null,
         else => return null,
     };
@@ -142,6 +146,18 @@ test "setup_and_cancel_parse" {
     try t.expect(parse(a, "{\"setup\": \"anthropic\"}") == null);
     try t.expect(parse(a, "{\"cancel\": true}").?.cancel);
     try t.expect(parse(a, "{\"cancel\": 1}") == null);
+}
+
+test "the_private_model_comes_with_the_form" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const f = parse(a, "{\"setup\": {\"provider\": \"anthropic\", \"model\": \"m\", \"private_model\": \"llama3.1:8b\", \"private_url\": \"http://127.0.0.1:11434/v1\", \"private_api\": \"anthropic\"}}").?.setup.?;
+    try t.expectEqualStrings("llama3.1:8b", f.private_model);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", f.private_url);
+    try t.expectEqual(setup.Api.anthropic, f.private_api);
+    try t.expect(parse(a, "{\"setup\": {\"provider\": \"anthropic\", \"private_api\": \"gemini\"}}") == null);
+    try t.expect(parse(a, "{\"setup\": {\"provider\": \"anthropic\", \"private_model\": 3}}") == null);
 }
 
 test "a_key_field_in_a_message_is_ignored" {

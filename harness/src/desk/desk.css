@@ -124,11 +124,11 @@ body[data-state="resting"] .card .dot, body[data-state="quiet"] .card .dot { ani
 .caption { position: absolute; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(46rem, calc(100% - 520px)); text-align: center; font-size: clamp(15px, 1.6vw, 19px); text-shadow: 0 1px 12px rgba(0, 0, 0, 0.95); pointer-events: none; }
 
 /* ---- the chat ---- */
-.chat { flex: 0 0 auto; padding: 12px 20px 16px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--line); background: var(--bg); }
+.chat { flex: 0 1 auto; min-height: 0; padding: 12px 20px 16px; display: flex; flex-direction: column; gap: 10px; border-top: 1px solid var(--line); background: var(--bg); }
 .chat-head { display: flex; align-items: baseline; gap: 12px; max-width: 900px; width: 100%; margin: 0 auto; }
 .chat-head h2 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.06em; }
 .chat-head .note { font-size: 13px; color: var(--soft); }
-.log { list-style: none; margin: 0 auto; padding: 0 4px 0 0; max-width: 900px; width: 100%; max-height: 22vh; min-height: 72px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.log { list-style: none; margin: 0 auto; padding: 0 4px 0 0; max-width: 900px; width: 100%; max-height: 34vh; min-height: 72px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
 .msg { max-width: 80%; display: flex; flex-direction: column; gap: 4px; }
 .msg .who { font: 12px var(--mono); color: var(--muted); }
 .msg .text { padding: 10px 14px; font-size: 15px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }

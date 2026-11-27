@@ -122,7 +122,7 @@ const Going = struct {
     gone: *std.atomic.Value(bool),
 };
 
-const Answer = struct { status: std.http.Status = .ok, body: []const u8 = "" };
+const Answer = struct { status: std.http.Status = .ok, body: []const u8 = "", why: Refusal = .message };
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
@@ -382,7 +382,6 @@ pub const Server = struct {
             return s.refuse(req, .route, .not_found, "harness serves MCP at POST /mcp only");
         // no stream to open (GET) and no session to end (DELETE)
         if (req.head.method != .POST) return s.refuse(req, .method, .method_not_allowed, "MCP here is POST /mcp: one message a request, answered as JSON");
-        if (other_version) return s.refuse(req, .version, .bad_request, "MCP-Protocol-Version is not one harness speaks (2025-06-18, 2025-03-26)");
         if (req.head.content_length) |n| if (n > s.max_body) return s.refuse(req, .size, .payload_too_large, "the message is over the proxy's limit");
         var body_buf: [8192]u8 = undefined;
         const r = req.readerExpectContinue(&body_buf) catch return false;
@@ -395,8 +394,8 @@ pub const Server = struct {
             },
             else => return false,
         };
-        const answer = try s.message(a, client, conn, body);
-        if (answer.status == .bad_request) s.noteRefusal(.message, .bad_request);
+        const answer = try s.message(a, client, conn, body, other_version);
+        if (answer.status == .bad_request) s.noteRefusal(answer.why, .bad_request);
         // the answer may have waited for the owner: its writing gets its
         // own time, and a stop meanwhile doesn't cut it
         sk.setLimits(10_000, 10_000, null);
@@ -471,7 +470,9 @@ pub const Server = struct {
     }
 
     /// One JSON-RPC message of `client`, answered.
-    fn message(s: *Server, a: std.mem.Allocator, client: usize, conn: sock.Handle, body: []const u8) !Answer {
+    /// `other_version`: its MCP-Protocol-Version header names a version
+    /// harness doesn't speak.
+    fn message(s: *Server, a: std.mem.Allocator, client: usize, conn: sock.Handle, body: []const u8, other_version: bool) !Answer {
         if (tooDeep(body)) return fail(a, .bad_request, "null", -32600, "the message is nested deeper than 64 levels");
         const root = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |e| switch (e) {
             error.OutOfMemory => return e,
@@ -493,6 +494,15 @@ pub const Server = struct {
         };
         const id = (try idText(a, id_v)) orelse return fail(a, .bad_request, "null", -32600, "id is not a string or a whole number");
 
+        // initialize is where the version is agreed, in its body: a client
+        // may send its own newest as the header there (the MCP Python SDK
+        // does). Any other request under a version harness doesn't speak
+        // is refused.
+        if (other_version and !std.mem.eql(u8, method, "initialize")) {
+            var refused = try fail(a, .bad_request, "null", -32000, "MCP-Protocol-Version is not one harness speaks (2025-06-18, 2025-03-26)");
+            refused.why = .version;
+            return refused;
+        }
         if (std.mem.eql(u8, method, "ping")) return ok(a, id, "{}");
         if (std.mem.eql(u8, method, "initialize")) {
             var version: []const u8 = mcp_http.versions[0];
@@ -957,6 +967,26 @@ test "what_is_not_mcp_is_refused" {
     try t.expectEqual(200, (try f.send(.{ .auth = auth, .body = list_body, .version = "2025-03-26" })).status);
     try t.expectEqual(200, (try f.send(.{ .auth = auth, .body = list_body, .version = "2025-06-18" })).status);
     try t.expectEqual([2]u32{ 3, 0 }, f.rec.counts());
+}
+
+test "initialize under a newer MCP-Protocol-Version header is answered with the version harness speaks" {
+    // the MCP Python SDK (Hermes) sends its newest version as the header of
+    // initialize itself, before anything is agreed
+    var f: Fix = undefined;
+    try f.init(plain);
+    defer f.deinit();
+    const auth = "Bearer " ++ tok_a;
+    const got = try f.send(.{ .auth = auth, .version = "2025-11-25", .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"mcp\",\"version\":\"0.1.0\"}}}" });
+    try t.expectEqual(200, got.status);
+    try t.expectEqualStrings("2025-06-18", (try f.json(got)).get("result").?.object.get("protocolVersion").?.string);
+    // the notification that follows may still carry it; it is taken
+    try t.expectEqual(202, (try f.send(.{ .auth = auth, .version = "2025-11-25", .body = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}" })).status);
+    // any other request under a version harness doesn't speak is refused, with the reason
+    const list = try f.send(.{ .auth = auth, .version = "2025-11-25", .body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}" });
+    try t.expectEqual(400, list.status);
+    try expectHas(list.body, "MCP-Protocol-Version is not one harness speaks (2025-06-18, 2025-03-26)");
+    try t.expectEqual(400, (try f.send(.{ .auth = auth, .version = "2025-11-25", .body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}" })).status);
+    try t.expectEqual([2]u32{ 0, 0 }, f.rec.counts());
 }
 
 test "a_foreign_origin_is_refused" {
