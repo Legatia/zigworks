@@ -62,7 +62,12 @@ on. Update it when something lands.
   file's value) is the computer's zone at each use; a fixed `+HH:MM` is
   still one offset all year.
 - **Private conversations on a local model** (from the fifteen-features
-  list).
+  list). **Built:** `[model] private_model = PROVIDER:MODEL`; every model
+  call of a run in a private conversation goes there, with no fallback,
+  and what was said while private is left out of what the other models
+  are sent. Spec `2026-11-27-harness-private-model-design.md`, plan
+  `docs/superpowers/plans/2026-11-27-private-model.md`. Not yet: the
+  desk's setup screen doesn't offer the setting.
 
 ## Left out by builders (small)
 
