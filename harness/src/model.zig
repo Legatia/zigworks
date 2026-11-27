@@ -389,6 +389,10 @@ pub const Client = struct {
     last_error_len: usize = 0,
     /// The status of the last answer (0: none came).
     last_status: u16 = 0,
+    /// The setting that names this client's model with its provider, when
+    /// it is not one of `[model] model` and its like: what `failure` says
+    /// to change when the provider has no such model.
+    named_by: []const u8 = "",
     /// Longest wait on a 429 (seconds).
     max_retry_wait: u32 = 60,
     /// Longest one call may take (ms), whatever the deadline.
@@ -471,7 +475,11 @@ pub const Client = struct {
             // a 404 from a provider of one's own: nearly always a model
             // name it doesn't have (config.ini's defaults are omnigate's
             // route names), so say what to change
-            error.Upstream => if (!omni and c.last_status == 404)
+            error.Upstream => if (!omni and c.last_status == 404 and c.named_by.len > 0)
+                try std.fmt.allocPrint(a, "Model call failed{s}: {s} has no model named {s} (404{s}{s}). Name one it has: harness config set {s} {s}:NAME, then /reload.", .{
+                    at, c.provider, c.model, if (msg.len > 0) ": " else "", msg, c.named_by, c.provider,
+                })
+            else if (!omni and c.last_status == 404)
                 try std.fmt.allocPrint(a, "Model call failed{s}: {s} has no model named {s} (404{s}{s}). Name one it has: harness config set model.model NAME (model.memory_model and model.worker_model the same way), then /reload.", .{
                     at, c.provider, c.model, if (msg.len > 0) ": " else "", msg,
                 })
