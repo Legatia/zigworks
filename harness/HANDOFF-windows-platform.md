@@ -5,6 +5,25 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: your pull request #3 is merged (2026-11-27, evening)
+
+- `platform/trial` (b434984) is on `harness-logins` and `main`, fast-forward, with one commit of mine after it. Take `main` into `platform/money` before its pull request.
+- macOS, which you couldn't run: harness's suite in Debug and ReleaseSafe on b434984, 1647 passed, 25 skipped in each, and the three cross builds with their unit-test builds. The one failed check on your pull request was `test (macos-15, harness)` in `web_waits_for_a_load_under_way_when_the_page_is_read` (web.zig:1872), the crash noted further down; nothing of yours.
+- Your four rulings stand.
+- Two changes on top of yours, in `core.zig` and the README's "Schedules":
+  - A one-day schedule whose message could not be sent no longer stays in triggers.ini for good: its section goes when the message arrives (`oneDayRan`, called by the run and by `resendItem`). One whose sending was given up keeps its section.
+  - `on` with a day already past is refused before it is added, by the tool and by `/trigger add`: "on = 2025-11-28 is already past (today is 2026-11-27)". Today's date is taken, also when its time has passed. If a test or smoke of yours adds a one-day schedule through the tool or `/trigger add`, give it today's date or a later one (writing triggers.ini directly is unchanged).
+- Still yours to decide or the owner's: the desk's conversation at five lines; a release with pull requests 2 and 3 waits for the owner's word.
+
+## For you: private conversations have a model of their own (2026-11-27, later still)
+
+- Built and on `main`: `[model] private_model = PROVIDER:MODEL` (README, "Private conversations"; spec `docs/superpowers/specs/2026-11-27-harness-private-model-design.md`). While a conversation is private, every model call of a run in it goes there and nowhere else; after `/private off`, what was said while private is left out of what the other models are sent.
+- Nothing for the desk shells or the page to do. The setup screen doesn't offer the setting; it is set in `config.ini` or with `harness config set model.private_model local:llama3.1:8b`.
+- `/private on` and `/private off` answer with longer lines now (where the words still go; what is left out). If a smoke or test of yours compares those answers whole, compare their start: "Private here: nothing from this conversation is written to memory" and "Private is off here."
+- One change that reaches every settings file: an error is named at the line that is wrong when an earlier line names what it is in (a mistake inside `[provider local]` is no longer reported at `[model] provider = local` or `private_model = local:…` above it). Files without such a reference are reported as before.
+- `ModelCfg` (agent.zig) has a new field, `private`, and `Run` a new one, `on_private`; `Conversation.messagesFor(arena, leave_private)` is new and `messages` calls it. If `platform/money` builds a `ModelCfg` or reads a conversation's messages for a model, take `main` first.
+- After the review (same day): `Conversation.Turn` has `on_private` (the private model answered it; `messagesFor(…, true)` leaves out exactly those turns, whatever the setting is later). The core's `Queued` has `private` (the conversation was private when the message came), and `chatTurnWith`, `voiceTurn` and `memberTurn` take a last argument `said_private`; a queued message's turn is private also after `/private off`. A brief for a private conversation is written by the private model. If `platform/money` calls one of those three functions or appends to the chat queue, take `main` first.
+
 ## For you: your pull request #2 is merged (2026-11-27, later)
 
 - `platform/desk-win-linux` (c7960a3) is merged as a2c3a03, on `harness-logins` and `main`. Take `main` into `platform/money` before its pull request.

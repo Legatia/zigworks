@@ -228,6 +228,56 @@ apps and forbid third-party apps from using them. Use an API key, or a
 bearer token a gateway issues. Not yet: OpenAI's Responses API, AWS
 Bedrock and Google Vertex sign-in, streaming, images.
 
+### Private conversations
+
+`/private on` keeps a conversation out of memory and keeps only sizes and
+hashes of it in the log; its words still go to the model's provider. With
+`private_model` they go to a model you name, and to no other:
+
+```ini
+[model]
+private_model = local:llama3.1:8b   ; PROVIDER:MODEL; unset: the same models as elsewhere
+```
+
+While a conversation is private, every model call of a run in it is made
+to `private_model`: the turns of your messages, the helpers they delegate
+to (`strong` ones and ones whose definition names a model too), the
+summary made when the conversation grows long, and the briefs, tasks,
+triggers' `do` runs and workflow steps that report there. A trigger's
+`check` reads its events, nothing of the conversation, and stays on
+`check_model` (else `worker_model`). When the private model's provider
+can't be reached or refuses, the turn ends with that provider's error; no
+other model is tried (a brief then lists its new items unwritten). A 404
+from it names the setting to change. The switch applies from the next
+message: a turn already running finishes on the model it started with,
+and a message that was waiting in the queue when `/private off` came is
+still answered as private.
+
+After `/private off` the turns said while it was on are left out of what
+the other models are sent, with one line in their place: "(a private part
+of this conversation is left out here)". They are sent again, whole, when
+the conversation is private again. This holds for the turns
+`private_model` answered, also if the setting is cleared later. Private
+turns from before the setting existed were answered by the usual model
+and stay in what it is sent.
+
+The provider's name is required (`private_model = llama3.1:8b` is refused
+when the file is read), so a mistyped name is never read as a model of the
+default provider. harness does not check where the provider runs: a
+machine at home, or a provider you have an agreement with, is yours to
+judge. The model is sent the same tools as any other; one that can't call
+tools answers in text only. `harness config set model.private_model
+local:llama3.1:8b` sets it and `harness config set model.private_model ""`
+clears it, at the next `/reload`.
+
+Not moved by it: voice notes are still transcribed by `[voice] provider`,
+and replies read aloud on the desk still go to `[desk] speak`'s provider.
+`/private on` names both when they are set, and without `private_model`
+it names the provider the words still go to. Tools are unchanged: what the
+agent fetches, sends or passes to an MCP server from a private
+conversation goes where the gate lets it. Home Assistant's voice keeps its
+own model.
+
 ## Voice notes
 
 Send a voice note (or an audio file) in your chat with the bot or one of
@@ -3158,7 +3208,9 @@ or a "not") is a new item. Commands: `/memory`, `/pin ID`, `/unpin ID`,
 `/forget ID`, `/memory auto on|off` (off: only pinned items go in unless
 something is looked up on request), `/private on|off` (on: nothing
 written to memory, and the log keeps only sizes and hashes keyed with
-`state/log-key`).
+`state/log-key`; its answer says where the words still go, and `[model]
+private_model` gives private conversations a model of their own: Models
+and providers, Private conversations).
 
 ## Long memory
 
@@ -3394,7 +3446,7 @@ only after a 3% move. A section's keys give its kind:
 | page | `page = URL`, with `json = PATH` for a value | text, removed, value, change, move | 1h (5m) |
 | file | `file = FOLDER/PATTERN` | path, change, size | 1m (30s) |
 | mcp | `mcp = SERVER/TOOL {json}` (`key = FIELD`), or `SERVER resource URI` | an item's fields, or text | 15m (1m) |
-| schedule | `every` or `at` alone, with `do`, `say` or `start` | none | as tasks (5m) |
+| schedule | `every` or `at` alone (`at` with `days`, or with `on = DATE` for one day), with `do`, `say` or `start` | none | as tasks (5m) |
 | brief | `topic` lines | none | daily at `at` |
 
 - **Sources.** A feed or search gives an event per link not seen before
@@ -3412,6 +3464,18 @@ only after a 3% move. A section's keys give its kind:
   event when it changed; a resource gives one when it changed, and is read
   again as soon as its server says it changed. A first poll only marks
   what is there.
+- **Schedules.** A section with no source runs at a time: `at = 07:00`
+  every day or on `days = mon, tue, …`, or `every = 15m`, as a task of
+  tasks.ini does. `on = 2026-11-28` with `at` is that one day alone, for a
+  reminder: it runs once, at its time or the first moment after it that
+  harness is up, and its section is then taken out of triggers.ini
+  (`/trigger run` tries it and keeps it; a reminder that could not be
+  sent goes once it has arrived). A day already past is not added. The
+  agent adds these with its `trigger` tool when you ask for something at
+  a time ("every weekday at
+  8:00, the weather", "remind me tomorrow at 10:00 to call the dentist"),
+  and you approve the section. A new schedule whose time today has passed
+  runs once right away, as a missed one does.
 - **Polls** run one at a time, on one thread, with no model call, offset
   by up to a tenth of `every`; with `at = 07:00` (and `days`) once a day
   instead. A failed poll waits 2, 4, 8 … times `every` (at most 6 h, or

@@ -258,6 +258,9 @@ pub const Conversation = struct {
         bytes: usize = 0,
         /// Said while private mode was on: never written to memory.
         private: bool = false,
+        /// Asked of the model of private conversations: never sent to
+        /// another model, whatever the settings are later.
+        on_private: bool = false,
         /// The outside text's sources this turn read (outside.zig), in
         /// the turn's arena.
         outside: std.ArrayList([]const u8) = .empty,
@@ -403,21 +406,60 @@ pub const Conversation = struct {
     /// after, and those hold for a turn (`turn` makes the instructions
     /// once), not from one turn to the next.
     pub fn messages(c: *const Conversation, arena: std.mem.Allocator) ![]model.Message {
+        return c.messagesFor(arena, false);
+    }
+
+    /// `messages`, and with `leave_private` (a request that goes to another
+    /// model than the one of private conversations) without the turns that
+    /// model answered: one line (`private_gap`) stands where each stretch
+    /// of them was, in a user message. A turn marked private that the
+    /// usual model answered (made private while it ran, or said before a
+    /// private model was set) was sent there already and stays.
+    pub fn messagesFor(c: *const Conversation, arena: std.mem.Allocator, leave_private: bool) ![]model.Message {
         var out: std.ArrayList(model.Message) = .empty;
-        for (c.turns.items, 0..) |tn, ti| for (tn.messages.items) |kept| {
-            var m = kept;
-            if (c.no_thinking or ti + 1 < c.turns.items.len) m.blocks = try withoutThinking(arena, m.blocks);
-            if (m.blocks.len == 0) continue;
-            if (out.items.len > 0 and out.items[out.items.len - 1].role == m.role) {
-                const last = &out.items[out.items.len - 1];
-                last.blocks = try std.mem.concat(arena, model.Block, &.{ last.blocks, m.blocks });
+        // turns were left out since the last message taken
+        var gap = false;
+        for (c.turns.items, 0..) |tn, ti| {
+            const newest = ti + 1 == c.turns.items.len;
+            if (leave_private and tn.on_private) {
+                gap = true;
                 continue;
             }
-            try out.append(arena, m);
-        };
+            for (tn.messages.items) |kept| {
+                var m = kept;
+                if (c.no_thinking or !newest) m.blocks = try withoutThinking(arena, m.blocks);
+                if (m.blocks.len == 0) continue;
+                if (gap) {
+                    gap = false;
+                    const line = try arena.dupe(model.Block, &.{.{ .text = private_gap }});
+                    // a turn starts with a user message: the line leads it;
+                    // before the agent's words it is a message of its own
+                    if (m.role == .user)
+                        m.blocks = try std.mem.concat(arena, model.Block, &.{ line, m.blocks })
+                    else
+                        try joined(&out, arena, .{ .role = .user, .blocks = line });
+                }
+                try joined(&out, arena, m);
+            }
+        }
         return out.items;
     }
+
+    /// Adds `m`: to the last message when that has its role (the API takes
+    /// the roles in turn), else as the next.
+    fn joined(out: *std.ArrayList(model.Message), arena: std.mem.Allocator, m: model.Message) !void {
+        if (out.items.len > 0 and out.items[out.items.len - 1].role == m.role) {
+            const last = &out.items[out.items.len - 1];
+            last.blocks = try std.mem.concat(arena, model.Block, &.{ last.blocks, m.blocks });
+            return;
+        }
+        try out.append(arena, m);
+    }
 };
+
+/// What stands, in a request to another model, where turns said while
+/// private were (`[model] private_model`).
+pub const private_gap = "(a private part of this conversation is left out here)";
 
 /// `blocks` without the model's thinking (the same slice when it has none).
 fn withoutThinking(arena: std.mem.Allocator, blocks: []const model.Block) ![]const model.Block {
@@ -509,6 +551,10 @@ pub const Run = struct {
     conversation: []const u8 = "",
     /// Its conversation's /private switch, read when used.
     conv_private: ?*const std.atomic.Value(bool) = null,
+    /// Its turn is on the model of private conversations (`ModelCfg.private`):
+    /// set where a turn starts, for the turn; its helpers and its summary
+    /// are on that model too.
+    on_private: bool = false,
     /// Its conversation is one others read: no mail tool is offered.
     no_mail: bool = false,
     /// What the per-turn context block says of the conversations
@@ -745,17 +791,25 @@ pub const Run = struct {
     /// A client for a model value ("PROVIDER:MODEL", or a model of the
     /// default provider) through the instance's providers; without them
     /// (tests), omnigate at `model_cfg.url`.
+    /// A turn on the model of private conversations (`on_private`) asks no
+    /// other: whatever `value` says (a helper's, the summary's), the
+    /// client is that model's.
     pub fn modelClient(r: *const Run, value: []const u8, max_tokens: u32) !model.Client {
         const cfg = r.model_cfg orelse return error.NoModelSettings;
-        if (cfg.providers) |set| return set.client(r.gpa, r.io, value, max_tokens);
-        return model.Client.init(r.gpa, r.io, cfg.url, cfg.key, value, max_tokens);
+        const v = if (r.on_private) cfg.private else value;
+        var c = if (cfg.providers) |set|
+            try set.client(r.gpa, r.io, v, max_tokens)
+        else
+            try model.Client.init(r.gpa, r.io, cfg.url, cfg.key, v, max_tokens);
+        if (r.on_private) c.named_by = "model.private_model";
+        return c;
     }
 
-    /// The name of the provider a model value picks.
+    /// The name of the provider a model value picks (as `modelClient`).
     fn providerOf(r: *const Run, value: []const u8) []const u8 {
         const cfg = r.model_cfg orelse return "";
         const set = cfg.providers orelse return "omnigate";
-        return set.pick(value).provider.name;
+        return set.pick(if (r.on_private) cfg.private else value).provider.name;
     }
 
     /// Who takes a snapshot in this run: the run, its conversation, and a
@@ -917,7 +971,7 @@ const send_def: model.ToolDef = .{
 /// workspace, where `run` is checked and the folder's `vars` apply.
 const shell_dir_def: model.ToolDef = .{
     .name = "shell",
-    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output.",
+    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output." ++ tools.shell_words,
     .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}},\"required\":[\"command\"]}",
 };
 
@@ -1150,6 +1204,7 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
     const pk = r.picked();
     var d: std.ArrayList(u8) = .empty;
     try d.appendSlice(a, if (with_dir) "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output." else "Run a shell command in the workspace folder. Returns the exit code and output.");
+    try d.appendSlice(a, tools.shell_words);
     if (copyEnvOf(r) != null) try d.appendSlice(a, " This run works in its own copy of the workspace: the files it reads and writes are the copy's (give paths inside the workspace, not absolute ones), and the owner applies or drops its changes when it ends.");
     try d.print(a, " Commands run in {s}", .{try envLine(a, list, pk.name)});
     var s: std.ArrayList(u8) = .empty;
@@ -1207,7 +1262,7 @@ const agent_save_def: model.ToolDef = .{
 };
 const trigger_def: model.ToolDef = .{
     .name = "trigger",
-    .description = "Triggers act when something happens outside: a new feed or search item, a changed page or value, a file in a workspace folder, an MCP source; a match starts a run (do), says a line without the model (say, {field} filled in) or starts a workflow. add proposes a new trigger: the owner sees harness's reading of it and approves it every time, and it applies at once. test polls one now and says what it would start, keeping nothing. list lists them; rm removes one (asked). A section is [NAME] (a-z, 0-9, - and _), one source (feed = URL, search = WORDS, page = URL with json = PATH for a value, file = FOLDER/PATTERN, mcp = SERVER/TOOL {json} or SERVER resource URI), then every (30s, 5m, 1h), match = FIELD OP VALUE (OP has, is, starts, ends, like, >, <), skip, check = a yes/no question for the model, one of do, say and start = workflow NAME, and agent, tools, to.",
+    .description = "Triggers act when something happens outside: a new feed or search item, a changed page or value, a file in a workspace folder, an MCP source; a match starts a run (do), says a line without the model (say, {field} filled in) or starts a workflow. add proposes a new trigger: the owner sees harness's reading of it and approves it every time, and it applies at once. test polls one now and says what it would start, keeping nothing. list lists them; rm removes one (asked). A section is [NAME] (a-z, 0-9, - and _), one source (feed = URL, search = WORDS, page = URL with json = PATH for a value, file = FOLDER/PATTERN, mcp = SERVER/TOOL {json} or SERVER resource URI), then every (30s, 5m, 1h), match = FIELD OP VALUE (OP has, is, starts, ends, like, >, <), skip, check = a yes/no question for the model, one of do, say and start = workflow NAME, and agent, tools, to. A section with no source is a schedule, for what the owner wants at a time or regularly (\"every weekday at 8:00 tell me the weather\"): at = HH:MM (the owner's time) with days = mon, tue, wed, thu, fri, sat, sun if not every day, or on = YYYY-MM-DD for that one day (a reminder: \"remind me tomorrow at 10:00 to call the dentist\" is at = 10:00, on = the date, say = Reminder: call the dentist; it runs once and its section is removed), or every = 15m (at least 5m), and one of do (a run of you with that instruction, its answer posted; it answers NOTHING to stay silent), say and start. A new schedule runs once right away when it has every, or when its at has already passed today on one of its days, and from then on time: say so. A scheduled run has nobody to ask, so a call that needs approval is skipped and listed for the owner to allow for that task.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"test\",\"list\",\"rm\"]},\"text\":{\"type\":\"string\",\"description\":\"add, test: the whole section, [NAME] and its lines\"},\"name\":{\"type\":\"string\",\"description\":\"test, rm: a trigger's name\"}},\"required\":[\"action\"]}",
 };
 
@@ -1295,7 +1350,7 @@ pub const Desk = struct {
 
 const workflow_def: model.ToolDef = .{
     .name = "workflow",
-    .description = "Workflows are step files harness runs with their state on disk: tool calls with fixed input, agent runs, waits for a time or an event, the owner's approval, branches, retries, messages. check reads a file and returns harness's reading or the line that is wrong. save proposes a new workflow or a change: the owner sees the whole file and harness's reading and approves it every time; it applies at once, and instances already going keep their file. start starts an instance (asked), stop stops one (asked), list and show see them. A file: workflow NAME, about, start (owner, agent, trigger:NAME, schedule:NAME), limits steps N, days N, at-once N, to, agent; then step NAME blocks, each with one action: tool TOOL {json} (a built-in tool or SERVER/TOOL), do TEXT (answer json, agent, tools), wait 2h, wait until 09:00, wait event TRIGGER (match FIELD OP VALUE), approve TEXT, review TEXT, say TEXT; and if FIELD OP VALUE goto STEP, retry N wait D, on fail|deny|timeout goto STEP, timeout D, goto STEP, end. A line ending in : takes the lines indented below it. Values: {STEP}, {STEP.field}, {STEP.ok}, {STEP.error}, {input}, {event.FIELD}, {instance}, {now}.",
+    .description = "Workflows are step files harness runs with their state on disk: tool calls with fixed input, agent runs, waits for a time or an event, the owner's approval, branches, retries, messages. check reads a file and returns harness's reading or the line that is wrong. save proposes a new workflow or a change: the owner sees the whole file and harness's reading and approves it every time; it applies at once, and instances already going keep their file. start starts an instance (asked) of a workflow whose start line names agent; one that names only owner the owner starts, with /workflow start NAME: say so instead. stop stops one (asked), list and show see them. For something at a time of day or every so often, a schedule of the trigger tool is simpler than a workflow that waits in a loop. A file: workflow NAME, about, start (owner, agent, trigger:NAME, schedule:NAME), limits steps N, days N, at-once N, to, agent; then step NAME blocks, each with one action: tool TOOL {json} (a built-in tool or SERVER/TOOL), do TEXT (answer json, agent, tools), wait 2h, wait until 09:00, wait event TRIGGER (match FIELD OP VALUE), approve TEXT, review TEXT, say TEXT; and if FIELD OP VALUE goto STEP, retry N wait D, on fail|deny|timeout goto STEP, timeout D, goto STEP, end. A line ending in : takes the lines indented below it. Values: {STEP}, {STEP.field}, {STEP.ok}, {STEP.error}, {input}, {event.FIELD}, {instance}, {now}.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"check\",\"save\",\"start\",\"list\",\"show\",\"stop\"]},\"name\":{\"type\":\"string\",\"description\":\"save, start, show: the workflow's name; stop and show: NAME or NAME#N\"},\"text\":{\"type\":\"string\",\"description\":\"check, save: the whole file; start: the instance's input\"}},\"required\":[\"action\"]}",
 };
 
@@ -1310,6 +1365,11 @@ pub const WfDesk = struct {
     /// Starts an instance by the workflow tool (the start line's `agent`),
     /// marked with the outside text the run had read (outside.zig).
     start: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent: []const u8, outside: []const []const u8) []const u8,
+    /// Why the workflow tool can't start `name` whatever the owner
+    /// answers (no such workflow, a start line without `agent`); null: it
+    /// may be asked. Said before the question: a yes that starts nothing
+    /// isn't asked for.
+    startable: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8,
     list: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const u8,
     show: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) []const u8,
     stop: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) []const u8,
@@ -1712,6 +1772,9 @@ pub const ModelCfg = struct {
     max_tokens: u32,
     /// The instance's providers; null: omnigate at `url` with `key`.
     providers: ?*const model.Providers = null,
+    /// The model of private conversations, as "PROVIDER:MODEL"; "": the
+    /// same models as elsewhere.
+    private: []const u8 = "",
 };
 
 /// A counting limit on helpers running at once, across the process, and
@@ -1885,6 +1948,14 @@ const gate_line =
     \\
 ;
 
+/// Harness's own line on how an answer is shown. Every way out (the desk,
+/// Telegram, the terminal) shows the text as typed, so Markdown marks come
+/// out as marks: "**Triggers:** none", seen with a real model.
+pub const plain_line =
+    \\Your answers are shown as plain text, exactly as typed: write no Markdown (no ** or # marks, no backticks, no tables). A short list of lines starting with - is fine.
+    \\
+;
+
 /// The same for a delegated run.
 const delegated_gate_line =
     \\Every tool call passes a gate and may be refused. If a call is refused, say so instead of trying another way around it.
@@ -1942,6 +2013,8 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     // own lines, which a persona never changes
     if (!r.helper) try out.appendSlice(arena, r.persona);
     try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
+    // (a helper's answer goes to the run that asked, not to a person)
+    if (!r.helper) try out.appendSlice(arena, plain_line);
     if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
     if (r.allows(.send)) try out.appendSlice(arena, if (who_mod.isMember(r.who.by)) member_send_guide else send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
@@ -2037,15 +2110,41 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
     // a helper's run carries its parent's deadline: it never ends later
     const deadline = if (r.helper and r.deadline_s > 0) @min(own_end, r.deadline_s) else own_end;
 
+    // read once: the same answer marks the turn and picks its model
+    // (`/private on` while it runs covers its log lines from then on, and
+    // changes the model from the next turn)
+    const private_now = r.isPrivate();
     {
         r.lock.lockUncancelable(r.io);
         defer r.lock.unlock(r.io);
-        if (from_owner and !r.isPrivate()) {
+        if (from_owner and !private_now) {
             const ids = try r.mem.noteMentions(a, user_text, started);
             for (ids) |id| try r.log.write(.memory, false, .{ .event = "mention", .id = id });
         }
     }
-    try r.logRun(.turn, r.isPrivate(), .{ .text = user_text });
+    try r.logRun(.turn, private_now, .{ .text = user_text });
+    // a private turn is asked of the model of private conversations, when
+    // one is set: this call, its helpers' (they are copies of this run) and
+    // its summary's. No other model is asked if that one fails.
+    const private_model = if (r.model_cfg) |cfg| cfg.private else "";
+    const usual_client = r.client;
+    var private_client: model.Client = undefined;
+    // a helper is on the model its parent's turn started with
+    const own_private = !r.helper and private_now and private_model.len > 0;
+    if (own_private) {
+        r.on_private = true;
+        errdefer r.on_private = false;
+        private_client = try r.modelClient(private_model, usual_client.max_tokens);
+        r.client = &private_client;
+    }
+    defer if (own_private) {
+        r.client = usual_client;
+        r.on_private = false;
+        private_client.deinit();
+    };
+    // what the private model was asked stays with it, also when the
+    // setting is taken away later
+    const leave_private = !r.helper and !r.on_private;
     // the folders it changes are snapshotted before their first change and
     // when it ends; its helpers share this
     // a run in a `workspace = copy` environment works in its own copy,
@@ -2071,7 +2170,8 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
     // which the model API refuses from then on: drop it whole
     var tn_kept = true;
     errdefer if (tn_kept) conv.dropLast();
-    tn.private = r.isPrivate();
+    tn.private = private_now;
+    tn.on_private = r.on_private;
     // where its calls mark what they read; what it starts with
     r.conv = conv;
     {
@@ -2150,7 +2250,7 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
             break;
         }
         result.steps += 1;
-        const msgs = try conv.messages(a);
+        const msgs = try conv.messagesFor(a, leave_private);
         const reply = r.client.sendParts(a, system.stable, "", msgs, defs, .{ .stop = r.env.stop, .deadline_s = deadline }) catch |e| {
             if (e == error.Stopped) {
                 result.stopped = true;
@@ -3113,6 +3213,7 @@ fn workflowTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         }
         if (name.len == 0) break :out .{ .text = "workflow takes action check, save, start, list, show or stop; start, show and stop need the name", .is_error = true };
         if (eql(u8, action, "start")) {
+            if (desk.startable(desk.ctx, a, name)) |why| break :out .{ .text = why, .is_error = true };
             if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "start {s}", .{name}), if (text.len > 0) try std.fmt.allocPrint(a, "input: {s}", .{text}) else "", r.now())) |why|
                 break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
             break :out .{ .text = desk.start(desk.ctx, a, name, text, r.who.by, r.who.agent, try r.outside(a)) };
@@ -8018,6 +8119,341 @@ test "a_delegated_definition_uses_its_own_provider" {
     try t.expectEqualStrings("claude-test", jv.str(jv.at(strong, &.{ "body", "model" })).?);
 }
 
+// ---- private conversations on a model of their own ----
+
+/// `local` (OpenAI format, at the stand-in) is the model of private
+/// conversations; omnigate (Anthropic format, at the stand-in too) is the
+/// provider of the rest. A request's path says which it went to.
+fn withPrivateModel(f: *Fix) !void {
+    try withHelpers(f);
+    const a = f.e.arena.allocator();
+    const set = try a.create(model.Providers);
+    set.* = try model.Providers.resolve(a, .{
+        .omnigate_url = try f.e.url(),
+        .sections = &.{.{ .name = "local", .api = .openai, .url = try std.fmt.allocPrint(a, "{s}/v1", .{try f.e.url()}) }},
+    }, .{ .get = helperKeys });
+    f.run.model_cfg.?.providers = set;
+    f.run.model_cfg.?.private = "local:gpt-private";
+}
+
+const at_private = "/v1/chat/completions";
+const at_usual = "/v1/messages";
+
+fn targetOf(f: *Fix, n: u32) ![]const u8 {
+    return jv.str(jv.get(jv.parse(f.e.arena.allocator(), try f.e.request(n)).?, "target")).?;
+}
+
+fn modelOf(f: *Fix, n: u32) ![]const u8 {
+    return jv.str(jv.at(jv.parse(f.e.arena.allocator(), try f.e.request(n)).?, &.{ "body", "model" })).?;
+}
+
+fn sayAs(f: *Fix, private: bool, text: []const u8) !void {
+    f.run.private = private;
+    const r = try f.say(text);
+    defer freeResult(&f.run, r);
+    if (r.ended_by) |why| {
+        std.debug.print("turn ended: {s}\n", .{why});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a_private_turn_is_asked_of_the_private_model" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.oaTextReply("Kept here."));
+    try f.e.script(2, model.textReply("Back."));
+    f.run.private = true;
+    const r = try f.say("the door code is 4471");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Kept here.", r.text);
+    try t.expectEqualStrings(at_private, try targetOf(&f, 1));
+    try t.expectEqualStrings("gpt-private", try modelOf(&f, 1));
+    const first = jv.parse(f.e.arena.allocator(), try f.e.request(1)).?;
+    try t.expectEqualStrings("Bearer sk-local-test-1", jv.str(jv.at(first, &.{ "headers", "Authorization" })).?);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"provider\":\"local\"") != null);
+    // the run's own client is back when the turn ends
+    try t.expect(f.run.client == &f.client);
+    try t.expect(!f.run.on_private);
+    // not private: the usual model
+    try sayAs(&f, false, "and the weather?");
+    try t.expectEqualStrings(at_usual, try targetOf(&f, 2));
+    try t.expectEqual(2, f.e.server.modelRequests());
+}
+
+test "a_private_turns_helpers_are_on_the_private_model" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    const a = f.e.arena.allocator();
+    // a definition that names a model of its own, and a strong task
+    var defs = try defsWith(&f, &.{.{ "researcher", "---\nname: researcher\ndescription: Research across sources.\nmodel: omnigate:claude-research\ntools: recall\n---\nResearch with two sources.\n" }});
+    defer defs.deinit();
+    f.run.defs = &defs;
+    try f.e.script(1, try model.oaToolReply(a, "call_1", "delegate", "{\"tasks\":[{\"task\":\"find a\",\"strong\":true},{\"task\":\"find b\",\"agent\":\"researcher\"},{\"task\":\"find c\"}]}"));
+    for (2..5) |n| try f.e.script(@intCast(n), model.oaTextReply("helper answer"));
+    try f.e.script(5, model.oaTextReply("Combined."));
+    f.run.private = true;
+    const r = try f.say("research the door code");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Combined.", r.text);
+    try t.expectEqual(5, f.e.server.modelRequests());
+    for (1..6) |n| {
+        try t.expectEqualStrings(at_private, try targetOf(&f, @intCast(n)));
+        try t.expectEqualStrings("gpt-private", try modelOf(&f, @intCast(n)));
+    }
+    try t.expectEqual(3, std.mem.count(u8, try f.e.request(5), "helper answer"));
+}
+
+test "a_private_turns_summary_is_asked_of_the_private_model" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    f.run.limits.conversation_bytes = 1000;
+    for (1..8) |n| try f.e.script(@intCast(n), model.oaTextReply("It will be sunny and mild with light wind in the afternoon."));
+    for (0..6) |_| try sayAs(&f, true, "tell me about the weather in the mountains this weekend please");
+    // six turn calls and one summary call, none of them elsewhere
+    try t.expectEqual(7, f.e.server.modelRequests());
+    try t.expect(f.conv.summary != null);
+    for (1..8) |n| try t.expectEqualStrings(at_private, try targetOf(&f, @intCast(n)));
+    try t.expectEqualStrings("gpt-private", try modelOf(&f, 7));
+    try t.expect(std.mem.indexOf(u8, try f.e.request(7), "Summarise this conversation") != null);
+}
+
+test "the_private_model_failing_ends_the_turn_there" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, "{\"status\":402}");
+    f.run.private = true;
+    const r = try f.say("the door code is 4471");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("Model budget used up at local.", r.ended_by.?);
+    // no other model is tried
+    try t.expectEqual(1, f.e.server.modelRequests());
+    try t.expectEqualStrings(at_private, try targetOf(&f, 1));
+}
+
+test "a_private_model_the_provider_does_not_have_is_named_with_its_setting" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, "{\"status\":404}");
+    f.run.private = true;
+    const r = try f.say("the door code is 4471");
+    defer freeResult(&f.run, r);
+    try t.expect(std.mem.indexOf(u8, r.ended_by.?, "local has no model named gpt-private") != null);
+    try t.expect(std.mem.indexOf(u8, r.ended_by.?, "harness config set model.private_model local:NAME") != null);
+    try t.expect(std.mem.indexOf(u8, r.ended_by.?, "model.model") == null);
+    try t.expectEqual(1, f.e.server.modelRequests());
+}
+
+test "private_turns_are_left_out_of_what_another_model_is_sent" {
+    var f: Fix = undefined;
+    try f.init("allow read_file *\n");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    const a = f.e.arena.allocator();
+    try f.e.script(1, model.textReply("Alpha answer."));
+    try f.e.script(2, model.oaTextReply("Bravo kept."));
+    try f.e.script(3, try model.oaToolReply(a, "call_1", "read_file", "{\"path\":\"zulu-notes.txt\"}"));
+    try f.e.script(4, model.oaTextReply("Charlie kept."));
+    try f.e.script(5, model.textReply("Delta answer."));
+    try f.e.script(6, model.oaTextReply("Echo kept."));
+    try sayAs(&f, false, "alpha question");
+    try sayAs(&f, true, "bravo secret");
+    try sayAs(&f, true, "charlie secret, read the notes");
+    try sayAs(&f, false, "delta question");
+    try sayAs(&f, true, "echo secret");
+    try t.expectEqual(6, f.e.server.modelRequests());
+    // the usual model: what was said while private is not in its request,
+    // and one line stands where it was
+    const usual = try f.e.request(5);
+    try t.expectEqualStrings(at_usual, try targetOf(&f, 5));
+    for ([_][]const u8{ "bravo secret", "Bravo kept.", "charlie secret", "zulu-notes", "call_1", "Charlie kept." }) |word| {
+        if (std.mem.indexOf(u8, usual, word) != null) {
+            std.debug.print("sent to the usual model: {s}\n", .{word});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try t.expectEqual(1, std.mem.count(u8, usual, private_gap));
+    const line = std.mem.indexOf(u8, usual, "{\"type\":\"text\",\"text\":\"" ++ private_gap ++ "\"}").?;
+    try t.expect(std.mem.indexOf(u8, usual, "Alpha answer.").? < line);
+    try t.expect(line < std.mem.indexOf(u8, usual, "delta question").?);
+    // what it is sent is a user message, then its answer, then a user message
+    const msgs = jv.arr(jv.at(jv.parse(a, usual).?, &.{ "body", "messages" })).?;
+    try t.expectEqual(3, msgs.len);
+    try t.expectEqualStrings("user", jv.str(jv.get(msgs[2], "role")).?);
+    // private again: the private model gets all of it, and no such line
+    const again = try f.e.request(6);
+    try t.expectEqualStrings(at_private, try targetOf(&f, 6));
+    for ([_][]const u8{ "alpha question", "bravo secret", "Bravo kept.", "charlie secret", "zulu-notes", "Charlie kept.", "delta question", "Delta answer.", "echo secret" }) |word| {
+        if (std.mem.indexOf(u8, again, word) == null) {
+            std.debug.print("not sent to the private model: {s}\n", .{word});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try t.expectEqual(0, std.mem.count(u8, again, private_gap));
+}
+
+test "two_private_stretches_leave_two_lines" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.oaTextReply("Papa kept."));
+    try f.e.script(2, model.textReply("Oscar answer."));
+    try f.e.script(3, model.oaTextReply("Quebec kept."));
+    try f.e.script(4, model.textReply("Romeo answer."));
+    try sayAs(&f, true, "papa secret");
+    try sayAs(&f, false, "oscar question");
+    try sayAs(&f, true, "quebec secret");
+    try sayAs(&f, false, "romeo question");
+    // a conversation that began private: the line comes first
+    const second = try f.e.request(2);
+    try t.expectEqual(1, std.mem.count(u8, second, private_gap));
+    try t.expect(std.mem.indexOf(u8, second, "papa") == null and std.mem.indexOf(u8, second, "Papa") == null);
+    const fourth = try f.e.request(4);
+    try t.expectEqual(2, std.mem.count(u8, fourth, private_gap));
+    for ([_][]const u8{ "papa", "Papa", "quebec", "Quebec" }) |word| try t.expect(std.mem.indexOf(u8, fourth, word) == null);
+    try t.expect(std.mem.indexOf(u8, fourth, "oscar question") != null);
+    try t.expect(std.mem.indexOf(u8, fourth, "Oscar answer.") != null);
+}
+
+test "without_a_private_model_private_turns_are_sent_as_before" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    f.run.model_cfg.?.private = "";
+    try f.e.script(1, model.textReply("Bravo kept."));
+    try f.e.script(2, model.textReply("Delta answer."));
+    try sayAs(&f, true, "bravo secret");
+    try sayAs(&f, false, "delta question");
+    try t.expectEqualStrings(at_usual, try targetOf(&f, 1));
+    const second = try f.e.request(2);
+    try t.expect(std.mem.indexOf(u8, second, "bravo secret") != null);
+    try t.expect(std.mem.indexOf(u8, second, "Bravo kept.") != null);
+    try t.expectEqual(0, std.mem.count(u8, second, private_gap));
+}
+
+test "a_turn_made_private_while_it_runs_stays_on_its_model_and_is_sent_whole" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    var sw: Switches = .{};
+    f.run.switches = &sw;
+    // /private on arrives while the owner is asked about the first call
+    f.on_ask = &sw.private;
+    try f.e.script(1, model.toolReply("tu_1", "shell", "{\"command\":\"echo sierra-word\"}"));
+    try f.e.script(2, model.toolReply("tu_2", "delegate", "{\"tasks\":[{\"task\":\"find tango\"}]}"));
+    try f.e.script(3, model.textReply("helper answer"));
+    try f.e.script(4, model.textReply("done"));
+    const r = try f.say("run it, uniform words");
+    defer freeResult(&f.run, r);
+    try t.expectEqualStrings("done", r.text);
+    try t.expect(sw.private.load(.acquire));
+    try t.expectEqual(4, f.e.server.modelRequests());
+    for (1..5) |n| try t.expectEqualStrings(at_usual, try targetOf(&f, @intCast(n)));
+    try t.expectEqualStrings("claude-worker", try modelOf(&f, 3));
+    // its own words and calls are in its later requests, with no line for them
+    const last = try f.e.request(4);
+    try t.expect(std.mem.indexOf(u8, last, "run it, uniform words") != null);
+    try t.expect(std.mem.indexOf(u8, last, "sierra-word") != null);
+    try t.expectEqual(0, std.mem.count(u8, last, private_gap));
+}
+
+test "privately_answered_turns_stay_with_that_model_when_the_setting_is_taken_away" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.oaTextReply("Bravo kept."));
+    try f.e.script(2, model.textReply("Delta answer."));
+    try f.e.script(3, model.textReply("Echo answer."));
+    try sayAs(&f, true, "bravo secret");
+    // harness config set model.private_model "", then /reload
+    f.run.model_cfg.?.private = "";
+    try sayAs(&f, false, "delta question");
+    // private with no model of its own now: the usual model's, like the rest
+    try sayAs(&f, true, "echo words");
+    for ([_]u32{ 2, 3 }) |n| {
+        const sent = try f.e.request(n);
+        try t.expectEqualStrings(at_usual, try targetOf(&f, n));
+        for ([_][]const u8{ "bravo secret", "Bravo kept." }) |word| {
+            if (std.mem.indexOf(u8, sent, word) != null) {
+                std.debug.print("request {d} to the usual model holds: {s}\n", .{ n, word });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try t.expectEqual(1, std.mem.count(u8, sent, private_gap));
+    }
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "delta question") != null);
+}
+
+test "a_turn_the_usual_model_answered_is_sent_to_it_again_though_marked_private" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.textReply("Alpha answer."));
+    try f.e.script(2, model.textReply("Delta answer."));
+    try sayAs(&f, false, "alpha question");
+    // /private on arrived while it ran, /private off after it: the core
+    // marks such a turn private (out of memory), on the model it started with
+    f.conv.turns.items[0].private = true;
+    try sayAs(&f, false, "delta question");
+    const second = try f.e.request(2);
+    try t.expectEqualStrings(at_usual, try targetOf(&f, 2));
+    try t.expect(std.mem.indexOf(u8, second, "alpha question") != null);
+    try t.expect(std.mem.indexOf(u8, second, "Alpha answer.") != null);
+    try t.expectEqual(0, std.mem.count(u8, second, private_gap));
+}
+
+test "the_newest_turn_is_sent_though_marked_private" {
+    var conv: Conversation = .init(t.allocator);
+    defer conv.deinit();
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const words = [_][]const u8{ "one", "two", "three" };
+    for (words, 0..) |w, i| {
+        const tn = try conv.begin();
+        // the second was asked of the private model; the third is on the
+        // usual one, private since /private on arrived
+        tn.private = i > 0;
+        tn.on_private = i == 1;
+        try keep(tn, .{ .role = .user, .blocks = &.{.{ .text = w }} });
+        if (i < 2) try keep(tn, .{ .role = .assistant, .blocks = &.{.{ .text = "answer" }} });
+    }
+    // to another model: the private model's turn is left out, the newest is not
+    const msgs = try conv.messagesFor(a, true);
+    try t.expectEqual(3, msgs.len);
+    try t.expectEqualStrings("one", msgs[0].blocks[0].text);
+    try t.expectEqual(model.Role.user, msgs[2].role);
+    try t.expectEqual(2, msgs[2].blocks.len);
+    try t.expectEqualStrings(private_gap, msgs[2].blocks[0].text);
+    try t.expectEqualStrings("three", msgs[2].blocks[1].text);
+    // to the private model, and as `messages` gives them: all of it
+    try t.expectEqual(5, (try conv.messagesFor(a, false)).len);
+    try t.expectEqual(5, (try conv.messages(a)).len);
+    // a stretch whose next kept message is the agent's: the line is a user message of its own
+    conv.turns.items[2].on_private = true;
+    const tn = try conv.begin();
+    try keep(tn, .{ .role = .assistant, .blocks = &.{.{ .text = "said by itself" }} });
+    const more = try conv.messagesFor(a, true);
+    try t.expectEqual(4, more.len);
+    try t.expectEqual(model.Role.user, more[2].role);
+    try t.expectEqualStrings(private_gap, more[2].blocks[0].text);
+    try t.expectEqualStrings("said by itself", more[3].blocks[0].text);
+}
+
 test "money_in_trigger_runs_is_refused_while_triggers_is_off" {
     var f: Fix = undefined;
     try f.init("");
@@ -9139,6 +9575,8 @@ test "the_persona_comes_after_the_body_and_before_harness_lines" {
     const body = std.mem.indexOf(u8, s, "You are a personal agent").?;
     const persona_at = std.mem.indexOf(u8, s, "PERSONA: dry and brief.").?;
     const gate_at = std.mem.indexOf(u8, s, "Every tool call passes a gate").?;
+    // harness's line on how an answer is shown comes with the gate's
+    try t.expect(std.mem.indexOf(u8, s, "Your answers are shown as plain text, exactly as typed: write no Markdown").? > gate_at);
     const send_at = std.mem.indexOf(u8, s, "The owner sees only what you post with send").?;
     const standing = std.mem.indexOf(u8, s, "Standing instructions from the owner").?;
     try t.expect(body < persona_at and persona_at < gate_at and gate_at < send_at and send_at < standing);

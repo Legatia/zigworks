@@ -53,9 +53,17 @@ pub const Env = struct {
 
 pub const Output = struct { text: []const u8, is_error: bool = false };
 
+/// What reads a command on this machine, said to the model: it can't tell
+/// from the tool's name, and asked for `dir /b` and `ls` at once when it
+/// wasn't told (two questions to the owner for one listing).
+pub const shell_words = if (@import("builtin").os.tag == .windows)
+    " On this machine the shell is Windows' cmd.exe (dir, type, findstr); for more, powershell -NoProfile -Command \"...\"."
+else
+    " On this machine the shell is /bin/sh.";
+
 pub fn defs() []const model.ToolDef {
     return &.{
-        .{ .name = "shell", .description = "Run a shell command in the workspace folder. Returns the exit code and output.", .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}" },
+        .{ .name = "shell", .description = "Run a shell command in the workspace folder. Returns the exit code and output." ++ shell_words, .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}" },
         .{ .name = "read_file", .description = "Read a text file in the workspace.", .schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}" },
         .{ .name = "write_file", .description = "Write a text file in the workspace, replacing it if it exists.", .schema_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}" },
         .{ .name = "fetch", .description = "Fetch a web page or API over http(s) with GET. Pages come back as readable text (headings, lists, tables, links), in parts: a long page says where the next part starts.", .schema_json = "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\",\"description\":\"where to continue a long page\"}},\"required\":[\"url\"]}" },

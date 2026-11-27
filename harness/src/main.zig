@@ -318,7 +318,8 @@ const App = struct {
         const sec = app.secrets(cfg);
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
-        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| app.note("{s}", .{n});
+        var model_values: [4][]const u8 = undefined;
+        for (try startNotes(app.arena, &set, config.modelValues(cfg, &model_values))) |n| app.note("{s}", .{n});
         if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| app.note("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
@@ -722,7 +723,8 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         }
         // the keys of the other providers in use or with a section
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
-        const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        var model_values: [4][]const u8 = undefined;
+        const used = try set.used(app.arena, config.modelValues(cfg, &model_values));
         const voice_service = set.find(cfg.voice.provider);
         // the desk's voice too
         const desk_voice = set.find(cfg.desk.speak);
@@ -1554,6 +1556,11 @@ fn taskCmd(app: *App, args: []const []const u8) !Exit {
     const tk = for (c.tasks) |tk| {
         if (eql(tk.name, args[1])) break tk;
     } else {
+        // the agent's own schedules are in triggers.ini (its trigger tool)
+        for (c.trig_tasks) |tk| if (eql(tk.name, args[1])) {
+            complain("{s} is a schedule in triggers.ini: harness trigger run {s}", .{ args[1], args[1] });
+            return .failed;
+        };
         complain("no task called {s}", .{args[1]});
         return .failed;
     };
@@ -3466,12 +3473,12 @@ test "the_terminal_answers_by_id_when_several_are_open" {
     // a key alone: several take it, so the id is needed
     try t.expectEqualStrings("Several are waiting: 1, 2. Add the id, as in 1 1.", c.terminalAnswer(a, "1").?);
     // with the id, that item
-    try t.expectEqualStrings("", c.terminalAnswer(a, "2 2").?);
+    try t.expect(std.mem.startsWith(u8, c.terminalAnswer(a, "2 2").?, "[2] Answered: Work, "));
     const text = try Io.Dir.cwd().readFileAlloc(t.io, c.paths.inbox, a, .unlimited);
     try t.expect(std.mem.indexOf(u8, text, "\"answer\":{\"key\":\"2\",\"text\":null,") != null);
     try t.expect(std.mem.indexOf(u8, text, "\"via\":\"terminal\"") != null);
-    // one left: a key alone answers it
-    try t.expectEqualStrings("", c.terminalAnswer(a, "1").?);
+    // one left: a key alone answers it, and the terminal says what became of it
+    try t.expect(std.mem.startsWith(u8, c.terminalAnswer(a, "1").?, "[1] Answered: Personal, "));
     try t.expectEqualStrings("No item 2 is waiting.", c.terminalAnswer(a, "1 2").?);
     // with no approval waiting, o is a message for the agent
     try t.expectEqual(null, c.terminalAnswer(a, "o"));
@@ -3542,6 +3549,18 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "start_notes_name_the_private_models_provider_without_its_key" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try config.parse(a, "[model]\nurl = http://127.0.0.1:9\nprivate_model = openrouter:x/y\n");
+    const ps = try model.Providers.resolve(a, config.providerSettings(p), model.no_keys);
+    var buf: [4][]const u8 = undefined;
+    const pn = try startNotes(a, &ps, config.modelValues(p, &buf));
+    try t.expectEqual(2, pn.len);
+    try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", pn[1]);
 }
 
 test "a_voice_service_without_its_key_is_named_at_start" {
