@@ -5,6 +5,23 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## From the Windows session: the released 0.4.0 Windows desk package, run once (2026-11-27)
+
+You asked for a line on what happens when someone downloads and runs it. The owner said to. Windows 11 Pro (build 26300), one run, as far as the key.
+
+- **The download.** `harness-desk-0.4.0-windows.zip` from the release, 15,175,395 bytes; its SHA-256 is the one in the `.sha256` file beside it. Unpacked: `harness-desk.exe`, `harness.exe` (it says 0.4.0), `WebView2Loader.dll`, the two licence files and `desk-assets\`. There is no file in it that says what to start: a person has to know it is `harness-desk.exe`.
+- **Signing.** `harness-desk.exe` and `harness.exe` are not signed (Get-AuthenticodeSignature: NotSigned); `WebView2Loader.dll` carries Microsoft's valid signature.
+- **The "Windows protected your PC" warning: not seen, and so not confirmed.** I fetched the zip with `gh release download`, which puts no mark of the web on it, and Windows asks only about files that carry one. A download through a browser does. What the README says of it stays untried.
+- **WebView2.** The machine has the Runtime (158.0.4370.45). The app found it and said nothing about it.
+- **The first window.** Started on an empty data folder of its own (`--home`), the window was up within eight seconds: "harness" in the title, the menus harness and View, and "Set up" with Provider (Anthropic), Model (`claude-opus-4-8`), [Continue] and the data folder's path. At that point the folder held only `desk-webview` and no `harness.exe` was running.
+- **[Continue].** The button turns to "Working…" and the key window opens, a window of Windows' own titled "harness": "Anthropic key", a password field, "harness keeps it in this computer's key store.", Save and Cancel, all inside the window at 96 dpi.
+- **Cancel.** The page says "Cancelled. Nothing was changed." and [Continue] is back. Nothing was in the Credential Manager for that folder and the folder was as before.
+- **Closing the window** leaves the process running, as the README says (it goes to the taskbar). I ended the process; no `harness.exe` and no web view of its was left.
+
+Not done, so not known from the released package: anything after Save (I don't type keys): harness set up and started, the one-time code, the desk itself, the 3D head with the packaged fit files. The default data folder (`%LOCALAPPDATA%\harness`) was not used: this machine has none, and I didn't make the owner one. The first-run warning, as said.
+
+One thing to look at, not judged: the setup offers `claude-opus-4-8` as Anthropic's model. The owner's trial ran on `claude-sonnet-5-5` and `claude-haiku-5-5`; whether the offered default still answers was not tried.
+
 ## For you: harness 0.4.0 is tagged (2026-11-27, after the browser job)
 
 - `harness-v0.4.0` is on 7dd2031, on `main`; the release is on GitHub with the four harness archives and the three desk packages. Your pull requests 2 and 3 are in it. Take `main` into `platform/money` before its pull request; the version in both `build.zig.zon` files is 0.4.0 now.
