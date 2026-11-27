@@ -5,6 +5,20 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: CI runs once per branch; the private model is in "Provider and key…" (2026-11-27, night)
+
+- **CI changed, and it changes what you see on your branches.** `ci.yml` has a `concurrency` group per branch:
+  - a branch's push and its pull request's run are one group, so each push to a branch with a pull request gives one run, not two; the other shows as cancelled beside it. That is the group, not a failure;
+  - a newer push to a branch cancels the older commit's run, also one that already started. Push when you want that commit tested; three pushes in a minute test the last one;
+  - on `main` a started run finishes; only a waiting one is replaced;
+  - nothing runs for `harness-logins` (always pushed with `main`) or for tags.
+  - Why: the runs for one commit of mine waited over an hour without starting, behind two full runs for each push to `platform/payrun`, `platform/money-jobs` and `platform/desk-first-run`. If the group gets in your way, say so here.
+- The desk app's "Provider and key…" has a part "Private model" (Model, Address, Format) for a keyless server of the owner's own; Continue adds `provider local.api`, `provider local.url`, `provider local.auth none` and `model.private_model local:MODEL` to the same `harness config set` call. It is all in the shared Zig (`setup.zig`, `pages.zig`, `bridge.zig`, `controller.zig`, `main.zig`): nothing for `windows/desk.c` or `linux/desk.c`. The rules are in `docs/superpowers/specs/2026-11-27-harness-private-model-design.md`, "In the desk app's setup screen".
+  - "Provider and key…" now reads eleven settings after `model.provider` (`setup.read_count`), four of them new; they answer empty when unset, with the stand-in and with a real harness.
+  - `smoke-other.sh` is not changed and its expectations hold (no private model: the argv is what it was). If you want the same checks on your platforms, `scripts/smoke.sh` has them after the "Replace the key" part and at the end of the real-harness part; the ids are `pmodel`, `purl`, `papi`, `i-private`, `bubble-private`, `warn-private`.
+  - `platform/desk-first-run` touches the same screen's first setup: the private part is written only in "Provider and key…" (`privateRows` in `pages.zig`, called for the change mode). Take `main` in before its pull request; a conflict there is mine to help with, say so here.
+- `harness-v0.4.1` is tagged on this commit when its run on `main` is green.
+
 ## For you: 0.4.0 was run from its release on macOS; 0.4.1 follows (2026-11-27, evening)
 
 - The owner: "Just do everything necessary to make sure this product works well." The released macOS harness and desk app were downloaded and run (the smoke against the released binary: 183 ok); the Linux arm64 archive was only read. Nobody has run the released Windows or Linux packages yet: still yours if you have a moment, a line here is enough.
@@ -16,7 +30,7 @@ environments (gap 2), the open Windows items and the hosted design notes.
 - With a bot token stored and nobody paired, a message written on the desk was answered as a "Not delivered" item. Now, once the owner has written on the desk in this run (`Core.desk_written`), a post Telegram refuses with `error.NotPaired` in a conversation the desk shows is delivered to the desk (`DeskTee.unpaired` in `core.zig`), a reply with buttons as its text without them (`sendWithButtons`). Files and approvals are as before. All in `core.zig`; nothing for the shells.
 - `test (windows-latest, calmcp)` failed on `main` for 7b10e54: "The hosted runner lost communication with the server", no log. If you see it again on your side, say so here.
 - The README says the binary is "about 8 MB stripped" (it said 1.9 and 2.3 MB).
-- 0.4.1 is these fixes; the version in both `build.zig.zon` files is 0.4.1 with the next commit. Take `main` into `platform/money` before its pull request.
+- 0.4.1 is these fixes and the private model part below; the version in both `build.zig.zon` files is 0.4.1. Take `main` into `platform/money` before its pull request.
 
 ## For you: harness 0.4.0 is tagged (2026-11-27, after the browser job)
 
