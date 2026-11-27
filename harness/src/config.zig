@@ -494,6 +494,14 @@ pub fn speakers(a: std.mem.Allocator, cfg: Config) ![]const []const u8 {
 }
 
 /// What the providers are made from (`model.Providers.resolve`).
+/// The model values in use, for the lists of their providers (/status,
+/// the notes at start, `harness secret`): `private_model` only when set,
+/// since an empty value would read as a model of the default provider.
+pub fn modelValues(cfg: Config, buf: *[4][]const u8) []const []const u8 {
+    buf.* = .{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model, cfg.model.private_model };
+    return buf[0..if (cfg.model.private_model.len > 0) 4 else 3];
+}
+
 pub fn providerSettings(cfg: Config) model.Settings {
     return .{ .default = cfg.model.provider, .omnigate_url = cfg.model.url, .omnigate_key = cfg.model.key, .sections = cfg.providers };
 }
@@ -1512,6 +1520,21 @@ test "a_chat_model_on_gemini_is_refused" {
         std.debug.print("got: {s}\n", .{why});
         return error.TestUnexpectedResult;
     }
+}
+
+test "the_model_values_in_use_include_a_private_model" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [4][]const u8 = undefined;
+    const d = try parse(a, defaults_ini);
+    const dv = modelValues(d, &buf);
+    try t.expectEqual(3, dv.len);
+    try t.expectEqualStrings(d.model.model, dv[0]);
+    const p = try parse(a, "[model]\nprivate_model = openrouter:x/y\n");
+    const pv = modelValues(p, &buf);
+    try t.expectEqual(4, pv.len);
+    try t.expectEqualStrings("openrouter:x/y", pv[3]);
 }
 
 test "private_model_names_its_provider" {
