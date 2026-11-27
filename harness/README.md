@@ -3394,7 +3394,7 @@ only after a 3% move. A section's keys give its kind:
 | page | `page = URL`, with `json = PATH` for a value | text, removed, value, change, move | 1h (5m) |
 | file | `file = FOLDER/PATTERN` | path, change, size | 1m (30s) |
 | mcp | `mcp = SERVER/TOOL {json}` (`key = FIELD`), or `SERVER resource URI` | an item's fields, or text | 15m (1m) |
-| schedule | `every` or `at` alone, with `do`, `say` or `start` | none | as tasks (5m) |
+| schedule | `every` or `at` alone (`at` with `days`, or with `on = DATE` for one day), with `do`, `say` or `start` | none | as tasks (5m) |
 | brief | `topic` lines | none | daily at `at` |
 
 - **Sources.** A feed or search gives an event per link not seen before
@@ -3412,6 +3412,16 @@ only after a 3% move. A section's keys give its kind:
   event when it changed; a resource gives one when it changed, and is read
   again as soon as its server says it changed. A first poll only marks
   what is there.
+- **Schedules.** A section with no source runs at a time: `at = 07:00`
+  every day or on `days = mon, tue, …`, or `every = 15m`, as a task of
+  tasks.ini does. `on = 2026-11-28` with `at` is that one day alone, for a
+  reminder: it runs once, at its time or the first moment after it that
+  harness is up, and its section is then taken out of triggers.ini
+  (`/trigger run` tries it and keeps it). The agent adds these with its
+  `trigger` tool when you ask for something at a time ("every weekday at
+  8:00, the weather", "remind me tomorrow at 10:00 to call the dentist"),
+  and you approve the section. A new schedule whose time today has passed
+  runs once right away, as a missed one does.
 - **Polls** run one at a time, on one thread, with no model call, offset
   by up to a tenth of `every`; with `at = 07:00` (and `days`) once a day
   instead. A failed poll waits 2, 4, 8 … times `every` (at most 6 h, or

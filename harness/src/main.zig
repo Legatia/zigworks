@@ -1554,6 +1554,11 @@ fn taskCmd(app: *App, args: []const []const u8) !Exit {
     const tk = for (c.tasks) |tk| {
         if (eql(tk.name, args[1])) break tk;
     } else {
+        // the agent's own schedules are in triggers.ini (its trigger tool)
+        for (c.trig_tasks) |tk| if (eql(tk.name, args[1])) {
+            complain("{s} is a schedule in triggers.ini: harness trigger run {s}", .{ args[1], args[1] });
+            return .failed;
+        };
         complain("no task called {s}", .{args[1]});
         return .failed;
     };
@@ -3466,12 +3471,12 @@ test "the_terminal_answers_by_id_when_several_are_open" {
     // a key alone: several take it, so the id is needed
     try t.expectEqualStrings("Several are waiting: 1, 2. Add the id, as in 1 1.", c.terminalAnswer(a, "1").?);
     // with the id, that item
-    try t.expectEqualStrings("", c.terminalAnswer(a, "2 2").?);
+    try t.expect(std.mem.startsWith(u8, c.terminalAnswer(a, "2 2").?, "[2] Answered: Work, "));
     const text = try Io.Dir.cwd().readFileAlloc(t.io, c.paths.inbox, a, .unlimited);
     try t.expect(std.mem.indexOf(u8, text, "\"answer\":{\"key\":\"2\",\"text\":null,") != null);
     try t.expect(std.mem.indexOf(u8, text, "\"via\":\"terminal\"") != null);
-    // one left: a key alone answers it
-    try t.expectEqualStrings("", c.terminalAnswer(a, "1").?);
+    // one left: a key alone answers it, and the terminal says what became of it
+    try t.expect(std.mem.startsWith(u8, c.terminalAnswer(a, "1").?, "[1] Answered: Personal, "));
     try t.expectEqualStrings("No item 2 is waiting.", c.terminalAnswer(a, "1 2").?);
     // with no approval waiting, o is a message for the agent
     try t.expectEqual(null, c.terminalAnswer(a, "o"));

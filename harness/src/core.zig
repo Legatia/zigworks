@@ -5406,7 +5406,10 @@ pub const Core = struct {
     /// The terminal's keys: `o`, `d` and `n` answer an approval, `1` to `4`
     /// another item's choices, with the item's id when several take the
     /// key (`o 41`). Null when the line is no answer (a message for the
-    /// agent); "" when it was taken; else what to print.
+    /// agent); "" when it was taken by a run that goes on (its answer is
+    /// what shows); else what to print: for an item no run waits on, what
+    /// became of it ("[19] Allowed for this task for 30 days, 09:03"),
+    /// since the terminal can't change the message it printed.
     pub fn terminalAnswer(c: *Core, a: std.mem.Allocator, line: []const u8) ?[]const u8 {
         var words = std.mem.tokenizeAny(u8, std.mem.trim(u8, line, " \t\r\n"), " \t");
         const k = words.next() orelse return null;
@@ -5416,6 +5419,7 @@ pub const Core = struct {
         if (words.next() != null) return null;
         var target: u64 = 0;
         var key: []const u8 = "";
+        var of_run = false;
         {
             c.inbox.mutex.lockUncancelable(c.io);
             defer c.inbox.mutex.unlock(c.io);
@@ -5430,6 +5434,7 @@ pub const Core = struct {
                 if (n == 1) oldest = it.id;
                 ids.print(a, "{s}{d}", .{ if (n > 1) ", " else "", it.id }) catch return null;
                 target = it.id;
+                of_run = it.isRun();
                 key = a.dupe(u8, kk) catch return null;
             }
             if (want) |w| {
@@ -5444,7 +5449,14 @@ pub const Core = struct {
             }
         }
         const took = c.answerItem(target, key, null, .terminal);
-        return if (took == .taken) "" else c.tookText(a, target, took);
+        if (took != .taken) return c.tookText(a, target, took);
+        if (of_run) return "";
+        c.inbox.mutex.lockUncancelable(c.io);
+        defer c.inbox.mutex.unlock(c.io);
+        const it = c.inbox.find(target) orelse return "";
+        const said = a.dupe(u8, inbox_mod.outcome(a, it, c.cfg.chat.utc_offset) catch return "") catch return "";
+        if (said.len > 0) said[0] = std.ascii.toUpper(said[0]);
+        return std.fmt.allocPrint(a, "[{d}] {s}", .{ target, said }) catch "";
     }
 
     /// No one is there to answer any more (the terminal's input ended): the
@@ -6977,9 +6989,17 @@ pub const Core = struct {
         if (tk.every_minutes) |every| {
             if (last) |l| if (now_s - l < @as(i64, every) * 60) return;
         } else if (tk.at_minutes) |at| {
-            if (tk.days & (@as(u7, 1) << util.weekday(today)) == 0) return;
-            if (c.localMinutes(now_s) < at) return;
-            if (last) |l| if (c.localDay(l) >= today) return;
+            if (tk.on_day) |day| {
+                // one day: from its time on, late if harness was down then,
+                // and once (a run at or after its time was this one)
+                if (today < day or (today == day and c.localMinutes(now_s) < at)) return;
+                const due = day * 86400 + @as(i64, at) * 60 - @as(i64, c.cfg.chat.utc_offset) * 60;
+                if (last) |l| if (l >= due) return;
+            } else {
+                if (tk.days & (@as(u7, 1) << util.weekday(today)) == 0) return;
+                if (c.localMinutes(now_s) < at) return;
+                if (last) |l| if (c.localDay(l) >= today) return;
+            }
         }
         if (c.waitsToBeSent(key.slice())) return;
         // its definition runs at most `parallel` at once
@@ -7227,6 +7247,15 @@ pub const Core = struct {
         // not counted as run until its message is delivered: its item does it
         if (outcome == .undelivered) return;
         c.markRan(key, v);
+        // a schedule for one day has run: its section goes (it would only
+        // sit in triggers.ini, never due again)
+        // (its own run, by the scheduler: /trigger run tries it and keeps it)
+        if (job == .task and job.task.on_day != null and job.task.in_triggers and std.mem.startsWith(u8, key, "task:")) {
+            var arena: std.heap.ArenaAllocator = .init(c.gpa);
+            defer arena.deinit();
+            const why = c.removeTrigger(arena.allocator(), job.task.name, "harness") catch null;
+            if (why) |w| c.log.write(.trigger, false, .{ .name = job.task.name, .event = "kept", .why = w }) catch {};
+        }
     }
 
     /// Sends again the post delivery item `id` keeps. Delivered: the item is
@@ -7817,6 +7846,12 @@ pub const Core = struct {
         return out.items;
     }
 
+    /// " on 2026-11-28, once" for a schedule of one day; else nothing.
+    fn onText(a: std.mem.Allocator, on: ?i64) ![]const u8 {
+        const day = util.civil(on orelse return "");
+        return std.fmt.allocPrint(a, " on {d:0>4}-{d:0>2}-{d:0>2}, once", .{ @as(u32, @intCast(day.y)), day.m, day.d });
+    }
+
     fn actionText(a: std.mem.Allocator, tr: triggers.Trigger) ![]const u8 {
         return switch (tr.action) {
             .do => std.fmt.allocPrint(a, "a run of {s}", .{tr.agent}),
@@ -7835,7 +7870,7 @@ pub const Core = struct {
             c.settings_mutex.lockUncancelable(c.io);
             defer c.settings_mutex.unlock(c.io);
             for (c.trig_list) |tr| {
-                try out.print(a, "{s} ({s}, triggers.ini): {s}, {s}", .{ tr.name, @tagName(tr.kind), try whenText(a, tr.every_s, tr.at, tr.days), try actionText(a, tr) });
+                try out.print(a, "{s} ({s}, triggers.ini): {s}{s}, {s}", .{ tr.name, @tagName(tr.kind), try whenText(a, tr.every_s, tr.at, tr.days), try onText(a, tr.on), try actionText(a, tr) });
                 if (tr.isEvent()) {
                     c.trig_mutex.lockUncancelable(c.io);
                     defer c.trig_mutex.unlock(c.io);
@@ -10109,7 +10144,7 @@ pub const Core = struct {
     // ---- workflows: the tool's desk ----
 
     fn wfDesk(c: *Core) agent.WfDesk {
-        return .{ .ctx = c, .check = wfDeskCheck, .save = wfDeskSave, .start = wfDeskStart, .list = wfDeskList, .show = wfDeskShow, .stop = wfDeskStop };
+        return .{ .ctx = c, .check = wfDeskCheck, .save = wfDeskSave, .start = wfDeskStart, .startable = wfDeskStartable, .list = wfDeskList, .show = wfDeskShow, .stop = wfDeskStop };
     }
 
     fn wfDeskCheck(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, text: []const u8) agent.Checked {
@@ -10126,6 +10161,16 @@ pub const Core = struct {
         const c: *Core = @ptrCast(@alignCast(ctx));
         const begun = c.startInstance(a, name, .{ .at = c.now(), .by = by, .agent = agent_name, .input = input, .tool = true, .outside = outside }) catch |e| return @errorName(e);
         return c.startText(a, name, begun) catch "out of memory";
+    }
+
+    /// Why the workflow tool can't start `name`, before the owner is asked.
+    fn wfDeskStartable(ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        const c: *Core = @ptrCast(@alignCast(ctx));
+        const text = c.workflowText(a, name) orelse return std.fmt.allocPrint(a, "Not started: there is no workflow {s}.", .{name}) catch "Not started.";
+        var diag: workflows.Diag = .{};
+        const w = workflows.parse(a, name, text, &diag) catch return null;
+        if (w.allows("", true)) return null;
+        return std.fmt.allocPrint(a, "Not started, and the owner was not asked: workflow {s} does not start by the agent (the workflow tool), its start line names {s}. The owner starts it: /workflow start {s}. Tell them so.", .{ name, std.mem.join(a, ", ", w.start) catch "owner", name }) catch "Not started.";
     }
 
     fn wfDeskList(ctx: *anyopaque, a: std.mem.Allocator) []const u8 {
@@ -20109,6 +20154,68 @@ test "task_every_runs_and_nothing_answer_is_silent" {
     try t.expect(std.mem.indexOf(u8, req, "scheduled task") != null);
 }
 
+test "a_schedule_for_one_day_runs_once_and_its_section_goes" {
+    // "remind me tomorrow at 10:00 to call the dentist": seen with a real
+    // model as a workflow of two waits and two questions to the owner
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const today = f.core.localDay(util.nowSeconds(t.io));
+    const day = util.civil(today + 2);
+    const off = @as(i64, f.core.cfg.chat.utc_offset) * 60;
+    try setTriggers(&f, try std.fmt.allocPrint(a, "[keep]\nsearch = zig\n[dentist]\nat = 10:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Reminder: call the dentist.\n", .{ @as(u32, @intCast(day.y)), day.m, day.d }));
+    try expectHas(try f.core.command(a, "/triggers"), "dentist (schedule, triggers.ini): at 10:00 on ");
+    // /trigger run tries it now and keeps it
+    try expectHas(try f.core.command(a, "/trigger run dentist"), "dentist");
+    try f.rec.waitFor("[dentist] Reminder: call the dentist.");
+    var tried: u32 = 0;
+    while (f.core.bg_active.load(.acquire) > 0 and tried < 5000) : (tried += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try expectHas(try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited), "[dentist]");
+    // not before its day, and not before its time on it
+    f.core.tick();
+    f.core.fixed_now = (today + 2) * 86400 + 8 * 3600 - off;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(1, f.rec.count("call the dentist"));
+    // from its time on: said, with no model call
+    f.core.fixed_now = (today + 2) * 86400 + 12 * 3600 - off;
+    f.core.tick();
+    var said: u32 = 0;
+    while (f.rec.count("call the dentist") < 2 and said < 5000) : (said += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    try t.expectEqual(2, f.rec.count("call the dentist"));
+    // its section goes, and nothing else of the file
+    var waited: u32 = 0;
+    var text: []const u8 = "";
+    while (waited < 5000) : (waited += 20) {
+        text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited);
+        if (std.mem.indexOf(u8, text, "[dentist]") == null and f.core.bg_active.load(.acquire) == 0) break;
+        t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    try t.expect(std.mem.indexOf(u8, text, "[dentist]") == null);
+    try expectHas(text, "[keep]\nsearch = zig\n");
+    try expectHas(try logText(&f), "\"kind\":\"trigger\",\"name\":\"dentist\",\"event\":\"removed\",\"by\":\"harness\"");
+    // never twice
+    f.core.fixed_now = (today + 3) * 86400 + 12 * 3600 - off;
+    f.core.tick();
+    t.io.sleep(.fromMilliseconds(200), .awake) catch {};
+    try t.expectEqual(2, f.rec.count("call the dentist"));
+    try t.expectEqual(0, f.e.server.modelRequests());
+    // one whose time passed while harness was down is said when it is seen
+    const past = util.civil(today + 1);
+    try setTriggers(&f, try std.fmt.allocPrint(a, "[keep]\nsearch = zig\n[late]\nat = 10:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Late: water the plants.\n", .{ @as(u32, @intCast(past.y)), past.m, past.d }));
+    f.core.tick();
+    try f.rec.waitFor("[late] Late: water the plants.");
+    waited = 0;
+    while (f.core.bg_active.load(.acquire) > 0 and waited < 5000) : (waited += 20) t.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    // the same name again, for a later day, runs again
+    const next = util.civil(today + 5);
+    try setTriggers(&f, try std.fmt.allocPrint(a, "[keep]\nsearch = zig\n[dentist]\nat = 10:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Again: call the dentist.\n", .{ @as(u32, @intCast(next.y)), next.m, next.d }));
+    f.core.fixed_now = (today + 6) * 86400 + 9 * 3600 - off;
+    f.core.tick();
+    try f.rec.waitFor("[dentist] Again: call the dentist.");
+}
+
 test "task_paused_after_budget_spent_until_resume" {
     var f: Fix = undefined;
     try f.init("", "", "[check]\nevery = 5m\ndo = Check the price.\n");
@@ -24690,6 +24797,37 @@ test "stop_pauses_a_step_under_way_until_it_is_answered" {
     try t.expectEqual(0, f.rec.count("woke"));
 }
 
+
+test "a_start_the_agent_cannot_make_is_refused_before_the_owner_is_asked" {
+    // seen with a real model: it saved a workflow with `start owner`, asked
+    // to start it, the owner said yes, and the start was refused all the same
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try setWorkflow(&f, "mine", "workflow mine\nstart owner\nstep greet\nsay hello\n");
+    try setWorkflow(&f, "ours", "workflow ours\nstart owner, agent\nstep greet\nsay hello\n");
+    try f.core.startWorker();
+    try f.e.script(1, model.toolReply("w1", "workflow", "{\"action\":\"start\",\"name\":\"mine\"}"));
+    try f.e.script(2, model.textReply("Start it yourself."));
+    try f.core.handleText("start mine");
+    try f.rec.waitFor("Start it yourself.");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try expectHas(try f.e.request(2), "Not started, and the owner was not asked: workflow mine does not start by the agent (the workflow tool), its start line names owner. The owner starts it: /workflow start mine.");
+    // one that isn't there: the same, unasked
+    try f.e.script(3, model.toolReply("w2", "workflow", "{\"action\":\"start\",\"name\":\"nope\"}"));
+    try f.e.script(4, model.textReply("None."));
+    try f.core.handleText("start nope");
+    try f.rec.waitFor("None.");
+    try t.expectEqual(0, f.rec.count("BUTTONS"));
+    try expectHas(try f.e.request(4), "Not started: there is no workflow nope.");
+    // one whose start line names the agent is asked for, as before
+    try f.e.script(5, model.toolReply("w3", "workflow", "{\"action\":\"start\",\"name\":\"ours\"}"));
+    try f.e.script(6, model.textReply("Started."));
+    try f.core.handleText("start ours");
+    try f.rec.waitFor("BUTTONS Allow this? [1]\nworkflow: start ours");
+    try f.press("once");
+    try f.rec.waitFor("Started.");
+}
 
 test "workflow_save_asks_every_time_with_its_reading" {
     var f: Fix = undefined;

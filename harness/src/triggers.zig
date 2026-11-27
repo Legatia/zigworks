@@ -65,6 +65,9 @@ pub const Trigger = struct {
     at: ?u16 = null,
     /// Bit 0 Monday … bit 6 Sunday.
     days: u7 = 0x7f,
+    /// `on = 2026-11-28` (a schedule with `at`): that day alone, the owner's
+    /// time, as days since 1970. It runs once and its section is removed.
+    on: ?i64 = null,
     /// Feed addresses, search words, the page's address or the file pattern.
     sources: []const []const u8 = &.{},
     /// A page's value: a path of names and `[N]`.
@@ -384,7 +387,7 @@ fn briefSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
 }
 
 const source_keys = [_][]const u8{ "topic", "feed", "search", "page", "file", "mcp" };
-const other_keys = [_][]const u8{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "subject", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate", "while", "tag" };
+const other_keys = [_][]const u8{ "every", "at", "days", "on", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "subject", "max_runs", "max_events", "checks_per_day", "json", "key", "urgent", "announce", "speakers", "escalate", "while", "tag" };
 
 fn kindOfKey(key: []const u8) ?Kind {
     if (std.mem.eql(u8, key, "topic")) return .brief;
@@ -404,7 +407,7 @@ fn oneOf(word: []const u8, words: []const []const u8) bool {
 /// Whether a key goes with a trigger of `kind`.
 fn keyFits(kind: Kind, key: []const u8) bool {
     return switch (kind) {
-        .schedule => oneOf(key, &.{ "every", "at", "days", "do", "say", "start", "to", "subject", "agent", "urgent", "escalate", "tag" }),
+        .schedule => oneOf(key, &.{ "every", "at", "days", "on", "do", "say", "start", "to", "subject", "agent", "urgent", "escalate", "tag" }),
         .brief => oneOf(key, &.{ "topic", "at", "to" }),
         else => blk: {
             if (oneOf(key, &.{ "every", "at", "days", "match", "skip", "check", "do", "say", "start", "agent", "tools", "to", "subject", "max_runs", "max_events", "checks_per_day", "urgent", "announce", "speakers", "escalate", "while", "tag" })) break :blk true;
@@ -441,6 +444,8 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
     var speakers_line: usize = 0;
     var escalate_line: usize = 0;
     var tag_line: usize = 0;
+    var days_line: usize = 0;
+    var on_line: usize = 0;
     for (g.lines) |l| {
         const v = l.value;
         if (!keyFits(k, l.key)) return badf(a, diag, l.n, "{s} is not a key of a {s} trigger", .{ l.key, @tagName(k) });
@@ -458,7 +463,11 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
             at_line = l.n;
             tr.at = config.parseClock(v) catch return bad(diag, l.n, "at is HH:MM");
         } else if (std.mem.eql(u8, l.key, "days")) {
+            days_line = l.n;
             tr.days = config.parseDays(v) catch return bad(diag, l.n, "days are mon, tue, wed, thu, fri, sat, sun, separated by commas");
+        } else if (std.mem.eql(u8, l.key, "on")) {
+            on_line = l.n;
+            tr.on = parseDate(v) orelse return bad(diag, l.n, "on is a day, like 2026-11-28");
         } else if (std.mem.eql(u8, l.key, "match") or std.mem.eql(u8, l.key, "skip")) {
             var why: []const u8 = "";
             const c = condOf(a, v, k, &why) catch |e| switch (e) {
@@ -570,6 +579,11 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
     tr.match = match.items;
     tr.skip = skip.items;
     if (every_line != 0 and at_line != 0) return bad(diag, @max(every_line, at_line), "every or at, not both");
+    if (on_line != 0) {
+        if (k != .schedule) return bad(diag, on_line, "on goes with a schedule: at, and no source");
+        if (at_line == 0) return bad(diag, on_line, "on needs at: the time on that day");
+        if (days_line != 0) return bad(diag, @max(on_line, days_line), "on or days, not both: on is one day");
+    }
     if (tools_line != 0 and tr.action != .do) return bad(diag, tools_line, "tools go with do");
     if (speakers_line != 0 and tr.announce.len == 0) return bad(diag, speakers_line, "speakers goes with announce: where it is said");
     if (tag_line != 0 and tr.action != .say) return bad(diag, tag_line, "tag goes with say: a workflow's head says its own");
@@ -590,6 +604,20 @@ fn triggerSection(a: Allocator, g: Group, diag: *Diag) Error!Trigger {
         },
     }
     return tr;
+}
+
+/// "2026-11-28" as days since 1970; null when it isn't a day there is.
+pub fn parseDate(v: []const u8) ?i64 {
+    if (v.len != 10 or v[4] != '-' or v[7] != '-') return null;
+    const y = std.fmt.parseInt(u16, v[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(u8, v[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(u8, v[8..10], 10) catch return null;
+    if (y < 1970 or m < 1 or m > 12 or d < 1 or d > 31) return null;
+    const day = util.daysFromCivil(y, m, d);
+    // 2026-02-30 is no day: it would come back as another
+    const back = util.civil(day);
+    if (back.y != y or back.m != m or back.d != d) return null;
+    return day;
 }
 
 /// "30s", "5m", "1h", "2d" in seconds.
@@ -1043,6 +1071,10 @@ fn when(a: Allocator, tr: Trigger, capital: bool) ![]const u8 {
     } else {
         try out.print(a, "{s}very {s}", .{ if (capital) "E" else " e", try fmtDuration(a, tr.every_s orelse 3600) });
     }
+    if (tr.on) |day| {
+        const c = util.civil(day);
+        try out.print(a, " on {d:0>4}-{d:0>2}-{d:0>2}, once", .{ @as(u32, @intCast(c.y)), c.m, c.d });
+    }
     if (tr.days != 0x7f) {
         try out.appendSlice(a, " on ");
         var first = true;
@@ -1105,6 +1137,7 @@ pub fn tasksOf(a: Allocator, list: []const Trigger) ![]config.Task {
             .at_minutes = tr.at,
             .every_minutes = if (tr.every_s) |s| s / 60 else null,
             .days = tr.days,
+            .on_day = tr.on,
             .do = switch (tr.action) {
                 .do => |x| x,
                 else => "",
@@ -1311,6 +1344,28 @@ test "a_reading_says_what_runs_without_the_model" {
     try t.expectEqualStrings("Reads https://api.example.com/btc every 5 min (the value at data.amount), no model call; a new value whose move > 3 says: BTC {value}.", try reading(a, btc, "claude-haiku"));
     const bills = try parseOne(a, "[bills]\nfile = inbox/*.pdf\nskip = path has draft\ncheck = Is this a bill?\nagent = scout\ntools = read_file\nto = home\ndo = Say who wants how much.\n");
     try t.expectEqualStrings("Watches inbox/*.pdf every 1 min, asks claude-haiku \"Is this a bill?\" of each item the rules pass (at most 50 a day); a new, changed or removed file, unless path has \"draft\", starts a run of scout with tools read_file; at most 6 runs an hour; posts to home.", try reading(a, bills, "claude-haiku"));
+}
+
+test "a_schedule_for_one_day_is_read_and_said_in_words" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const once = try parseOne(a, "[dentist]\nat = 10:00\non = 2026-11-28\nsay = Reminder: call the dentist.\n");
+    try t.expectEqual(Kind.schedule, once.kind);
+    try t.expectEqual(util.daysFromCivil(2026, 11, 28), once.on.?);
+    try t.expectEqualStrings("At 10:00 on 2026-11-28, once, no model call, says: Reminder: call the dentist..", try reading(a, once, "claude-haiku"));
+    try t.expectEqual(util.daysFromCivil(2026, 11, 28), (try tasksOf(a, &.{once}))[0].on_day.?);
+    // a day there is, as it is written
+    try t.expectEqual(null, parseDate("2026-02-30"));
+    try t.expectEqual(null, parseDate("2026-13-01"));
+    try t.expectEqual(null, parseDate("28.11.2026"));
+    try t.expectEqual(null, parseDate("tomorrow"));
+    try t.expectEqual(util.daysFromCivil(2028, 2, 29), parseDate("2028-02-29").?);
+    // one day: with at, without days or every, and only a schedule's
+    try refused(a, "[x]\nat = 10:00\non = tomorrow\nsay = x\n", 3, "on is a day, like 2026-11-28");
+    try refused(a, "[x]\nevery = 15m\non = 2026-11-28\nsay = x\n", 3, "on needs at");
+    try refused(a, "[x]\nat = 10:00\ndays = mon\non = 2026-11-28\nsay = x\n", 4, "on or days, not both");
+    try refused(a, "[x]\nfeed = https://example.com/f.xml\non = 2026-11-28\nsay = x\n", 3, "on is not a key of a feed trigger");
 }
 
 test "in_triggers_ini_only_whole_lines_are_comments" {

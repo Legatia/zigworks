@@ -917,7 +917,7 @@ const send_def: model.ToolDef = .{
 /// workspace, where `run` is checked and the folder's `vars` apply.
 const shell_dir_def: model.ToolDef = .{
     .name = "shell",
-    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output.",
+    .description = "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output." ++ tools.shell_words,
     .schema_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"dir\":{\"type\":\"string\",\"description\":\"a folder in the workspace to start in; default the workspace\"}},\"required\":[\"command\"]}",
 };
 
@@ -1150,6 +1150,7 @@ fn shellDef(r: *const Run, a: std.mem.Allocator) !model.ToolDef {
     const pk = r.picked();
     var d: std.ArrayList(u8) = .empty;
     try d.appendSlice(a, if (with_dir) "Run a shell command in the workspace folder, or in `dir`, a folder inside it. Returns the exit code and output." else "Run a shell command in the workspace folder. Returns the exit code and output.");
+    try d.appendSlice(a, tools.shell_words);
     if (copyEnvOf(r) != null) try d.appendSlice(a, " This run works in its own copy of the workspace: the files it reads and writes are the copy's (give paths inside the workspace, not absolute ones), and the owner applies or drops its changes when it ends.");
     try d.print(a, " Commands run in {s}", .{try envLine(a, list, pk.name)});
     var s: std.ArrayList(u8) = .empty;
@@ -1207,7 +1208,7 @@ const agent_save_def: model.ToolDef = .{
 };
 const trigger_def: model.ToolDef = .{
     .name = "trigger",
-    .description = "Triggers act when something happens outside: a new feed or search item, a changed page or value, a file in a workspace folder, an MCP source; a match starts a run (do), says a line without the model (say, {field} filled in) or starts a workflow. add proposes a new trigger: the owner sees harness's reading of it and approves it every time, and it applies at once. test polls one now and says what it would start, keeping nothing. list lists them; rm removes one (asked). A section is [NAME] (a-z, 0-9, - and _), one source (feed = URL, search = WORDS, page = URL with json = PATH for a value, file = FOLDER/PATTERN, mcp = SERVER/TOOL {json} or SERVER resource URI), then every (30s, 5m, 1h), match = FIELD OP VALUE (OP has, is, starts, ends, like, >, <), skip, check = a yes/no question for the model, one of do, say and start = workflow NAME, and agent, tools, to.",
+    .description = "Triggers act when something happens outside: a new feed or search item, a changed page or value, a file in a workspace folder, an MCP source; a match starts a run (do), says a line without the model (say, {field} filled in) or starts a workflow. add proposes a new trigger: the owner sees harness's reading of it and approves it every time, and it applies at once. test polls one now and says what it would start, keeping nothing. list lists them; rm removes one (asked). A section is [NAME] (a-z, 0-9, - and _), one source (feed = URL, search = WORDS, page = URL with json = PATH for a value, file = FOLDER/PATTERN, mcp = SERVER/TOOL {json} or SERVER resource URI), then every (30s, 5m, 1h), match = FIELD OP VALUE (OP has, is, starts, ends, like, >, <), skip, check = a yes/no question for the model, one of do, say and start = workflow NAME, and agent, tools, to. A section with no source is a schedule, for what the owner wants at a time or regularly (\"every weekday at 8:00 tell me the weather\"): at = HH:MM (the owner's time) with days = mon, tue, wed, thu, fri, sat, sun if not every day, or on = YYYY-MM-DD for that one day (a reminder: \"remind me tomorrow at 10:00 to call the dentist\" is at = 10:00, on = the date, say = Reminder: call the dentist; it runs once and its section is removed), or every = 15m (at least 5m), and one of do (a run of you with that instruction, its answer posted; it answers NOTHING to stay silent), say and start. A new schedule runs once right away when it has every, or when its at has already passed today on one of its days, and from then on time: say so. A scheduled run has nobody to ask, so a call that needs approval is skipped and listed for the owner to allow for that task.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"test\",\"list\",\"rm\"]},\"text\":{\"type\":\"string\",\"description\":\"add, test: the whole section, [NAME] and its lines\"},\"name\":{\"type\":\"string\",\"description\":\"test, rm: a trigger's name\"}},\"required\":[\"action\"]}",
 };
 
@@ -1295,7 +1296,7 @@ pub const Desk = struct {
 
 const workflow_def: model.ToolDef = .{
     .name = "workflow",
-    .description = "Workflows are step files harness runs with their state on disk: tool calls with fixed input, agent runs, waits for a time or an event, the owner's approval, branches, retries, messages. check reads a file and returns harness's reading or the line that is wrong. save proposes a new workflow or a change: the owner sees the whole file and harness's reading and approves it every time; it applies at once, and instances already going keep their file. start starts an instance (asked), stop stops one (asked), list and show see them. A file: workflow NAME, about, start (owner, agent, trigger:NAME, schedule:NAME), limits steps N, days N, at-once N, to, agent; then step NAME blocks, each with one action: tool TOOL {json} (a built-in tool or SERVER/TOOL), do TEXT (answer json, agent, tools), wait 2h, wait until 09:00, wait event TRIGGER (match FIELD OP VALUE), approve TEXT, review TEXT, say TEXT; and if FIELD OP VALUE goto STEP, retry N wait D, on fail|deny|timeout goto STEP, timeout D, goto STEP, end. A line ending in : takes the lines indented below it. Values: {STEP}, {STEP.field}, {STEP.ok}, {STEP.error}, {input}, {event.FIELD}, {instance}, {now}.",
+    .description = "Workflows are step files harness runs with their state on disk: tool calls with fixed input, agent runs, waits for a time or an event, the owner's approval, branches, retries, messages. check reads a file and returns harness's reading or the line that is wrong. save proposes a new workflow or a change: the owner sees the whole file and harness's reading and approves it every time; it applies at once, and instances already going keep their file. start starts an instance (asked) of a workflow whose start line names agent; one that names only owner the owner starts, with /workflow start NAME: say so instead. stop stops one (asked), list and show see them. For something at a time of day or every so often, a schedule of the trigger tool is simpler than a workflow that waits in a loop. A file: workflow NAME, about, start (owner, agent, trigger:NAME, schedule:NAME), limits steps N, days N, at-once N, to, agent; then step NAME blocks, each with one action: tool TOOL {json} (a built-in tool or SERVER/TOOL), do TEXT (answer json, agent, tools), wait 2h, wait until 09:00, wait event TRIGGER (match FIELD OP VALUE), approve TEXT, review TEXT, say TEXT; and if FIELD OP VALUE goto STEP, retry N wait D, on fail|deny|timeout goto STEP, timeout D, goto STEP, end. A line ending in : takes the lines indented below it. Values: {STEP}, {STEP.field}, {STEP.ok}, {STEP.error}, {input}, {event.FIELD}, {instance}, {now}.",
     .schema_json = "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"check\",\"save\",\"start\",\"list\",\"show\",\"stop\"]},\"name\":{\"type\":\"string\",\"description\":\"save, start, show: the workflow's name; stop and show: NAME or NAME#N\"},\"text\":{\"type\":\"string\",\"description\":\"check, save: the whole file; start: the instance's input\"}},\"required\":[\"action\"]}",
 };
 
@@ -1310,6 +1311,11 @@ pub const WfDesk = struct {
     /// Starts an instance by the workflow tool (the start line's `agent`),
     /// marked with the outside text the run had read (outside.zig).
     start: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, input: []const u8, by: []const u8, agent: []const u8, outside: []const []const u8) []const u8,
+    /// Why the workflow tool can't start `name` whatever the owner
+    /// answers (no such workflow, a start line without `agent`); null: it
+    /// may be asked. Said before the question: a yes that starts nothing
+    /// isn't asked for.
+    startable: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) ?[]const u8,
     list: *const fn (ctx: *anyopaque, a: std.mem.Allocator) []const u8,
     show: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8) []const u8,
     stop: *const fn (ctx: *anyopaque, a: std.mem.Allocator, name: []const u8, by: []const u8) []const u8,
@@ -3113,6 +3119,7 @@ fn workflowTool(r: *Run, a: std.mem.Allocator, input_json: []const u8) !tools.Ou
         }
         if (name.len == 0) break :out .{ .text = "workflow takes action check, save, start, list, show or stop; start, show and stop need the name", .is_error = true };
         if (eql(u8, action, "start")) {
+            if (desk.startable(desk.ctx, a, name)) |why| break :out .{ .text = why, .is_error = true };
             if (try decideAndAsk(r, a, .workflow, "workflow", try std.fmt.allocPrint(a, "start {s}", .{name}), if (text.len > 0) try std.fmt.allocPrint(a, "input: {s}", .{text}) else "", r.now())) |why|
                 break :out .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
             break :out .{ .text = desk.start(desk.ctx, a, name, text, r.who.by, r.who.agent, try r.outside(a)) };

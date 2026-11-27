@@ -236,7 +236,9 @@ async function answer(box, id, key, text) {
 function itemBox(it) {
   const box = el("div", "item cut " + (it.urgent ? "urgent" : "open"));
   box.append(el("div", "title", it.title || ""));
-  if (it.body && it.body !== it.title) box.append(el("div", "body", it.body));
+  // (a body that starts with the title's own line says it once)
+  const body = it.title && (it.body || "").startsWith(it.title + "\n") ? it.body.slice(it.title.length + 1) : it.body;
+  if (body && body !== it.title) box.append(el("div", "body", body));
   if (it.draft) box.append(el("div", "body", it.draft));
   const where = it.conversation && it.conversation !== "main" ? "in " + it.conversation : "";
   const meta = [it.urgent ? "urgent" : "", where].filter(Boolean).join(" · ");

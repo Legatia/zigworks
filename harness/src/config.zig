@@ -778,6 +778,10 @@ pub const Task = struct {
     every_minutes: ?u32 = null,
     /// Bit 0 = Monday … bit 6 = Sunday.
     days: u7 = 0x7f,
+    /// A schedule of triggers.ini for one day (`on = 2026-11-28`, days
+    /// since 1970, the owner's time): it runs once, at `at_minutes` or the
+    /// first moment after it harness is up, and its section is removed.
+    on_day: ?i64 = null,
     do: []const u8 = "",
     /// The conversation it posts to (`to =`).
     to: []const u8 = "main",
@@ -1021,7 +1025,8 @@ pub const triggers_example =
     \\; A section's keys give its kind: feed = URL, search = WORDS,
     \\; page = URL (json = PATH for a value), file = FOLDER/PATTERN,
     \\; mcp = SERVER resource URI or SERVER/TOOL {"json": "input"} (key = FIELD);
-    \\; every or at alone is a schedule, topic lines a brief.
+    \\; every or at alone is a schedule (at with days, or with
+    \\; on = 2026-11-28 for that one day, once), topic lines a brief.
     \\; Then: every (feed 1h, search 6h, page 1h, file 1m, mcp 15m) or at
     \\; (+ days); match = FIELD OP VALUE (each must hold), skip = FIELD OP
     \\; VALUE; check = a yes/no question for the model; one of do, say
