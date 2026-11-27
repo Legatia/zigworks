@@ -13,6 +13,7 @@ const record = @import("record.zig");
 const job = @import("job.zig");
 const dispute = @import("dispute.zig");
 const change = @import("change.zig");
+const payrun_cmd = @import("payrun_cmd.zig");
 
 const usage =
     \\usage: paymcp PAY.ini                        serve MCP on stdin and stdout (what an agent starts)
@@ -26,17 +27,22 @@ const usage =
     \\       paymcp change PAY.ini KEY [--yes]     what paymcp can do about one finding at the provider; with
     \\                                             --yes, do it (needs [changes] allow = yes and STRIPE_WRITE_KEY)
     \\       paymcp stage PAY.ini KEY [--yes]      keep the evidence for one dispute at the provider, not sent
+    \\       paymcp payrun PAY.ini check BATCH.csv   a batch of payments to suppliers, before it is paid
+    \\       paymcp payrun PAY.ini paid BATCH.csv    write down that the batch, as it was checked, was paid
+    \\       paymcp payrun PAY.ini history FILE.csv  give paymcp past payments, and search them for payments made twice
+    \\       paymcp payrun PAY.ini lookback          search the past payments again
+    \\       paymcp payrun PAY.ini draft KEY         the draft of a message to the supplier about a payment made twice
     \\       paymcp version
     \\
     \\The key comes from the environment, never from the file: STRIPE_KEY, a
     \\restricted key that can only read (rk_test_... for a sandbox). A live
     \\account's secret key (sk_live_...) is refused; a sandbox's (sk_test_...)
-    \\is taken, with a note. decide and record need no key: they read and
-    \\write only paymcp's own record.
+    \\is taken, with a note. decide, record and payrun need no key: they read
+    \\and write only files on this computer.
     \\
 ;
 
-const Cmd = enum { serve, check, audit, decide, record, draft, evidence, change, stage };
+const Cmd = enum { serve, check, audit, decide, record, draft, evidence, change, stage, payrun };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -57,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (eql(word, "decide")) break :blk if (args.len >= 5) .decide else return fail(io, usage, 2);
         if (eql(word, "draft")) break :blk if (args.len == 4) .draft else return fail(io, usage, 2);
         if (eql(word, "evidence")) break :blk if (args.len == 4) .evidence else return fail(io, usage, 2);
+        if (eql(word, "payrun")) break :blk if (args.len >= 4) .payrun else return fail(io, usage, 2);
         if (eql(word, "change") or eql(word, "stage")) {
             if (args.len == 5 and eql(args[4], "--yes")) yes = true else if (args.len != 4) return fail(io, usage, 2);
             break :blk if (eql(word, "change")) .change else .stage;
@@ -79,6 +86,20 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const now: i64 = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 
+    if (cmd == .payrun) {
+        const verb = std.meta.stringToEnum(payrun_cmd.Verb, args[3]) orelse return fail(io, usage, 2);
+        const rest = args[4..];
+        var anyway = false;
+        var file: []const u8 = "";
+        for (rest) |x| {
+            if (eql(x, "--anyway") and verb == .paid) anyway = true else if (file.len == 0 and x.len > 0 and x[0] != '-') file = x else return fail(io, usage, 2);
+        }
+        if ((verb == .lookback) != (file.len == 0)) return fail(io, usage, 2);
+        const got = try payrun_cmd.run(a, io, &cfg, verb, file, anyway, now);
+        if (!got.ok) return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}{s}", .{ got.text, if (std.mem.endsWith(u8, got.text, "\n")) "" else "\n" }), 1);
+        try out(io, got.text);
+        return 0;
+    }
     if (cmd == .decide or cmd == .record) {
         if (cfg.record_path.len == 0) return fail(io, try std.fmt.allocPrint(a, "paymcp: {s} says record = none: no record is kept, so there is nothing to read or to write a decision into\n", .{path}), 1);
         var kept = try record.open(a, io, cfg.record_path);
@@ -101,6 +122,13 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const key = init.environ_map.get("STRIPE_KEY") orelse "";
+    if (cmd == .serve and key.len == 0 and cfg.payrun_on) {
+        // a pay file for the payment-run check only: no account is read
+        var none = stripe.Client.init(init.gpa, io, &cfg, "") catch return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}: url isn't an address paymcp can reach\n", .{path}), 1);
+        defer none.deinit();
+        try server.runWith(init.gpa, io, &cfg, &none, false);
+        return 0;
+    }
     if (config.keyProblem(&cfg, key)) |why| return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{why}), 1);
     // (on stderr: stdout is the report, or MCP)
     if (config.keyNote(key)) |note| Io.File.stderr().writeStreamingAll(io, note) catch {};
@@ -203,6 +231,8 @@ test {
     _ = @import("record.zig");
     _ = @import("dispute.zig");
     _ = @import("change.zig");
+    _ = @import("payrun.zig");
+    _ = @import("payrun_cmd.zig");
     _ = @import("server.zig");
     _ = @import("jv.zig");
     _ = @import("ini.zig");

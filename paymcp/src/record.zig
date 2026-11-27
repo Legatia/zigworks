@@ -70,12 +70,22 @@ pub const Book = struct {
         const e = b.entries.get(key) orelse return .open;
         if (e.decision == .intended) return .intended;
         if (e.decision == .asked) return .asked;
+        // (a payment run's findings are of that run: none is "new" or "back")
+        if (payrunKind(e.kind)) return .open;
         if (b.readings > 1 and e.found_n == b.readings) return if (e.times > 1) .back else .new;
         return .open;
     }
 };
 
 pub const Diag = struct { line: usize = 0 };
+
+/// Whether a kind (as the record names it) is the payment-run check's:
+/// the billing account's readings say nothing about those, and the other
+/// way round.
+pub fn payrunKind(kind: []const u8) bool {
+    const k = std.meta.stringToEnum(audit.Kind, kind) orelse return false;
+    return k.payrun();
+}
 
 fn apply(a: Allocator, b: *Book, v: jv.Value) !bool {
     const at = jv.int(jv.get(v, "at")) orelse return false;
@@ -178,6 +188,10 @@ pub const Reading = struct {
     who_given: bool = true,
     usage_read: bool = true,
     disputes_read: bool = true,
+    /// A payment run's findings: written down so that a person can decide
+    /// about them, without counting as a reading of the billing account
+    /// and without calling anything gone.
+    payrun: bool = false,
 };
 
 /// Writes one reading into the book and gives the lines to add to the
@@ -187,7 +201,7 @@ pub const Reading = struct {
 /// list when its amount has grown by more than a tenth since.
 pub fn note(a: Allocator, b: *Book, r: Reading) ![]const u8 {
     var lines: std.ArrayList(u8) = .empty;
-    try add(a, b, &lines, try std.fmt.allocPrint(a, "{{\"at\":{d},\"event\":\"reading\",\"findings\":{d}}}", .{ r.now, r.findings.len }));
+    if (!r.payrun) try add(a, b, &lines, try std.fmt.allocPrint(a, "{{\"at\":{d},\"event\":\"reading\",\"findings\":{d}}}", .{ r.now, r.findings.len }));
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     for (r.findings) |f| {
         try seen.put(a, f.key, {});
@@ -212,12 +226,14 @@ pub fn note(a: Allocator, b: *Book, r: Reading) ![]const u8 {
             }));
         };
     }
+    if (r.payrun) return lines.items;
     // (the keys first: adding to the book while walking it would move it)
     var gone: std.ArrayList([]const u8) = .empty;
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
         if (e.gone != null or seen.contains(kv.key_ptr.*)) continue;
+        if (payrunKind(e.kind)) continue;
         if (!r.whole) continue;
         if (!r.who_given and needsWho(e.kind)) continue;
         if (!r.usage_read and eql(e.kind, "usage_not_reported")) continue;
@@ -377,6 +393,7 @@ pub fn since(a: Allocator, b: *const Book) !Since {
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
+        if (payrunKind(e.kind)) continue;
         if (e.gone != null) {
             if (e.gone_n == b.readings and e.decision != .intended) {
                 try s.gone.put(a, e);
@@ -417,6 +434,7 @@ pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
+        if (payrunKind(e.kind)) continue;
         if (e.gone != null) {
             if (e.decision != .intended) try gone_t.put(a, e);
         } else switch (e.decision) {
@@ -442,6 +460,7 @@ pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
         var it2 = b.entries.iterator();
         while (it2.next()) |kv| {
             const e = kv.value_ptr.*;
+            if (payrunKind(e.kind)) continue;
             const here = switch (p.what) {
                 'a' => e.gone == null and e.decision == .asked,
                 'i' => e.gone == null and e.decision == .intended,
@@ -468,6 +487,7 @@ pub fn json(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
+        if (payrunKind(e.kind)) continue;
         const part: usize = if (e.gone != null) (if (e.decision == .intended) continue else 3) else switch (e.decision) {
             .open => 0,
             .asked => 1,

@@ -63,7 +63,7 @@ fn totalsText(a: Allocator, findings: []const audit.Finding) ![]const u8 {
     return std.mem.join(a, "; ", parts.items);
 }
 
-fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8, book: ?*const record.Book, can_change: bool) !void {
+pub fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8, book: ?*const record.Book, can_change: bool) !void {
     var suffix: []const u8 = "";
     var decided: ?[]const u8 = null;
     if (book) |b| switch (b.mark(f.key)) {
@@ -80,7 +80,7 @@ fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8
     for (f.rows) |row| try o.print(a, "   - {s}: {s}\n", .{ try flat(a, row.source), try flat(a, row.value) });
     if (decided) |d| try o.print(a, "   {s}\n", .{d});
     try o.print(a, "   Proposed: {s}\n", .{f.proposal});
-    if (f.letter != null) try o.appendSlice(a, "   A message to the customer is drafted: ask for the draft of this key.\n");
+    if (f.letter != null) try o.print(a, "   A message to the {s} is drafted: ask for the draft of this key.\n", .{if (f.kind.payrun()) "supplier" else "customer"});
     if (can_change and f.change != null) try o.print(a, "   paymcp can do this, when a person says so: {s}\n", .{try flat(a, f.does)});
     if (book) |b| if (b.entries.get(f.key)) |e| if (e.changed > 0) try o.print(a, "   Changed through paymcp on {s}: {s}.\n", .{ try model.day(a, e.changed), e.change_note });
     try o.print(a, "   [{s}]\n", .{try flat(a, f.key)});
@@ -284,12 +284,12 @@ fn keepLines(a: Allocator, v: []const u8) ![]const u8 {
 /// A finding's draft as a person reads it, or why there is none.
 pub fn letterText(a: Allocator, f: audit.Finding, cfg: *const config.Config) ![]const u8 {
     const body = (try letterBody(a, f, cfg)) orelse
-        return std.fmt.allocPrint(a, "No message is drafted for {s}: nothing about it is the customer's to see yet. Proposed: {s}\n", .{ try flat(a, f.key), f.proposal });
+        return std.fmt.allocPrint(a, "No message is drafted for {s}: nothing about it is the {s}'s to see yet. Proposed: {s}\n", .{ try flat(a, f.key), if (f.kind.payrun()) "supplier" else "customer", f.proposal });
     const l = f.letter.?;
     var o: std.ArrayList(u8) = .empty;
     try o.appendSlice(a, "A draft, for you to read, change and send from your own mail. paymcp sent nothing and can send nothing.\n");
     try o.print(a, "About: {s}: {s}, {s}  [{s}]\n\n", .{ f.kind.title(), try amountText(a, f), try flat(a, f.name), try flat(a, f.key) });
-    try o.print(a, "To: {s}\nSubject: {s}\n\n{s}", .{ if (l.to.len > 0) try flat(a, l.to) else "(billing has no address for this customer)", try flat(a, l.subject), body });
+    try o.print(a, "To: {s}\nSubject: {s}\n\n{s}", .{ if (l.to.len > 0) try flat(a, l.to) else if (f.kind.payrun()) "(your suppliers file has no address for this supplier)" else "(billing has no address for this customer)", try flat(a, l.subject), body });
     return o.items;
 }
 

@@ -36,12 +36,20 @@
 //!                                   ; time, with a second key (STRIPE_WRITE_KEY), when a person says so
 //!   max_amount = 0                  ; the most one change may be worth (smallest unit); 0: no limit here
 //!
+//!   [payrun]                        ; the payment-run check (needs no key: it reads files)
+//!   suppliers = suppliers.csv       ; your suppliers: name, tax number, bank account, phone
+//!   history = pay.payments.jsonl    ; paymcp's own list of past payments (the default: beside this file)
+//!   duplicate_days = 45             ; the same supplier and amount again within this many days
+//!   out_of_line = 3                 ; an amount this many times the largest paid to that supplier
+//!   currency = eur                  ; of a file with no currency column
+//!
 //! The key is never in the file: STRIPE_KEY in the environment.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ini = @import("ini.zig");
 const audit = @import("audit.zig");
+const payrun = @import("payrun.zig");
 
 pub const Mode = enum { sandbox, live };
 
@@ -60,6 +68,15 @@ pub const Config = struct {
     changes: bool = false,
     /// The most one change may be worth, in the currency's smallest unit; 0: no limit here.
     max_change: i64 = 0,
+    /// The payment-run check: the business's list of suppliers ("": none
+    /// given), paymcp's own list of past payments, and its rules.
+    /// The pay file has a [payrun] section.
+    payrun_on: bool = false,
+    /// The pay file's folder: the files a tool is given are looked for here.
+    dir: []const u8 = ".",
+    payrun_suppliers: []const u8 = "",
+    payrun_history: []const u8 = "",
+    payrun: payrun.Rules = .{},
     rules: audit.Rules = .{},
 };
 
@@ -72,6 +89,7 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
     };
     var c = try parse(a, text, diag);
     const dir = std.fs.path.dirname(path) orelse ".";
+    c.dir = dir;
     if (c.who_path.len > 0 and !std.fs.path.isAbsolute(c.who_path))
         c.who_path = try std.fs.path.join(a, &.{ dir, c.who_path });
     if (c.record_off) {
@@ -80,6 +98,13 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
         c.record_path = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.record.jsonl", .{std.fs.path.stem(path)}) });
     } else if (!std.fs.path.isAbsolute(c.record_path)) {
         c.record_path = try std.fs.path.join(a, &.{ dir, c.record_path });
+    }
+    if (c.payrun_suppliers.len > 0 and !std.fs.path.isAbsolute(c.payrun_suppliers))
+        c.payrun_suppliers = try std.fs.path.join(a, &.{ dir, c.payrun_suppliers });
+    if (c.payrun_history.len == 0) {
+        c.payrun_history = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.payments.jsonl", .{std.fs.path.stem(path)}) });
+    } else if (!std.fs.path.isAbsolute(c.payrun_history)) {
+        c.payrun_history = try std.fs.path.join(a, &.{ dir, c.payrun_history });
     }
     return c;
 }
@@ -146,6 +171,21 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 }
                 c.rules.current = list.items;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[billing] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "payrun")) {
+            c.payrun_on = true;
+            if (eql(e.key, "suppliers")) {
+                c.payrun_suppliers = e.value;
+            } else if (eql(e.key, "history")) {
+                if (e.value.len == 0) return bad(diag, e.line, "history is a file's name");
+                c.payrun_history = e.value;
+            } else if (eql(e.key, "duplicate_days")) {
+                c.payrun.duplicate_days = try days(a, diag, e);
+            } else if (eql(e.key, "out_of_line")) {
+                c.payrun.out_of_line = std.fmt.parseInt(u32, e.value, 10) catch return bad(diag, e.line, "out_of_line takes a whole number: how many times the largest payment before (0: not looked for)");
+            } else if (eql(e.key, "currency")) {
+                if (e.value.len != 3) return bad(diag, e.line, "currency is three letters, as eur");
+                c.payrun.currency = try std.ascii.allocLowerString(a, e.value);
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[payrun] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "changes")) {
             if (eql(e.key, "allow")) {
                 if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "allow is yes or no");
@@ -169,7 +209,7 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters] and [changes]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters], [changes] and [payrun]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;

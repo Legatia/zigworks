@@ -26,6 +26,11 @@ new and what is no longer found.
   finding has a draft of the message to them; a card dispute has a draft
   of the evidence, as far as the account shows it. You read, change and
   send them yourself.
+- **Payments going out, too.** The payment-run check reads a batch of
+  payments to suppliers before you pay it, from the file you export, and
+  searches past payments for ones made twice
+  ([The payment-run check](#the-payment-run-check)). It needs no key and
+  no account: only files.
 - **A page.** With [harness](../harness), the findings are one page: the
   list, each finding's rows and drafts, your decisions
   ([harness/](harness/README.md)).
@@ -34,7 +39,7 @@ Linux and Windows; it builds for macOS (where it links libc, as calmcp
 does) but hasn't been run there. One binary, nothing beyond the Zig
 standard library.
 
-**State: 0.3.0, written from Stripe's public documentation for API version
+**State: 0.4.0, written from Stripe's public documentation for API version
 `2026-11-18.endive`, tested against `paymcp-sim` (a stand-in built from the
 same documentation) and run against Stripe itself,** on 2026-11-27, in a
 test account holding only the made-up business below. There it found what
@@ -43,7 +48,8 @@ made by Stripe's own test cards; and made each kind of change once, each
 seen at Stripe afterwards ([Against a Stripe sandbox](#against-a-stripe-sandbox)).
 It has never read a live account, and never an account with real history
 in it. Run it on a sandbox first and read the report against the
-dashboard before trusting a number. See [Limits](#limits).
+dashboard before trusting a number. The payment-run check has read
+made-up files only: no business's own export yet. See [Limits](#limits).
 
 ## Quick start, without an account
 
@@ -273,6 +279,76 @@ customer paid before.
 A key that may not read disputes: the report says so and audits the rest.
 `[disputes] read = no` asks for none.
 
+## The payment-run check
+
+For the money going out. Before a batch of payments to suppliers is
+paid, export it as a file and let paymcp read it. In most countries the
+business that pays carries the loss when a payment goes to the wrong
+account, and a bank's own name check often skips payments sent as a
+batch.
+
+```
+$ paymcp payrun examples/payrun.ini history examples/payrun/payments-2025.csv
+Read examples/payrun/payments-2025.csv: 7 payments, 4191.00 EUR. 7 added to paymcp's list of past payments (examples/payrun.payments.jsonl); 0 were in it already.
+Past payments searched on 2026-11-27: 7 payments in paymcp's list. Nothing was changed, and no bank or supplier was asked.
+
+1 payment made twice, by the look of it: 149.00 EUR. Each is a question: two bills of the same amount are common.
+
+1. Paid twice: 149.00 EUR, once
+   Bill KH-5521 of Kestrel Hosting for 149.00 EUR was paid on 2025-09-10 and again on 2025-09-24.
+   ...
+$ paymcp payrun examples/payrun.ini check examples/payrun/run-2025-11-17.csv
+Payment run run-2025-11-17.csv, checked 2026-11-27. Nothing was paid and nothing was changed: paymcp read these files, and asked no bank.
+Read: 5 payments, 3681.40 EUR; 3 suppliers in your suppliers file; 7 past payments in paymcp's list, the first of 2025-08-04.
+
+5 things to look at before paying. Each is a question, not a mistake found.
+
+1. Bank details changed: 1230.00 EUR, once
+   Nordlys Print is to be paid 1230.00 EUR to account PL44114020040000310276543210; the last payment to them went to PL61109010140000071219812874.
+   - run-2025-11-17.csv, line 2: Nordlys Print, bill NP/2025/140, 1230.00 EUR, to account PL44114020040000310276543210
+   - paymcp's list of past payments: last paid on 2025-10-02 to account PL61109010140000071219812874; 3 payments went to that account
+   - your suppliers file, line 2: account PL61109010140000071219812874, phone +48 22 555 01 01
+   Proposed: Before paying, call the supplier on a number you had before this change (your suppliers file has +48 22 555 01 01), never one from the message that announced the new account, and ask whether the account is theirs. ...
+   [account_changed:run-2025-11-17.csv:PL5260001246]
+   ...
+$ paymcp payrun examples/payrun.ini paid examples/payrun/run-2025-11-17.csv
+Written down: 5 payments of run-2025-11-17.csv, 3681.40 EUR, as paid. The next check knows them. (paymcp paid nothing: it only keeps the list.)
+```
+
+| Finding | The rule |
+|---|---|
+| Bank details changed | The account differs from the one this supplier was last paid to (or, with no past payment, from your suppliers file). Comes first. |
+| A supplier never paid before | No past payment to this supplier, once there are past payments at all. |
+| A likely duplicate | The same supplier with the same bill number as a past payment or another row; or the same amount within `duplicate_days` (45) with no bill number to tell them apart, or one a slip of the hand away. Bills numbered in a row for the same monthly amount are two bills. |
+| An amount out of line | More than `out_of_line` (3) times the largest ever paid to that supplier, with three payments or more to judge by. |
+| Two suppliers, one account | The account is another supplier's, in your suppliers file or in past payments. |
+| Paid twice (the look-back) | Over past payments: the same supplier and amount with the same bill number, or one a slip away. With a draft of the request to the supplier (`payrun ... draft KEY`). |
+
+- **The files.** CSV with a heading row, cells apart by `,` or `;`.
+  Columns are found by their headings (`supplier`/`vendor`/`name`,
+  `tax_id`/`vat`/`nip`, `bill`/`invoice`/`reference`, `amount`/`total`,
+  `currency`, `date`, `account`/`iban`, and in the suppliers file `phone`
+  and `email`). A supplier is matched by tax number where the file has
+  one, else by name. Amounts as people write them (`1 234,56`,
+  `1,234.56`); a day is `2026-11-27` or `27.11.2026`. A heading that fits
+  two columns, an amount or a date that can't be read for sure: the check
+  stops with the line, since a file half understood would be a wrong
+  check.
+- **What was checked is what is paid.** A check keeps a fingerprint
+  (SHA-256) of each row. `payrun ... paid` writes the batch into paymcp's
+  list of past payments only if the file is still what was checked; a row
+  added or altered in between is listed and nothing is written down.
+- **Your answers are kept.** `paymcp decide PAY.ini KEY intended "called
+  Anna on the old number, the account is theirs"` writes it into the
+  record, and the next check of that batch leaves the finding out.
+- **Tools:** `payrun_check` (a batch file in the pay file's folder; a
+  path that leads elsewhere isn't read) and `payrun_lookback`. A pay file
+  with a `[payrun]` section and no key serves these and `billing_decide`
+  only.
+- **What it can't do,** and says: read the account printed on a bill,
+  tell who owns an account, ask a bank, or stop a payment. It is a check
+  before paying; the person can still pay what it flagged.
+
 ## The record
 
 paymcp keeps one file of its own beside the pay file (`pay.ini` gives
@@ -314,6 +390,7 @@ thing paymcp writes.
 | `billing_record` | The record: readings since when, what is open, asked, dismissed and why, and no longer found, with the sums. Only reads. |
 | `billing_draft` | The draft of a message to the customer about one finding: to whom, the subject, the text. Nothing is sent. Only reads. |
 | `dispute_evidence` | For one dispute to answer: what the bank wants, what the account already shows, what only you have. Nothing is sent. Only reads. |
+| `payrun_check`, `payrun_lookback` | **With a `[payrun]` section.** A batch of payments to suppliers checked before it is paid; past payments searched for ones made twice. They read files on this computer only. |
 | `billing_change` | **Only with changes on.** Does the one thing paymcp can do about a finding ([Changing things](#changing-things)). |
 | `dispute_stage` | **Only with changes on.** Keeps a dispute's evidence draft at the provider, not sent. |
 
@@ -443,6 +520,13 @@ from = Ola at Fernhill            ; who a drafted message to a customer is from
 [changes]
 ; allow = no                      ; yes: one thing at a time may be changed, with STRIPE_WRITE_KEY
 ; max_amount = 0                  ; the most one change may be worth (smallest unit); 0: no limit here
+
+[payrun]                          ; the payment-run check: files only, no key
+suppliers = suppliers.csv         ; your suppliers: name, tax number, account, phone, mail (optional)
+; history = pay.payments.jsonl    ; paymcp's list of past payments (the default: beside this file)
+; duplicate_days = 45
+; out_of_line = 3
+; currency = eur                  ; of a file with no currency column
 ```
 
 A setting the file doesn't have is refused with its line, a key in the
@@ -536,6 +620,7 @@ record through the command line and over MCP against `paymcp-sim`.
 - Days are UTC.
 - Not looked for yet: payments taken twice or refunded twice, early fraud warnings, taxes, trials that never convert, coupons past their redeem-by date.
 - Without changes turned on it proposes and does not fix: changing a subscription, sending an invoice or reminding a customer is done in the dashboard, or from your own mail, by a person.
+- The payment-run check has read made-up files only. Real exports name their columns in many ways and languages: where a heading isn't one it knows, rename it; nothing is guessed. It matches a supplier by tax number or by name as written, so one supplier under two spellings is two. It knows only the payments it was given.
 - "No longer found" is not "put right": a finding also goes when a "how old" setting, your price list or your own file changes. The record keeps what it was worth; what happened to it is yours to say.
 - The record is one file on one computer, written whole each time: two readings at the same moment from two programs can lose one's lines.
 

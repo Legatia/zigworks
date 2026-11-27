@@ -121,6 +121,66 @@ check "the reading key in the second key.s place: the provider refuses, and it i
 check "with both, one thing is changed, read back, and the next audit no longer finds it" 'STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" paused:sub_gorse --yes >"$T/ch2" && grep -q "^Done: collection on subscription sub_gorse is no longer paused\." "$T/ch2" && STRIPE_WRITE_KEY=$WKEY "$B" audit "$T/change.ini" >"$T/ch3" && ! grep -q "Collection paused" "$T/ch3" && grep -q "1 no longer found (29.00 EUR a month)" "$T/ch3" && grep -q "paymcp can do this, when a person says so: End the discount" "$T/ch3" && "$B" record "$T/change.ini" | grep -q "changed through paymcp on ....-..-..: resumed collection on subscription sub_gorse"'
 check "what paymcp can.t do about a finding is said, and a second time finds the record changed" '! STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" written_off:cus_ivy:eur --yes 2>"$T/err" && grep -q "there is nothing paymcp can do about written_off:cus_ivy:eur" "$T/err" && ! STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "no finding has the key paused:sub_gorse now" "$T/err"'
 check "evidence for a dispute is kept at the provider and not sent" 'STRIPE_WRITE_KEY=$WKEY "$B" stage "$T/change.ini" dispute:du_birch --yes >"$T/st" && grep -q "^Done: 6 fields are kept at the provider as evidence for dispute du_birch .*Nothing was sent to the bank\." "$T/st" && STRIPE_WRITE_KEY=$WKEY "$B" audit "$T/change.ini" | grep -q "dispute du_birch: status needs_response, .*evidence kept at the provider yes, sent to the bank 0 times"'
+# the payment-run check: files only, no key, no stand-in
+mkdir "$T/pr"
+cp -r examples/payrun "$T/pr/payrun"
+cp examples/payrun.ini "$T/pr/payrun.ini"
+RUN="$T/pr/payrun/run-2025-11-17.csv"
+check "payrun: with no past payments it says so, and the suppliers file still shows a changed account" 'env -u STRIPE_KEY "$B" payrun "$T/pr/payrun.ini" check "$RUN" >"$T/p1" && grep -q "^No past payments are known yet" "$T/p1" && grep -qx "1. Bank details changed: 1230.00 EUR, once" "$T/p1" && grep -q "your suppliers file has PL61109010140000071219812874\.$" "$T/p1" && grep -q "Nothing was paid and nothing was changed" "$T/p1"'
+check "payrun: past payments are taken in once, and the one made twice is found" 'env -u STRIPE_KEY "$B" payrun "$T/pr/payrun.ini" history "$T/pr/payrun/payments-2025.csv" >"$T/p2" && grep -q "7 payments, 4191.00 EUR\. 7 added to paymcp.s list of past payments" "$T/p2" && grep -qx "1 payment made twice, by the look of it: 149.00 EUR. Each is a question: two bills of the same amount are common." "$T/p2" && grep -qx "   Bill KH-5521 of Kestrel Hosting for 149.00 EUR was paid on 2025-09-10 and again on 2025-09-24." "$T/p2" && "$B" payrun "$T/pr/payrun.ini" history "$T/pr/payrun/payments-2025.csv" | grep -q "0 added to paymcp.s list of past payments (.*); 7 were in it already\." && "$B" payrun "$T/pr/payrun.ini" lookback | grep -qx "1. Paid twice: 149.00 EUR, once"'
+check "payrun: the batch before it is paid: bank details first, then by amount" '"$B" payrun "$T/pr/payrun.ini" check "$RUN" >"$T/p3" && grep -qx "5 things to look at before paying. Each is a question, not a mistake found." "$T/p3" && grep -qx "1. Bank details changed: 1230.00 EUR, once" "$T/p3" && grep -qx "2. An amount out of line: 1490.00 EUR, once" "$T/p3" && grep -qx "3. A supplier never paid before: 512.40 EUR, once" "$T/p3" && grep -qx "4. Two suppliers, one account: 512.40 EUR, once" "$T/p3" && grep -qx "5. A likely duplicate: 149.00 EUR, once" "$T/p3" && grep -q "last paid on 2025-10-02 to account PL61109010140000071219812874; 3 payments went to that account" "$T/p3" && grep -q "(your suppliers file has +48 22 555 01 01)" "$T/p3"'
+check "payrun: a monthly bill of the same amount is not a duplicate of last month.s" '! grep -q "Mirela" "$T/p3"'
+check "payrun: a decision is kept with what the person said, and the check leaves it out" '"$B" decide "$T/pr/payrun.ini" "new_supplier:run-2025-11-17.csv:quillon supplies" intended called Anna at Kestrel, it is their supplies arm >"$T/p4" && grep -q "is dismissed as intended: called Anna at Kestrel, it is their supplies arm" "$T/p4" && "$B" payrun "$T/pr/payrun.ini" check "$RUN" >"$T/p5" && grep -qx "4 things to look at before paying. Each is a question, not a mistake found." "$T/p5" && grep -qx "1 dismissed as intended is not listed." "$T/p5"'
+check "payrun: the request to a supplier for a payment made twice, as a draft" '"$B" payrun "$T/pr/payrun.ini" draft "paid_twice:kestrel hosting:kh5521:2025-09-24" >"$T/p6" && grep -qx "To: accounts@kestrel.example" "$T/p6" && grep -q "^Going through our payments we found that we paid you 149.00 EUR twice for bill KH-5521: on 2025-09-10 and again on 2025-09-24\.$" "$T/p6" && grep -q "paymcp sent nothing and can send nothing" "$T/p6"'
+cp "$RUN" "$T/pr/run.keep"
+sed -e "s/Q-77,512.40/Q-77,5512.40/" "$T/pr/run.keep" >"$RUN"
+check "payrun: a batch altered after its check is not written down as paid" '! "$B" payrun "$T/pr/payrun.ini" paid "$RUN" 2>"$T/err" && grep -q "The file is not what was checked on ....-..-..: 1 row is new or altered, 1 checked row is no longer there\." "$T/err" && grep -q "   - line 6: Quillon Supplies, bill Q-77, 5512.40 EUR" "$T/err" && grep -q "Nothing was written down" "$T/err"'
+cp "$T/pr/run.keep" "$RUN"
+check "payrun: as it was checked, it is written down, once; a batch never checked is not" '"$B" payrun "$T/pr/payrun.ini" paid "$RUN" | grep -q "^Written down: 5 payments of run-2025-11-17.csv, 3681.40 EUR, as paid\." && "$B" payrun "$T/pr/payrun.ini" paid "$RUN" | grep -q "^All 5 payments of run-2025-11-17.csv were written down as paid already" && cp "$RUN" "$T/pr/payrun/other.csv" && ! "$B" payrun "$T/pr/payrun.ini" paid "$T/pr/payrun/other.csv" 2>"$T/err" && grep -q "other.csv was never checked" "$T/err"'
+printf 'supplier,amount\nNordlys Print,12.345.67\n' >"$T/pr/payrun/bad.csv"
+check "payrun: an amount that can.t be read for sure stops the check, with its line" '! "$B" payrun "$T/pr/payrun.ini" check "$T/pr/payrun/bad.csv" 2>"$T/err" && grep -q "bad.csv line 2: the amount is \"12.345.67\": it can.t be read for sure\. Nothing was checked" "$T/err"'
+cat >"$T/prmcp.py" <<'EOF'
+import json, os, subprocess, sys
+
+binary, pay = sys.argv[1], sys.argv[2]
+env = {k: v for k, v in os.environ.items() if k != "STRIPE_KEY"}
+p = subprocess.Popen([binary, pay], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
+n = 0
+failed = False
+
+def rpc(method, params):
+    global n
+    n += 1
+    p.stdin.write((json.dumps({"jsonrpc": "2.0", "id": n, "method": method, "params": params}) + "\n").encode())
+    p.stdin.flush()
+    return json.loads(p.stdout.readline())
+
+def call(name, args):
+    m = rpc("tools/call", {"name": name, "arguments": args})["result"]
+    return m["content"][0]["text"], m["isError"]
+
+def check(name, ok, detail=""):
+    global failed
+    print(("ok" if ok else "not ok") + f" - payrun over mcp: {name}" + ("" if ok else f" ({str(detail)[:600]})"))
+    failed = failed or not ok
+
+rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
+tools = [t["name"] for t in rpc("tools/list", {})["result"]["tools"]]
+check("with no key, only the payment-run check and the decision are there", tools == ["payrun_check", "payrun_lookback", "billing_decide"], tools)
+text, err = call("payrun_check", {"file": "payrun/run-2025-11-17.csv"})
+check("payrun_check reads a batch in the pay file's folder (paid a moment ago: every bill in it now looks paid already)", not err and text.count("looks paid already") == 5 and "asked no bank" in text, text)
+for bad in ("../payrun.ini", "/etc/passwd", "C:\\Windows\\win.ini", "payrun/../../x.csv", ""):
+    text, err = call("payrun_check", {"file": bad})
+    check("a path that leads out of the folder isn't read (%s)" % bad, err and "isn't read" in text, text)
+text, err = call("payrun_lookback", {})
+check("payrun_lookback", not err and "Paid twice: 149.00 EUR, once" in text, text)
+text, err = call("billing_audit", {})
+check("the billing account isn't read without its key, and it is said", err and "only the payment-run check is here" in text, text)
+p.stdin.close()
+p.wait(timeout=10)
+sys.exit(1 if failed else 0)
+EOF
+python3 -I "$T/prmcp.py" "$B" "$T/pr/payrun.ini" || fail=1
 check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>"$T/err" && grep -q "^usage: paymcp PAY.ini" "$T/err"'
 
 # the files for a Stripe sandbox (customers found by address, every "how

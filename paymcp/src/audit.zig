@@ -87,6 +87,19 @@ pub const Kind = enum {
     no_customer,
     dispute,
     disputes_unanswered,
+    // the payment-run check (payrun.zig)
+    account_changed,
+    new_supplier,
+    duplicate_payment,
+    out_of_line,
+    shared_account,
+    batch_changed,
+    paid_twice,
+
+    /// The kinds of the payment-run check: not the billing account's.
+    pub fn payrun(k: Kind) bool {
+        return @intFromEnum(k) >= @intFromEnum(Kind.account_changed);
+    }
 
     pub fn title(k: Kind) []const u8 {
         return switch (k) {
@@ -106,6 +119,13 @@ pub const Kind = enum {
             .no_customer => "Using the product, not in billing at all",
             .dispute => "A card dispute to answer",
             .disputes_unanswered => "Disputes lost without an answer",
+            .account_changed => "Bank details changed",
+            .new_supplier => "A supplier never paid before",
+            .duplicate_payment => "A likely duplicate",
+            .out_of_line => "An amount out of line",
+            .shared_account => "Two suppliers, one account",
+            .batch_changed => "The file is not what was checked",
+            .paid_twice => "Paid twice",
         };
     }
 };

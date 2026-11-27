@@ -120,13 +120,15 @@ fn isWord(v: []const u8, words: []const []const u8) bool {
 
 /// CSV lines: commas, cells in double quotes (a quote inside is doubled, a
 /// line end inside is kept), CRLF or LF.
-const Lines = struct {
+pub const Lines = struct {
     text: []const u8,
+    /// What stands between two cells.
+    sep: u8 = ',',
     pos: usize = 0,
     line: usize = 0,
     next_line: usize = 1,
 
-    fn next(l: *Lines, a: Allocator) !?[][]const u8 {
+    pub fn next(l: *Lines, a: Allocator) !?[][]const u8 {
         if (l.pos >= l.text.len) return null;
         l.line = l.next_line;
         var cells: std.ArrayList([]const u8) = .empty;
@@ -147,12 +149,13 @@ const Lines = struct {
                 }
                 continue;
             }
+            if (ch == l.sep) {
+                try cells.append(a, cell.items);
+                cell = .empty;
+                continue;
+            }
             switch (ch) {
                 '"' => quoted = true,
-                ',' => {
-                    try cells.append(a, cell.items);
-                    cell = .empty;
-                },
                 '\r' => {},
                 '\n' => {
                     l.next_line += 1;
