@@ -31,6 +31,11 @@
 //!   [letters]
 //!   from = Ola at Fernhill          ; who a drafted message to a customer is from
 //!
+//!   [changes]
+//!   allow = no                      ; yes: paymcp gets tools that change one thing at the provider at a
+//!                                   ; time, with a second key (STRIPE_WRITE_KEY), when a person says so
+//!   max_amount = 0                  ; the most one change may be worth (smallest unit); 0: no limit here
+//!
 //! The key is never in the file: STRIPE_KEY in the environment.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,6 +55,11 @@ pub const Config = struct {
     record_off: bool = false,
     /// Who a drafted message to a customer is from; "": a place left to fill in.
     letter_from: []const u8 = "",
+    /// Whether paymcp may change anything at the provider at all (with
+    /// the second key, one thing at a time, when a person says so).
+    changes: bool = false,
+    /// The most one change may be worth, in the currency's smallest unit; 0: no limit here.
+    max_change: i64 = 0,
     rules: audit.Rules = .{},
 };
 
@@ -136,6 +146,14 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 }
                 c.rules.current = list.items;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[billing] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "changes")) {
+            if (eql(e.key, "allow")) {
+                if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "allow is yes or no");
+                c.changes = eql(e.value, "yes");
+            } else if (eql(e.key, "max_amount")) {
+                c.max_change = std.fmt.parseInt(i64, e.value, 10) catch return bad(diag, e.line, "max_amount takes a whole number, in the currency's smallest unit");
+                if (c.max_change < 0) return bad(diag, e.line, "max_amount is zero or more");
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[changes] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "disputes")) {
             if (eql(e.key, "read")) {
                 if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "read is yes or no");
@@ -151,7 +169,7 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes] and [letters]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters] and [changes]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;
@@ -175,6 +193,22 @@ pub fn keyProblem(c: *const Config, key: []const u8) ?[]const u8 {
     if (!test_key and !live_key) return "STRIPE_KEY doesn't look like a restricted key (rk_test_... or rk_live_...)";
     if (c.mode == .sandbox and live_key) return "STRIPE_KEY is a live key and the file says mode = sandbox. To audit the live account, say mode = live";
     if (c.mode == .live and test_key) return "STRIPE_KEY is a sandbox key and the file says mode = live";
+    return null;
+}
+
+/// Why the second key (STRIPE_WRITE_KEY) can't be used, or null. It is
+/// the key that may change things: a restricted key with Write on what
+/// paymcp changes (subscriptions, invoices, disputes) and nothing else. A
+/// live account's secret key is refused here too.
+pub fn writeKeyProblem(c: *const Config, key: []const u8) ?[]const u8 {
+    if (key.len == 0) return "STRIPE_WRITE_KEY isn't set: the second key, which may change subscriptions, invoices and disputes (README, Changing things)";
+    if (std.mem.startsWith(u8, key, "sk_test_")) return if (c.mode == .live) "STRIPE_WRITE_KEY is a sandbox key and the file says mode = live" else null;
+    if (std.mem.startsWith(u8, key, "sk_")) return "STRIPE_WRITE_KEY is a secret key, which can do everything. Make a restricted key with Write on subscriptions, invoices and disputes only (README, Changing things)";
+    const test_key = std.mem.startsWith(u8, key, "rk_test_");
+    const live_key = std.mem.startsWith(u8, key, "rk_live_");
+    if (!test_key and !live_key) return "STRIPE_WRITE_KEY doesn't look like a restricted key (rk_test_... or rk_live_...)";
+    if (c.mode == .sandbox and live_key) return "STRIPE_WRITE_KEY is a live key and the file says mode = sandbox";
+    if (c.mode == .live and test_key) return "STRIPE_WRITE_KEY is a sandbox key and the file says mode = live";
     return null;
 }
 

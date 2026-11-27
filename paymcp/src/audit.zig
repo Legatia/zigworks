@@ -126,6 +126,20 @@ pub const Letter = struct {
     body: []const u8,
 };
 
+/// The one thing paymcp can do about a finding at the provider, where the
+/// pay file allows changes and a person says so. Each is for from now on:
+/// nothing here charges for the past.
+pub const Change = union(enum) {
+    end_discount: struct { subscription: []const u8, discount: []const u8 },
+    set_quantity: struct { item: []const u8, to: i64, was: i64 },
+    set_price: struct { item: []const u8, to: []const u8, was: []const u8 },
+    unpause: struct { subscription: []const u8 },
+    /// `by_hand`: the customer pays it themselves; else the provider
+    /// charges the payment method on file.
+    finalize: struct { invoice: []const u8, by_hand: bool },
+    remind: struct { invoices: []const []const u8 },
+};
+
 pub const Finding = struct {
     kind: Kind,
     /// The same thing gets the same key at every reading.
@@ -145,6 +159,9 @@ pub const Finding = struct {
     letter: ?Letter = null,
     /// A day by which someone must act (a dispute's answer), in seconds.
     due: ?i64 = null,
+    /// What paymcp can do about it, and that in a sentence; null: nothing.
+    change: ?Change = null,
+    does: []const u8 = "",
 };
 
 const day_s: i64 = 86400;
@@ -280,6 +297,8 @@ fn discounts(c: *Ctx, sub: model.Subscription) !void {
                 .{ .source = try c.p("discount {s}", .{d.id}), .value = try c.p("coupon {s}, start {s}, end none", .{ d.coupon.id, try c.date(d.start) }) },
             }),
             .proposal = "If it was meant to end, end it from the next period and tell the customer first. If it was meant to last, dismiss this as intended.",
+            .change = .{ .end_discount = .{ .subscription = sub.id, .discount = d.id } },
+            .does = try c.p("End the discount \"{s}\" on subscription {s}: the next invoice is for the full price. Nothing is charged for the time already invoiced.", .{ d.coupon.label(), sub.id }),
             .letter = if (!d.coupon_known) null else try c.letter(sub.customer, "Your discount", "Your subscription with us has had the discount \"{s}\" ({s}) since {s}. It was meant to run for a limited time, and we would like to end it from your next billing period{s}.\n\nIf it was agreed to last longer, reply to this message and we will keep to what was agreed.", .{
                 d.coupon.label(),
                 off,
@@ -309,6 +328,8 @@ fn free(c: *Ctx, sub: model.Subscription) !void {
                 .{ .source = try c.p("discount {s}", .{d.id}), .value = try c.p("coupon {s}, 100% off, end none", .{d.coupon.id}) },
             }),
             .proposal = "If this is a gift that should last, dismiss it as intended. Otherwise end the discount from the next period and tell the customer first.",
+            .change = .{ .end_discount = .{ .subscription = sub.id, .discount = d.id } },
+            .does = try c.p("End the discount \"{s}\" on subscription {s}: the next invoice is for the full price. Nothing is charged for the time already invoiced.", .{ d.coupon.label(), sub.id }),
             .letter = try c.letter(sub.customer, "Your subscription", "Your subscription with us has been free of charge since {s}, through the discount \"{s}\". We would like to end that from your next billing period{s}.\n\nIf it was agreed to stay free, reply to this message and we will keep to what was agreed.", .{
                 try c.date(d.start),
                 d.coupon.label(),
@@ -387,6 +408,8 @@ fn oldPrices(c: *Ctx, sub: model.Subscription) !void {
                 .{ .source = if (now_price) |np| try c.p("price {s}", .{np.id}) else "the price list", .value = if (now_price) |np| try c.p("active, {s} a unit a month", .{if (np.monthly()) |m| try c.money(m, sub.currency) else "not one amount"}) else "no single current price for this product and interval" },
             }),
             .proposal = "Old customers often keep old prices on purpose: if so, dismiss this as intended. Otherwise move the subscription to the price sold now from the next period, with notice.",
+            .change = if (now_price != null and amount != null) .{ .set_price = .{ .item = it.id, .to = now_price.?.id, .was = it.price.id } } else null,
+            .does = if (now_price != null and amount != null) try c.p("Move subscription item {s} from {s} to {s}, keeping its quantity: the next invoice is at the new price. Nothing is charged for the time already invoiced.", .{ it.id, it.price.label(), now_price.?.label() }) else "",
             .letter = blk: {
                 const np = now_price orelse break :blk null;
                 const new_m = np.monthly() orelse break :blk null;
@@ -418,6 +441,8 @@ fn paused(c: *Ctx, sub: model.Subscription) !void {
             .{ .source = try c.p("subscription {s}", .{sub.id}), .value = try c.p("status {s}, pause_collection.behavior {s}, resumes_at {s}", .{ @tagName(sub.status), pause.behavior, if (pause.resumes_at) |at| try c.date(at) else "none" }) },
         }),
         .proposal = "If the pause is over, resume collection. If the customer is still away, set a date, or dismiss this as intended.",
+        .change = .{ .unpause = .{ .subscription = sub.id } },
+        .does = try c.p("Resume collection on subscription {s}: its next invoice is collected again. Invoices made while it was paused stay as they are.", .{sub.id}),
     });
 }
 
@@ -440,8 +465,13 @@ fn invoices(c: *Ctx) !void {
                     .{ .source = try c.p("invoice {s}", .{inv.id}), .value = try c.p("status draft, created {s}, total {s}, auto_advance {}", .{ try c.date(inv.created), try c.money(inv.total, inv.currency), inv.auto_advance }) },
                 }),
                 .proposal = "Look at it, then send it or delete it. A draft that should not go out is better deleted than left.",
+                .change = .{ .finalize = .{ .invoice = inv.id, .by_hand = !inv.collects_itself } },
+                .does = if (inv.collects_itself)
+                    try c.p("Finalise the draft invoice {s} for {s}: the provider then charges the payment method {s} has on file, by itself.", .{ inv.id, try c.money(inv.total, inv.currency), c.nameOf(inv.customer) })
+                else
+                    try c.p("Finalise the draft invoice {s} for {s} and have the provider send it to {s} to pay.", .{ inv.id, try c.money(inv.total, inv.currency), c.nameOf(inv.customer) }),
             });
-        } else if (inv.status == .open and inv.collects_itself and !inv.attempted and age_days >= c.r.unsent_days) {
+        } else if (inv.status == .open and inv.collects_itself and !inv.attempted and @divFloor(c.now - (inv.finalized_at orelse inv.created), day_s) >= c.r.unsent_days) {
             try c.add(.{
                 .kind = .unsent_invoice,
                 .key = try c.p("unsent_invoice:{s}", .{inv.id}),
@@ -518,12 +548,14 @@ fn late(c: *Ctx) !void {
             // the invoices as a letter lists them
             var lines: std.ArrayList(u8) = .empty;
             var one_label: []const u8 = "";
+            var ids: std.ArrayList([]const u8) = .empty;
             for (c.d.invoices) |inv| {
                 if (!isLate(c, inv, kind)) continue;
                 if (!std.mem.eql(u8, inv.customer, first.customer) or !std.mem.eql(u8, inv.currency, first.currency)) continue;
                 sum += inv.amount_remaining;
                 const left = try c.money(inv.amount_remaining, inv.currency);
                 one_label = inv.label();
+                try ids.append(c.a, inv.id);
                 if (kind == .overdue) {
                     try lines.print(c.a, "- {s}: {s}, due {s}\n", .{ inv.label(), left, try c.date(inv.due_date.?) });
                 } else try lines.print(c.a, "- {s}: {s}\n", .{ inv.label(), left });
@@ -574,6 +606,9 @@ fn late(c: *Ctx) !void {
                     "Remind the customer, with the invoice's own link to pay. If they dispute it or can't pay, settle that on purpose: an invoice left open is neither collected nor written off."
                 else
                     "The payment method on file was refused. Ask the customer for a new one (the invoice's own page takes it). Where no further try is planned, nothing more will be collected unless someone acts.",
+                // (more than a few at once is a talk with the customer, not a button)
+                .change = if (kind == .overdue and n <= 5) .{ .remind = .{ .invoices = ids.items } } else null,
+                .does = if (kind == .overdue and n <= 5) try c.p("Have the provider send {s} to {s} again, with its link to pay.", .{ if (n == 1) try c.p("invoice {s}", .{one_label}) else try c.p("the {d} invoices", .{n}), name }) else "",
                 .letter = if (kind == .overdue)
                     (if (n == 1)
                         try c.letter(first.customer, try c.p("Invoice {s}", .{one_label}), "Invoice {s} for {s} was due on {s} and is still open. Could you pay it, or tell us if something about it is not right?", .{ one_label, total, try c.date(oldest) })
@@ -876,6 +911,8 @@ fn seatsAndPlan(c: *Ctx, row: who.Row, cu: model.Customer, sub: model.Subscripti
                         .{ .source = try c.p("subscription item {s}", .{it.id}), .value = try c.p("price {s}, {s} a unit a month, quantity {d}", .{ it.price.id, try c.money(old_m.?, sub.currency), qty }) },
                     }),
                     .proposal = "Move the subscription to the plan the customer has, from the next period, and tell them first. Or put the product back to the plan they pay for.",
+                    .change = .{ .set_price = .{ .item = it.id, .to = pp.id, .was = it.price.id } },
+                    .does = try c.p("Move subscription item {s} from {s} to {s}, keeping its quantity: the next invoice is at the new price. Nothing is charged for the time already invoiced.", .{ it.id, it.price.label(), pp.label() }),
                     .letter = try c.letter(cu.id, "Your plan", "Your account has the plan \"{s}\", and your subscription is for {s}. From your next billing period we would like to bill the plan you have: {s} instead of {s} a unit a month.\n\nIf you would rather go back to {s}, reply to this message and we will change the account instead.", .{ row.plan, it.price.label(), try c.money(new_m.?, sub.currency), try c.money(old_m.?, sub.currency), it.price.label() }),
                 });
                 // the seats are judged on the plan they should be on, once
@@ -900,6 +937,8 @@ fn seatsAndPlan(c: *Ctx, row: who.Row, cu: model.Customer, sub: model.Subscripti
             .{ .source = try c.p("subscription item {s}", .{it.id}), .value = try c.p("price {s}, quantity {d}, {s} a unit a month", .{ it.price.id, qty, if (unit) |u| try c.money(u, sub.currency) else "not one amount" }) },
         }),
         .proposal = "Set the quantity to the seats in use from the next period, and tell the customer first.",
+        .change = .{ .set_quantity = .{ .item = it.id, .to = seats, .was = qty } },
+        .does = try c.p("Set the quantity of subscription item {s} from {d} to {d}: the next invoice is for {d}. Nothing is charged for the time already invoiced.", .{ it.id, qty, seats, seats }),
         .letter = try c.letter(cu.id, "The seats on your subscription", "Your account has {d} seats in use, and your subscription covers {d}. From your next billing period we would like to set it to {d} seats{s}.\n\nIf some of those seats should not be there, tell us before then and we will take them off.", .{ seats, qty, seats, if (unit) |u| try c.p(" ({s} a seat a month)", .{try c.money(u, sub.currency)}) else "" }),
     });
 }

@@ -51,14 +51,22 @@ PIDS="$PIDS $!"
 DPORT=$(free_port)
 "$S" "$DPORT" "$KEY" --disputes >"$T/sim3.out" 2>&1 &
 PIDS="$PIDS $!"
+# ...and one where a second key may change things
+WKEY=rk_test_smoke_second_key_not_real
+WPORT=$(free_port)
+"$S" "$WPORT" "$KEY" --disputes --write-key "$WKEY" >"$T/sim4.out" 2>&1 &
+PIDS="$PIDS $!"
 wait_port "$PORT"
 wait_port "$MPORT"
 wait_port "$DPORT"
+wait_port "$WPORT"
 cp examples/who.csv "$T/who.csv"
 sed -e "s|8743|$PORT|" examples/sim.ini >"$T/pay.ini"
 sed -e "s|8743|$MPORT|" examples/sim.ini >"$T/nometers.ini"
 grep -v "^who = " "$T/pay.ini" >"$T/nowho.ini"
 sed -e "s|8743|$DPORT|" examples/sim.ini >"$T/disputes.ini"
+sed -e "s|8743|$WPORT|" examples/sim.ini >"$T/nochange.ini"
+{ cat "$T/nochange.ini"; printf '\n[changes]\nallow = yes\n'; } >"$T/change.ini"
 export STRIPE_KEY=$KEY
 
 check "version" '"$B" version | grep -q "^paymcp "'
@@ -107,6 +115,12 @@ check "record = none: nothing is written, and a decision has nowhere to go" '"$B
 check "card disputes: those to answer first, by their last day; what was lost unanswered as one sum" '"$B" audit "$T/disputes.ini" >"$T/dp" && grep -qx "17 findings: 371.00 EUR a month and 1341.00 EUR once." "$T/dp" && grep -qx "1. A card dispute to answer: 60.00 EUR, once" "$T/dp" && grep -qx "2. A card dispute to answer: 48.00 EUR, once" "$T/dp" && grep -q "^   The bank of Birch Studio took back a payment of 48.00 EUR made on ....-..-..: the cardholder says nothing was received\. It can be answered until ....-..-.., [89] days from now\.$" "$T/dp" && grep -q "^[0-9]*\. Disputes lost without an answer: 90.00 EUR, once$" "$T/dp" && ! grep -q "du_juniper_won" "$T/dp"'
 check "the evidence draft: what the account shows, what only the business has, nothing sent" '"$B" evidence "$T/disputes.ini" dispute:du_birch >"$T/ev" && grep -q "^Evidence for dispute du_birch, as a draft\. Nothing was sent to the provider or the bank" "$T/ev" && grep -qx "  customer_name: Birch Studio" "$T/ev" && grep -q "the same customer made 6 payments to us, the first on ....-..-..; none of them was disputed or refunded\.$" "$T/ev" && grep -qx "  - access_activity_log: when the account was used after the payment" "$T/ev" && ! "$B" evidence "$T/disputes.ini" free:sub_elm 2>"$T/err" && grep -q "no card dispute to answer has the key free:sub_elm" "$T/err"'
 check "a note to the customer about the bank's question" '"$B" draft "$T/disputes.ini" dispute:du_alder_inq >"$T/dl" && grep -qx "Subject: A question from your bank about a payment to us" "$T/dl" && grep -q "^Your bank has asked us about a payment to us of 60.00 EUR made on ....-..-..: it was for \"Team plan\"\." "$T/dl"'
+check "change without --yes: the finding, what would be done, and nothing changed" '"$B" change "$T/change.ini" paused:sub_gorse >"$T/ch" && grep -qx "Collection paused: 29.00 EUR a month" "$T/ch" && grep -q "^Resume collection on subscription sub_gorse: its next invoice is collected again\." "$T/ch" && grep -qx "Nothing was changed. To do exactly this, run it again with --yes." "$T/ch"'
+check "no [changes] in the pay file, or no second key: nothing is changed" '! STRIPE_WRITE_KEY=$WKEY "$B" change "$T/nochange.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "nothing was changed: .*nochange.ini doesn.t say \[changes\] allow = yes" "$T/err" && ! "$B" change "$T/change.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "nothing was changed: STRIPE_WRITE_KEY isn.t set" "$T/err" && ! STRIPE_WRITE_KEY=sk_live_abc "$B" change "$T/change.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "STRIPE_WRITE_KEY is a secret key, which can do everything" "$T/err" && "$B" audit "$T/change.ini" | grep -q "^[0-9]*\. Collection paused: 29.00 EUR a month"'
+check "the reading key in the second key.s place: the provider refuses, and it is said" '! STRIPE_WRITE_KEY=$KEY "$B" change "$T/change.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "Nothing was changed: the second key may not change this (403)" "$T/err"'
+check "with both, one thing is changed, read back, and the next audit no longer finds it" 'STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" paused:sub_gorse --yes >"$T/ch2" && grep -q "^Done: collection on subscription sub_gorse is no longer paused\." "$T/ch2" && STRIPE_WRITE_KEY=$WKEY "$B" audit "$T/change.ini" >"$T/ch3" && ! grep -q "Collection paused" "$T/ch3" && grep -q "1 no longer found (29.00 EUR a month)" "$T/ch3" && grep -q "paymcp can do this, when a person says so: End the discount" "$T/ch3" && "$B" record "$T/change.ini" | grep -q "changed through paymcp on ....-..-..: resumed collection on subscription sub_gorse"'
+check "what paymcp can.t do about a finding is said, and a second time finds the record changed" '! STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" written_off:cus_ivy:eur --yes 2>"$T/err" && grep -q "there is nothing paymcp can do about written_off:cus_ivy:eur" "$T/err" && ! STRIPE_WRITE_KEY=$WKEY "$B" change "$T/change.ini" paused:sub_gorse --yes 2>"$T/err" && grep -q "no finding has the key paused:sub_gorse now" "$T/err"'
+check "evidence for a dispute is kept at the provider and not sent" 'STRIPE_WRITE_KEY=$WKEY "$B" stage "$T/change.ini" dispute:du_birch --yes >"$T/st" && grep -q "^Done: 6 fields are kept at the provider as evidence for dispute du_birch .*Nothing was sent to the bank\." "$T/st" && STRIPE_WRITE_KEY=$WKEY "$B" audit "$T/change.ini" | grep -q "dispute du_birch: status needs_response, .*evidence kept at the provider yes, sent to the bank 0 times"'
 check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>"$T/err" && grep -q "^usage: paymcp PAY.ini" "$T/err"'
 
 # the files for a Stripe sandbox (customers found by address, every "how
@@ -275,6 +289,7 @@ finally:
 sys.exit(1 if failed else 0)
 EOF
 python3 -I "$T/page.py" "$B" "$S" "$(free_port)" || fail=1
+check "the second key is in nothing paymcp wrote" '! grep -rq "$WKEY" "$T/ch" "$T/ch2" "$T/ch3" "$T/st" "$T/err" "$T/change.record.jsonl"'
 check "the key is in nothing paymcp wrote" '! grep -rq "$KEY" "$T/a" "$T/a.json" "$T/c" "$T/n" "$T/m" "$T/err" "$T/r" "$T/pay.record.jsonl"'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else

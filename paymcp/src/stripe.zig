@@ -29,6 +29,10 @@ pub const Client = struct {
     requests: u32 = 0,
     /// Waits between tries, in ms (tests: none).
     wait_ms: u32 = 1000,
+    /// The second key, which may change things; "": nothing is changed.
+    write_key: []const u8 = "",
+    /// POSTs sent.
+    posts: u32 = 0,
 
     pub fn init(gpa: Allocator, io: Io, cfg: *const config.Config, key: []const u8) !Client {
         const target = http.Target.parse(cfg.url) catch return error.BadUrl;
@@ -41,8 +45,64 @@ pub const Client = struct {
         c.hc.deinit();
     }
 
+    /// One change: a POST of form fields with the second key, the API
+    /// version pinned and an idempotency key, so that a request sent
+    /// twice (after a lost answer) is made once. Never sent with the
+    /// reading key, and never when there is no second key.
+    pub fn post(c: *Client, a: Allocator, path: []const u8, fields: []const [2][]const u8, idem: []const u8) Error!jv.Value {
+        if (c.write_key.len == 0) {
+            c.why = "there is no key that may change things (STRIPE_WRITE_KEY)";
+            return error.Provider;
+        }
+        var body: std.ArrayList(u8) = .empty;
+        for (fields, 0..) |f, i| {
+            if (i > 0) try body.append(a, '&');
+            try formEncode(a, &body, f[0]);
+            try body.append(a, '=');
+            try formEncode(a, &body, f[1]);
+        }
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            c.posts += 1;
+            const ans = http.fetch(&c.hc, a, .{
+                .method = .POST,
+                .path = path,
+                .key = c.write_key,
+                .body = body.items,
+                .content_type = "application/x-www-form-urlencoded",
+                .headers = &.{ .{ .name = "Stripe-Version", .value = model.api_version }, .{ .name = "Idempotency-Key", .value = idem } },
+                .limits = .{ .idle_ms = 20_000, .total_ms = 60_000 },
+            }) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                if (tries < 2) {
+                    c.pause(tries);
+                    continue;
+                }
+                c.why = try std.fmt.allocPrint(a, "the billing provider couldn't be reached ({s}); whether the change was made isn't known", .{@errorName(e)});
+                return error.Provider;
+            };
+            if (ans.status == 200) {
+                return jv.parse(a, ans.body) orelse {
+                    c.why = "the billing provider's answer wasn't JSON";
+                    return error.Provider;
+                };
+            }
+            if ((ans.status == 429 or ans.status >= 500) and tries < 3) {
+                c.pause(tries);
+                continue;
+            }
+            const msg = std.mem.trimEnd(u8, jv.str(jv.at(jv.parse(a, ans.body), &.{ "error", "message" })) orelse "", ". \r\n");
+            c.why = switch (ans.status) {
+                401 => "the billing provider refused the second key (401): it is wrong, was deleted, or is for another account",
+                403 => try std.fmt.allocPrint(a, "the second key may not change this (403){s}{s}", .{ if (msg.len > 0) ": " else "", msg }),
+                else => try std.fmt.allocPrint(a, "the billing provider answered {d}{s}{s}", .{ ans.status, if (msg.len > 0) ": " else "", msg }),
+            };
+            return error.Provider;
+        }
+    }
+
     /// One GET; the parsed answer. `path` starts with /v1/.
-    fn get(c: *Client, a: Allocator, path: []const u8) Error!jv.Value {
+    pub fn get(c: *Client, a: Allocator, path: []const u8) Error!jv.Value {
         var tries: u32 = 0;
         while (true) : (tries += 1) {
             c.requests += 1;
@@ -245,6 +305,15 @@ pub const Client = struct {
         return data;
     }
 };
+
+/// `v` as a form field's name or value.
+fn formEncode(a: Allocator, out: *std.ArrayList(u8), v: []const u8) !void {
+    for (v) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
+            try out.append(a, ch);
+        } else try out.print(a, "%{X:0>2}", .{ch});
+    }
+}
 
 const t = std.testing;
 const sim = @import("sim.zig");

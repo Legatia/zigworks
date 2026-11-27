@@ -43,6 +43,9 @@ pub const Entry = struct {
     decided: i64 = 0,
     /// The amount when the person decided.
     decided_amount: ?i64 = null,
+    /// When paymcp last changed something at the provider about it, and what.
+    changed: i64 = 0,
+    change_note: []const u8 = "",
 
     pub fn title(e: Entry) []const u8 {
         const k = std.meta.stringToEnum(audit.Kind, e.kind) orelse return e.kind;
@@ -106,6 +109,11 @@ fn apply(a: Allocator, b: *Book, v: jv.Value) !bool {
     if (eql(event, "gone")) {
         e.gone = at;
         e.gone_n = b.readings;
+        return true;
+    }
+    if (eql(event, "changed")) {
+        e.changed = at;
+        e.change_note = jv.str(jv.get(v, "what")) orelse "";
         return true;
     }
     if (eql(event, "decided")) {
@@ -217,6 +225,15 @@ pub fn note(a: Allocator, b: *Book, r: Reading) ![]const u8 {
         try gone.append(a, kv.key_ptr.*);
     }
     for (gone.items) |key| try add(a, b, &lines, try std.fmt.allocPrint(a, "{{\"at\":{d},\"event\":\"gone\",\"key\":{f}}}", .{ r.now, std.json.fmt(key, .{}) }));
+    return lines.items;
+}
+
+/// The line for a change paymcp made at the provider about finding `key`;
+/// null when the record doesn't have the finding (nothing is written).
+pub fn changed(a: Allocator, b: *Book, key: []const u8, what: []const u8, now: i64) !?[]const u8 {
+    if (b.entries.get(key) == null) return null;
+    var lines: std.ArrayList(u8) = .empty;
+    try add(a, b, &lines, try std.fmt.allocPrint(a, "{{\"at\":{d},\"event\":\"changed\",\"key\":{f},\"what\":{f}}}", .{ now, std.json.fmt(key, .{}), std.json.fmt(try flat(a, what, 300), .{}) }));
     return lines.items;
 }
 
@@ -381,6 +398,7 @@ fn listLine(a: Allocator, o: *std.ArrayList(u8), key: []const u8, e: Entry, at: 
     try o.print(a, "   - {s}  {s}: {s}  {s}", .{ try model.day(a, at), e.title(), try amountText(a, e), e.name });
     if (with_reason and e.reason.len > 0) try o.print(a, ": \"{s}\"", .{e.reason});
     try o.print(a, "  [{s}]\n", .{key});
+    if (e.changed > 0) try o.print(a, "     changed through paymcp on {s}: {s}\n", .{ try model.day(a, e.changed), e.change_note });
 }
 
 /// The whole record in a few lines: what is open, what is no longer
@@ -436,7 +454,7 @@ pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     return o.items;
 }
 
-const JLine = struct { key: []const u8, title: []const u8, name: []const u8, amount_text: []const u8, day: []const u8, reason: ?[]const u8 };
+const JLine = struct { key: []const u8, title: []const u8, name: []const u8, amount_text: []const u8, day: []const u8, reason: ?[]const u8, changed: ?[]const u8 };
 const JPart = struct { n: usize, sums: []const u8, unknown: usize, items: []const JLine, more: usize };
 
 /// The most lines of one part the record as data carries.
@@ -468,6 +486,7 @@ pub fn json(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
             .amount_text = try amountText(a, e),
             .day = try model.day(a, if (part == 3) e.gone.? else e.decided),
             .reason = if (part == 3) null else e.reason,
+            .changed = if (e.changed > 0) try std.fmt.allocPrint(a, "{s}: {s}", .{ try model.day(a, e.changed), e.change_note }) else null,
         });
     }
     var parts: [4]JPart = undefined;

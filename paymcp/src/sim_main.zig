@@ -4,7 +4,7 @@ const sim = @import("sim.zig");
 const model = @import("model.zig");
 
 const usage =
-    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes]
+    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes] [--write-key KEY2]
     \\
     \\A made-up software business (twelve customers, their subscriptions,
     \\prices and invoices) behind a stand-in for the billing provider's API on
@@ -14,6 +14,9 @@ const usage =
     \\meters, as a key without that permission. With --disputes the business
     \\has four card disputes (one to answer, one inquiry, one lost with no
     \\answer sent, one won); with --no-disputes KEY may not read disputes.
+    \\With --write-key, requests sent with KEY2 may also change things (end a
+    \\discount, set a quantity or a price, resume collection, finalise or send
+    \\an invoice, keep evidence for a dispute); KEY still only reads.
     \\examples/who.csv is the business's own file that goes with it.
     \\
 ;
@@ -33,6 +36,9 @@ pub fn main(init: std.process.Init) !u8 {
             now = model.dayStart(args[i]) orelse return bad(io);
         } else if (std.mem.eql(u8, args[i], "--no-meters")) {
             meters = false;
+        } else if (std.mem.eql(u8, args[i], "--write-key") and i + 1 < args.len) {
+            i += 1;
+            opts.write_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--disputes")) {
             opts.disputes = .some;
         } else if (std.mem.eql(u8, args[i], "--no-disputes")) {

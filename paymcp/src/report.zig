@@ -20,6 +20,8 @@ pub const Options = struct {
     all: bool = false,
     /// Why the record couldn't be used.
     record_problem: ?[]const u8 = null,
+    /// paymcp may change things here: say what it can do about a finding.
+    can_change: bool = false,
 };
 
 /// Control characters (a newline in a customer's name) become spaces.
@@ -61,7 +63,7 @@ fn totalsText(a: Allocator, findings: []const audit.Finding) ![]const u8 {
     return std.mem.join(a, "; ", parts.items);
 }
 
-fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8, book: ?*const record.Book) !void {
+fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8, book: ?*const record.Book, can_change: bool) !void {
     var suffix: []const u8 = "";
     var decided: ?[]const u8 = null;
     if (book) |b| switch (b.mark(f.key)) {
@@ -79,6 +81,8 @@ fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8
     if (decided) |d| try o.print(a, "   {s}\n", .{d});
     try o.print(a, "   Proposed: {s}\n", .{f.proposal});
     if (f.letter != null) try o.appendSlice(a, "   A message to the customer is drafted: ask for the draft of this key.\n");
+    if (can_change and f.change != null) try o.print(a, "   paymcp can do this, when a person says so: {s}\n", .{try flat(a, f.does)});
+    if (book) |b| if (b.entries.get(f.key)) |e| if (e.changed > 0) try o.print(a, "   Changed through paymcp on {s}: {s}.\n", .{ try model.day(a, e.changed), e.change_note });
     try o.print(a, "   [{s}]\n", .{try flat(a, f.key)});
 }
 
@@ -169,16 +173,16 @@ pub fn text(a: Allocator, r: job.Reading, cfg: *const config.Config, opts: Optio
     const n = if (opts.limit > 0) @min(opts.limit, shown.items.len) else shown.items.len;
     for (shown.items[0..n], 1..) |f, i| {
         try o.append(a, '\n');
-        try block(a, &o, f, try std.fmt.allocPrint(a, "{d}. ", .{i}), opts.book);
+        try block(a, &o, f, try std.fmt.allocPrint(a, "{d}. ", .{i}), opts.book, opts.can_change);
     }
     if (n < shown.items.len) try o.print(a, "\n...and {d} more, smaller: ask with a larger limit, or for one kind.\n", .{shown.items.len - n});
     return o.items;
 }
 
 /// One finding in full.
-pub fn one(a: Allocator, f: audit.Finding, book: ?*const record.Book) ![]const u8 {
+pub fn one(a: Allocator, f: audit.Finding, book: ?*const record.Book, can_change: bool) ![]const u8 {
     var o: std.ArrayList(u8) = .empty;
-    try block(a, &o, f, "", book);
+    try block(a, &o, f, "", book, can_change);
     return o.items;
 }
 
@@ -436,6 +440,9 @@ pub fn oneJson(a: Allocator, f: audit.Finding, cfg: *const config.Config, book: 
         .letter = if (body) |b| @as(?struct { to: []const u8, subject: []const u8, body: []const u8 }, .{ .to = try flat(a, f.letter.?.to), .subject = try flat(a, f.letter.?.subject), .body = b }) else null,
         // a card dispute's evidence, as far as the account shows it
         .evidence = evidence,
+        // what paymcp can do about it, where the pay file allows changes
+        .can_do = if (cfg.changes and f.change != null) @as(?[]const u8, try flat(a, f.does)) else null,
+        .changed = if (entry) |e| (if (e.changed > 0) @as(?[]const u8, try std.fmt.allocPrint(a, "{s}: {s}", .{ try model.day(a, e.changed), e.change_note })) else null) else null,
     }, .{});
 }
 

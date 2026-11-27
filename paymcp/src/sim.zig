@@ -26,6 +26,8 @@ pub const Options = struct {
     /// Card disputes: the business has none, has some, or the key may not
     /// read them.
     disputes: enum { none, some, denied } = .none,
+    /// A second key, which may change things; "": nothing can.
+    write_key: []const u8 = "",
 };
 
 pub const customer_count = 12;
@@ -66,6 +68,16 @@ pub const Sim = struct {
     subscriptions: std.ArrayList(Obj) = .empty,
     invoices: std.ArrayList(Obj) = .empty,
     disputes: std.ArrayList(Obj) = .empty,
+    // the records the lists above are written from (a change rewrites them)
+    subs: []Sub = &.{},
+    invs: []Inv = &.{},
+    dps: []Dp = &.{},
+    price_json: [price_count][]const u8 = undefined,
+    price_ids: [price_count][]const u8 = undefined,
+    /// POSTs made with the key that may change things.
+    changes: u32 = 0,
+    /// Evidence sent to the bank (a dispute's `submit` not false).
+    submitted: u32 = 0,
     /// Requests refused for what they were (not a GET, no pinned version).
     refused: u32 = 0,
     /// Answer 429 to this many requests before answering again.
@@ -122,13 +134,15 @@ fn q(a: Allocator, v: []const u8) ![]const u8 {
 
 const P = struct { id: []const u8, json: []const u8 };
 
+const SubItem = struct { price: usize, quantity: i64 };
+
 const Sub = struct {
     id: []const u8,
     customer: []const u8,
     status: []const u8 = "active",
     age_days: i64,
     /// price, quantity (0: metered, no quantity)
-    items: []const struct { price: usize, quantity: i64 },
+    items: []const SubItem,
     discount: ?struct { id: []const u8, coupon: []const u8, name: []const u8, percent: []const u8, age_days: i64, ends_in_days: ?i64 = null } = null,
     /// "none", "date:-12" (days from now) or "": not paused
     pause: []const u8 = "",
@@ -166,7 +180,11 @@ fn seed(s: *Sim) !void {
         .{ .id = "price_team_2023", .json = try priceJson(a, "price_team_2023", "prod_team", 900, "month", false, "", "Team 2023", "") },
         .{ .id = "price_comped", .json = try priceJson(a, "price_comped", "prod_comped", 0, "month", true, "", "Pro, comped", "") },
     };
-    for (prices, 0..) |p, i| try s.prices.append(a, .{ .id = p.id, .json = p.json, .active = i != 4 });
+    for (prices, 0..) |p, i| {
+        try s.prices.append(a, .{ .id = p.id, .json = p.json, .active = i != 4 });
+        s.price_json[i] = p.json;
+        s.price_ids[i] = p.id;
+    }
 
     const subs = [subscription_count]Sub{
         // 25% off for two years with no end; nine seats in the product, five paid
@@ -192,7 +210,65 @@ fn seed(s: *Sim) !void {
         // nothing to find yet: a price of zero, ten days old
         .{ .id = "sub_larch", .customer = "cus_larch", .age_days = 10, .items = &.{.{ .price = 5, .quantity = 1 }} },
     };
-    for (subs) |sub| {
+    s.subs = try a.dupe(Sub, &subs);
+    try writeSubs(s);
+
+    const invoices = [_]Inv{
+        .{ .id = "in_gorse_draft", .number = "", .customer = "cus_gorse", .status = "draft", .age_days = 20, .total = 48000, .finalized = false },
+        .{ .id = "in_hazel_open", .number = "FH-0412", .customer = "cus_hazel", .status = "open", .age_days = 9, .total = 2900, .finalized = true, .sub = "sub_hazel" },
+        .{ .id = "in_ivy_bad", .number = "FH-0371", .customer = "cus_ivy", .status = "uncollectible", .age_days = 100, .total = 6000, .finalized = true, .attempted = true, .sub = "sub_ivy" },
+        .{ .id = "in_ivy_void", .number = "FH-0398", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 6000, .finalized = true, .attempted = true, .sub = "sub_ivy" },
+        // voided while still a draft: never sent, nothing given up
+        .{ .id = "in_ivy_never", .number = "", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 9900, .finalized = false },
+        // sent to be paid by hand, three weeks past due
+        .{ .id = "in_dogwood_late", .number = "FH-0405", .customer = "cus_dogwood", .status = "open", .age_days = 51, .total = 34000, .finalized = true, .due_days_ago = 21 },
+        // the card refused four times; no further try planned
+        .{ .id = "in_birch_failed", .number = "FH-0415", .customer = "cus_birch", .status = "open", .age_days = 16, .total = 4800, .finalized = true, .attempted = true, .tries = 4, .sub = "sub_birch" },
+        .{ .id = "in_alder_paid", .number = "FH-0420", .customer = "cus_alder", .status = "paid", .age_days = 12, .total = 4500, .finalized = true, .attempted = true, .sub = "sub_alder" },
+    };
+    s.invs = try a.dupe(Inv, &invoices);
+    try writeInvoices(s);
+}
+
+const Inv = struct { id: []const u8, number: []const u8, customer: []const u8, status: []const u8, age_days: i64, total: i64, finalized: bool, attempted: bool = false, sub: []const u8 = "", tries: u8 = 0, due_days_ago: ?i64 = null, auto_advance: bool = false, final_today: bool = false };
+
+/// The invoices as the provider would give them, from the records.
+fn writeInvoices(s: *Sim) !void {
+    const a = s.gpa;
+    const now = s.opts.now;
+    s.invoices.clearRetainingCapacity();
+    for (s.invs) |inv| {
+        const created = now - inv.age_days * day;
+        const open = std.mem.eql(u8, inv.status, "open") or std.mem.eql(u8, inv.status, "draft");
+        try s.invoices.append(a, .{ .id = inv.id, .status = inv.status, .created = created, .json = try std.fmt.allocPrint(a,
+            \\{{"id":"{s}","object":"invoice","amount_due":{d},"amount_paid":{d},"amount_remaining":{d},"attempt_count":{d},"attempted":{},"auto_advance":{},"collection_method":"{s}","created":{d},"currency":"eur","customer":"{s}","due_date":{s},"livemode":false,"next_payment_attempt":null,"number":{s},"parent":{s},"status":"{s}","status_transitions":{{"finalized_at":{s},"marked_uncollectible_at":null,"paid_at":null,"voided_at":null}},"total":{d}}}
+        , .{
+            inv.id,
+            inv.total,
+            if (std.mem.eql(u8, inv.status, "paid")) inv.total else 0,
+            if (open) inv.total else 0,
+            if (inv.tries > 0) inv.tries else @as(u8, if (inv.attempted) 1 else 0),
+            inv.attempted,
+            inv.auto_advance,
+            if (inv.due_days_ago != null) "send_invoice" else "charge_automatically",
+            created,
+            inv.customer,
+            if (inv.due_days_ago) |n| try std.fmt.allocPrint(a, "{d}", .{now - n * day}) else "null",
+            try q(a, inv.number),
+            if (inv.sub.len > 0) try std.fmt.allocPrint(a, "{{\"type\":\"subscription_details\",\"quote_details\":null,\"subscription_details\":{{\"metadata\":{{}},\"subscription\":\"{s}\"}}}}", .{inv.sub}) else "null",
+            inv.status,
+            if (inv.finalized) try std.fmt.allocPrint(a, "{d}", .{if (inv.final_today) now else created}) else "null",
+            inv.total,
+        }) });
+    }
+}
+
+/// The subscriptions as the provider would give them, from the records.
+fn writeSubs(s: *Sim) !void {
+    const a = s.gpa;
+    const now = s.opts.now;
+    s.subscriptions.clearRetainingCapacity();
+    for (s.subs) |sub| {
         const created = now - sub.age_days * day;
         const period_start = now - 20 * day;
         const period_end = now + 10 * day;
@@ -201,7 +277,7 @@ fn seed(s: *Sim) !void {
             if (i > 0) try items.append(a, ',');
             try items.print(a,
                 \\{{"id":"si_{s}_{d}","object":"subscription_item","created":{d},"current_period_end":{d},"current_period_start":{d},"discounts":[],"price":{s},"quantity":{s},"subscription":"{s}"}}
-            , .{ sub.id[4..], i + 1, created, period_end, period_start, prices[it.price].json, if (it.quantity == 0) "null" else try std.fmt.allocPrint(a, "{d}", .{it.quantity}), sub.id });
+            , .{ sub.id[4..], i + 1, created, period_end, period_start, s.price_json[it.price], if (it.quantity == 0) "null" else try std.fmt.allocPrint(a, "{d}", .{it.quantity}), sub.id });
         }
         var ids: []const u8 = "[]";
         var full: []const u8 = "[]";
@@ -226,47 +302,10 @@ fn seed(s: *Sim) !void {
             .expanded = try std.fmt.allocPrint(a, "{s}{s}}}", .{ head, full }),
         });
     }
-
-    const Inv = struct { id: []const u8, number: []const u8, customer: []const u8, status: []const u8, age_days: i64, total: i64, finalized: bool, attempted: bool = false, sub: []const u8 = "", tries: u8 = 0, due_days_ago: ?i64 = null };
-    const invoices = [_]Inv{
-        .{ .id = "in_gorse_draft", .number = "", .customer = "cus_gorse", .status = "draft", .age_days = 20, .total = 48000, .finalized = false },
-        .{ .id = "in_hazel_open", .number = "FH-0412", .customer = "cus_hazel", .status = "open", .age_days = 9, .total = 2900, .finalized = true, .sub = "sub_hazel" },
-        .{ .id = "in_ivy_bad", .number = "FH-0371", .customer = "cus_ivy", .status = "uncollectible", .age_days = 100, .total = 6000, .finalized = true, .attempted = true, .sub = "sub_ivy" },
-        .{ .id = "in_ivy_void", .number = "FH-0398", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 6000, .finalized = true, .attempted = true, .sub = "sub_ivy" },
-        // voided while still a draft: never sent, nothing given up
-        .{ .id = "in_ivy_never", .number = "", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 9900, .finalized = false },
-        // sent to be paid by hand, three weeks past due
-        .{ .id = "in_dogwood_late", .number = "FH-0405", .customer = "cus_dogwood", .status = "open", .age_days = 51, .total = 34000, .finalized = true, .due_days_ago = 21 },
-        // the card refused four times; no further try planned
-        .{ .id = "in_birch_failed", .number = "FH-0415", .customer = "cus_birch", .status = "open", .age_days = 16, .total = 4800, .finalized = true, .attempted = true, .tries = 4, .sub = "sub_birch" },
-        .{ .id = "in_alder_paid", .number = "FH-0420", .customer = "cus_alder", .status = "paid", .age_days = 12, .total = 4500, .finalized = true, .attempted = true, .sub = "sub_alder" },
-    };
-    for (invoices) |inv| {
-        const created = now - inv.age_days * day;
-        const open = std.mem.eql(u8, inv.status, "open") or std.mem.eql(u8, inv.status, "draft");
-        try s.invoices.append(a, .{ .id = inv.id, .status = inv.status, .created = created, .json = try std.fmt.allocPrint(a,
-            \\{{"id":"{s}","object":"invoice","amount_due":{d},"amount_paid":{d},"amount_remaining":{d},"attempt_count":{d},"attempted":{},"auto_advance":false,"collection_method":"{s}","created":{d},"currency":"eur","customer":"{s}","due_date":{s},"livemode":false,"next_payment_attempt":null,"number":{s},"parent":{s},"status":"{s}","status_transitions":{{"finalized_at":{s},"marked_uncollectible_at":null,"paid_at":null,"voided_at":null}},"total":{d}}}
-        , .{
-            inv.id,
-            inv.total,
-            if (std.mem.eql(u8, inv.status, "paid")) inv.total else 0,
-            if (open) inv.total else 0,
-            if (inv.tries > 0) inv.tries else @as(u8, if (inv.attempted) 1 else 0),
-            inv.attempted,
-            if (inv.due_days_ago != null) "send_invoice" else "charge_automatically",
-            created,
-            inv.customer,
-            if (inv.due_days_ago) |n| try std.fmt.allocPrint(a, "{d}", .{now - n * day}) else "null",
-            try q(a, inv.number),
-            if (inv.sub.len > 0) try std.fmt.allocPrint(a, "{{\"type\":\"subscription_details\",\"quote_details\":null,\"subscription_details\":{{\"metadata\":{{}},\"subscription\":\"{s}\"}}}}", .{inv.sub}) else "null",
-            inv.status,
-            if (inv.finalized) try std.fmt.allocPrint(a, "{d}", .{created}) else "null",
-            inv.total,
-        }) });
-    }
 }
 
-const Dp = struct { id: []const u8, customer: []const u8, payer: []const u8, email: []const u8, amount: i64, reason: []const u8, status: []const u8, age_days: i64, due_in_days: ?i64 = null, sent: u8 = 0, code: []const u8 = "", what: []const u8 = "Team plan" };
+
+const Dp = struct { id: []const u8, customer: []const u8, payer: []const u8, email: []const u8, amount: i64, reason: []const u8, status: []const u8, age_days: i64, due_in_days: ?i64 = null, sent: u8 = 0, code: []const u8 = "", what: []const u8 = "Team plan", staged: bool = false };
 
 /// The disputes of the made-up business (with `disputes = .some`): one to
 /// answer, one inquiry, one lost with nothing ever sent, one won.
@@ -284,17 +323,23 @@ fn chargeJson(a: Allocator, d: Dp, now: i64) ![]const u8 {
 }
 
 fn seedDisputes(s: *Sim) !void {
+    s.dps = try s.gpa.dupe(Dp, &sim_disputes);
+    try writeDisputes(s);
+}
+
+fn writeDisputes(s: *Sim) !void {
     const a = s.gpa;
     const now = s.opts.now;
-    for (sim_disputes) |d| {
+    s.disputes.clearRetainingCapacity();
+    for (s.dps) |d| {
         const created = now - d.age_days * day;
         const fmt =
-            \\{{"id":"{s}","object":"dispute","amount":{d},"balance_transactions":[],"charge":{s},"created":{d},"currency":"eur","evidence_details":{{"due_by":{s},"has_evidence":false,"past_due":false,"submission_count":{d}}},"is_charge_refundable":false,"livemode":false,"metadata":{{}},"payment_intent":null,"payment_method_details":{{"card":{{"brand":"visa","case_type":"{s}","network_reason_code":{s}}},"type":"card"}},"reason":"{s}","status":"{s}"}}
+            \\{{"id":"{s}","object":"dispute","amount":{d},"balance_transactions":[],"charge":{s},"created":{d},"currency":"eur","evidence_details":{{"due_by":{s},"has_evidence":{},"past_due":false,"submission_count":{d}}},"is_charge_refundable":false,"livemode":false,"metadata":{{}},"payment_intent":null,"payment_method_details":{{"card":{{"brand":"visa","case_type":"{s}","network_reason_code":{s}}},"type":"card"}},"reason":"{s}","status":"{s}"}}
         ;
         const due = if (d.due_in_days) |n| try std.fmt.allocPrint(a, "{d}", .{now + n * day}) else "null";
         const case = if (std.mem.startsWith(u8, d.status, "warning_")) "inquiry" else "chargeback";
-        const plain = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try std.fmt.allocPrint(a, "\"ch_{s}\"", .{d.id[3..]}), created, due, d.sent, case, try q(a, d.code), d.reason, d.status });
-        const full = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try chargeJson(a, d, now), created, due, d.sent, case, try q(a, d.code), d.reason, d.status });
+        const plain = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try std.fmt.allocPrint(a, "\"ch_{s}\"", .{d.id[3..]}), created, due, d.staged, d.sent, case, try q(a, d.code), d.reason, d.status });
+        const full = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try chargeJson(a, d, now), created, due, d.staged, d.sent, case, try q(a, d.code), d.reason, d.status });
         try s.disputes.append(a, .{ .id = d.id, .status = d.status, .created = created, .json = plain, .expanded = full });
     }
 }
@@ -326,6 +371,7 @@ const Req = struct {
     query: []const u8,
     auth: []const u8 = "",
     version: []const u8 = "",
+    body: []const u8 = "",
 };
 
 const Res = struct { status: u16, body: []const u8 = "" };
@@ -375,6 +421,7 @@ fn readRequest(a: Allocator, r: *Io.Reader) !?Req {
     if (length > 0) {
         const body = try a.alloc(u8, length);
         try r.readSliceAll(body);
+        req.body = body;
     }
     return req;
 }
@@ -438,9 +485,12 @@ fn decode(a: Allocator, v: []const u8) ![]const u8 {
 }
 
 fn handle(s: *Sim, a: Allocator, req: Req) !Res {
-    if (!std.mem.startsWith(u8, req.auth, "Bearer ") or !std.mem.eql(u8, req.auth[7..], s.opts.key))
+    if (!std.mem.startsWith(u8, req.auth, "Bearer ")) return err(a, 401, "invalid_request_error", "", "Invalid API Key provided.");
+    const writes = s.opts.write_key.len > 0 and std.mem.eql(u8, req.auth[7..], s.opts.write_key);
+    if (!writes and !std.mem.eql(u8, req.auth[7..], s.opts.key))
         return err(a, 401, "invalid_request_error", "", "Invalid API Key provided.");
-    if (!std.mem.eql(u8, req.method, "GET")) {
+    const get = std.mem.eql(u8, req.method, "GET");
+    if (!get and !(writes and std.mem.eql(u8, req.method, "POST"))) {
         s.refused += 1;
         return err(a, 403, "invalid_request_error", "", "The provided key does not have the required permissions for this endpoint. This key can only read.");
     }
@@ -453,6 +503,8 @@ fn handle(s: *Sim, a: Allocator, req: Req) !Res {
         return err(a, 429, "invalid_request_error", "rate_limit", "Too many requests hit the API too quickly.");
     }
     const p = req.path;
+    if (try one(s, a, req, get)) |res| return res;
+    if (!get) return err(a, 404, "invalid_request_error", "", "Unrecognized request URL.");
     if (std.mem.eql(u8, p, "/v1/customers")) return page(s, a, req, s.customers.items, "/v1/customers", .any);
     if (std.mem.eql(u8, p, "/v1/prices")) return page(s, a, req, s.prices.items, "/v1/prices", .active);
     if (std.mem.eql(u8, p, "/v1/subscriptions")) return page(s, a, req, s.subscriptions.items, "/v1/subscriptions", .subscription);
@@ -477,6 +529,142 @@ fn handle(s: *Sim, a: Allocator, req: Req) !Res {
         return .{ .status = 200, .body = try std.fmt.allocPrint(a, "{{\"object\":\"list\",\"data\":[{s}],\"has_more\":false,\"url\":\"{s}\"}}", .{ data, p }) };
     }
     return err(a, 404, "invalid_request_error", "", "Unrecognized request URL.");
+}
+
+fn objJson(list: []const Obj, id: []const u8) ?[]const u8 {
+    for (list) |o| if (std.mem.eql(u8, o.id, id)) return o.json;
+    return null;
+}
+
+/// Whether a form body names `key` at all (also with nothing after "=").
+fn hasKey(a: Allocator, body: []const u8, key: []const u8) !bool {
+    var it = std.mem.splitScalar(u8, body, '&');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse kv.len;
+        if (std.mem.eql(u8, try decode(a, kv[0..eq]), key)) return true;
+    }
+    return false;
+}
+
+fn itemJson(s: *Sim, a: Allocator, sub: Sub, i: usize) ![]const u8 {
+    const it = sub.items[i];
+    return std.fmt.allocPrint(a,
+        \\{{"id":"si_{s}_{d}","object":"subscription_item","created":{d},"current_period_end":{d},"current_period_start":{d},"discounts":[],"price":{s},"quantity":{s},"subscription":"{s}"}}
+    , .{ sub.id[4..], i + 1, s.opts.now - sub.age_days * day, s.opts.now + 10 * day, s.opts.now - 20 * day, s.price_json[it.price], if (it.quantity == 0) "null" else try std.fmt.allocPrint(a, "{d}", .{it.quantity}), sub.id });
+}
+
+/// One record by its id, read or (with the key that may) changed; null
+/// when the path is a list's.
+fn one(s: *Sim, a: Allocator, req: Req, get: bool) !?Res {
+    const p = req.path;
+    const missing = try err(a, 404, "invalid_request_error", "resource_missing", "No such object.");
+    const subs = "/v1/subscriptions/";
+    if (std.mem.startsWith(u8, p, subs)) {
+        const id = p[subs.len..];
+        const sub = for (s.subs) |*x| {
+            if (std.mem.eql(u8, x.id, id)) break x;
+        } else return missing;
+        if (!get) {
+            if (try hasKey(a, req.body, "discounts")) {
+                if ((try param(a, req.body, "discounts")).len > 0) return try err(a, 400, "invalid_request_error", "", "discounts is an array, or an empty string to clear it.");
+                sub.discount = null;
+            } else if (sub.discount) |d| {
+                // a populated array overwrites: what isn't named again goes
+                var named = false;
+                var kept = false;
+                var it = std.mem.splitScalar(u8, req.body, '&');
+                while (it.next()) |kv| {
+                    const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+                    if (!std.mem.startsWith(u8, try decode(a, kv[0..eq]), "discounts[")) continue;
+                    named = true;
+                    if (std.mem.eql(u8, try decode(a, kv[eq + 1 ..]), d.id)) kept = true;
+                }
+                if (named and !kept) sub.discount = null;
+            }
+            if (try hasKey(a, req.body, "pause_collection")) {
+                if ((try param(a, req.body, "pause_collection")).len > 0) return try err(a, 400, "invalid_request_error", "", "The stand-in only clears pause_collection.");
+                sub.pause = "";
+            }
+            s.changes += 1;
+            try writeSubs(s);
+        }
+        return .{ .status = 200, .body = objJson(s.subscriptions.items, id) orelse return missing };
+    }
+    const items = "/v1/subscription_items/";
+    if (std.mem.startsWith(u8, p, items)) {
+        const id = p[items.len..];
+        for (s.subs) |*sub| for (sub.items, 0..) |_, i| {
+            if (!std.mem.eql(u8, id, try std.fmt.allocPrint(a, "si_{s}_{d}", .{ sub.id[4..], i + 1 }))) continue;
+            if (!get) {
+                const next = try s.gpa.dupe(SubItem, sub.items);
+                const price = try param(a, req.body, "price");
+                if (price.len > 0) {
+                    next[i].price = for (s.price_ids, 0..) |pid, n| {
+                        if (std.mem.eql(u8, pid, price)) break n;
+                    } else return try err(a, 400, "invalid_request_error", "resource_missing", "No such price.");
+                    // (as the provider: a new price sets the quantity to 1 unless one is given)
+                    if (next[i].quantity != 0) next[i].quantity = 1;
+                }
+                const qty = try param(a, req.body, "quantity");
+                if (qty.len > 0) next[i].quantity = std.fmt.parseInt(i64, qty, 10) catch return try err(a, 400, "invalid_request_error", "", "quantity must be an integer.");
+                if (!std.mem.eql(u8, try param(a, req.body, "proration_behavior"), "none")) return try err(a, 400, "invalid_request_error", "", "The stand-in takes proration_behavior=none only: nothing is charged for the past.");
+                sub.items = next;
+                s.changes += 1;
+                try writeSubs(s);
+            }
+            return .{ .status = 200, .body = try itemJson(s, a, sub.*, i) };
+        };
+        return missing;
+    }
+    const invs = "/v1/invoices/";
+    if (std.mem.startsWith(u8, p, invs)) {
+        var id = p[invs.len..];
+        var verb: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, id, '/')) |slash| {
+            verb = id[slash + 1 ..];
+            id = id[0..slash];
+        }
+        const inv = for (s.invs) |*x| {
+            if (std.mem.eql(u8, x.id, id)) break x;
+        } else return missing;
+        if (get != (verb.len == 0)) return try err(a, 404, "invalid_request_error", "", "Unrecognized request URL.");
+        if (std.mem.eql(u8, verb, "finalize")) {
+            if (!std.mem.eql(u8, inv.status, "draft")) return try err(a, 400, "invalid_request_error", "invoice_not_editable", "This invoice is already finalized.");
+            inv.status = "open";
+            inv.finalized = true;
+            inv.final_today = true;
+            inv.auto_advance = !std.mem.eql(u8, try param(a, req.body, "auto_advance"), "false");
+            if (inv.number.len == 0) inv.number = try std.fmt.allocPrint(s.gpa, "FH-{d:0>4}", .{9000 + s.changes});
+        } else if (std.mem.eql(u8, verb, "send")) {
+            if (!std.mem.eql(u8, inv.status, "open")) return try err(a, 400, "invalid_request_error", "", "Only an open invoice can be sent.");
+        } else if (verb.len > 0) return try err(a, 404, "invalid_request_error", "", "Unrecognized request URL.");
+        if (!get) {
+            s.changes += 1;
+            try writeInvoices(s);
+        }
+        return .{ .status = 200, .body = objJson(s.invoices.items, id) orelse return missing };
+    }
+    const dps = "/v1/disputes/";
+    if (std.mem.startsWith(u8, p, dps)) {
+        const id = p[dps.len..];
+        if (s.opts.disputes == .denied) return try err(a, 403, "invalid_request_error", "", "The provided key does not have the required permissions for this endpoint.");
+        const dp = for (s.dps) |*x| {
+            if (std.mem.eql(u8, x.id, id)) break x;
+        } else return missing;
+        if (!get) {
+            if (std.mem.indexOf(u8, req.body, "evidence%5B") != null or std.mem.indexOf(u8, req.body, "evidence[") != null) dp.staged = true;
+            // as the provider: evidence goes to the bank unless submit says false
+            if (!std.mem.eql(u8, try param(a, req.body, "submit"), "false")) {
+                s.submitted += 1;
+                dp.sent += 1;
+                dp.status = "under_review";
+            }
+            s.changes += 1;
+            try writeDisputes(s);
+        }
+        return .{ .status = 200, .body = objJson(s.disputes.items, id) orelse return missing };
+    }
+    return null;
 }
 
 const Filter = enum { any, active, subscription, invoice };
