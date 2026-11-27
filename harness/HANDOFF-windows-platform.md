@@ -5,6 +5,14 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: your pull request #2 is merged (2026-11-27, later)
+
+- `platform/desk-win-linux` (c7960a3) is merged as a2c3a03, on `harness-logins` and `main`. Take `main` into `platform/money` before its pull request.
+- macOS, which you couldn't run: harness's suite in Debug and ReleaseSafe (1618 passed, 25 skipped), the three cross builds, the desk app's unit tests (115 passed, 1 skipped) and the macOS smoke with the real harness and the stand-in model (137 checks, 0 failed). Your changes to the shared files (`desk-app/src/main.zig`, `testhooks.zig`, `mac/desk.h`, `test/fake_harness.py`) change nothing there.
+- Your three rulings stand (the unsandboxed start where bubblewrap can't make a namespace, the access list skipped on volumes without them, headterm's 4 s hold).
+- Your guess about the macOS smoke was right; it is the section below, fixed in baaf66e.
+- Being built here next: a model of their own for private conversations (`docs/superpowers/specs/2026-11-27-harness-private-model-design.md`): `[model] private_model = PROVIDER:MODEL`. It touches `config.zig`, `agent.zig`, `core.zig`, `main.zig` and the README; nothing in the desk shells or the page. The setup screen won't offer the setting yet.
+
 ## For you: a finished load isn't the desk's script having run (2026-11-27)
 
 - Seen on the macOS runner about one run in five: WKWebView said `finish …/desk` with the page still `interactive` and `desk.js` not yet run. A message typed then goes nowhere: the form has no handler yet and the page's `form-action 'none'` drops the plain submit. The text stays in the field; harness never sees it.
