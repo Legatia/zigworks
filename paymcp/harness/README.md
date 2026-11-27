@@ -73,12 +73,44 @@ The Money page: http://127.0.0.1:8744/  (no gate here: this is for looking at th
   billing, harness asks you before the first call, as for any MCP tool.
 - **Nothing here changes the billing account**, with or without rules.
 
+## Changing things, asked every time
+
+Off unless you turn it on in two places: `[changes] allow = yes` in the
+pay file, and the second key in harness's key store (`harness secret add
+stripe-write`), named on the section's `secret` line. `mcp.ini` here has
+the lines, commented out.
+
+paymcp then has two more tools: `billing_change` (the one thing a finding
+says paymcp can do: end a discount, set a quantity, move to a price,
+resume collection, finalise a draft invoice, have an invoice sent again)
+and `dispute_stage` (keep a dispute's evidence draft at Stripe, not sent).
+Declare them as money tools, as those lines do, and harness treats them
+as it treats anything that moves money:
+
+- **Asked every time**, with the call in front of you: the finding's key
+  and its amount. There is no "Allow 24 h", and no rule lifts the
+  question.
+- **Never from a run nobody watches** unless you set a budget for
+  routines, and never from the page: an app's acts call no money tool.
+  You change things by asking in the chat ("end Alder's discount") and
+  answering harness's question.
+- **`max_per_call`** in `mcp.ini` is harness's own limit on one change's
+  amount, beside the pay file's `max_amount`.
+
+What a change does and doesn't do is in the paymcp README, "Changing
+things": from the next invoice on, one request, read back, never a
+payment taken, never evidence sent to a bank.
+
 ## Tried, and not
 
 On Windows 11, with harness 0.4.0: the page inside a harness started for
 the purpose, against the stand-in (the findings listed through the gate,
 each call in the log as `app:money`), and the page on its own through
 `try-page.py`, by hand: opening a finding, the draft, each decision, the
-record, reading again. Not tried: the page in a harness of the owner's
-with a real account behind it (approving an app is the owner's to do),
-macOS and Linux by hand, a pay file with more than a few dozen findings.
+record, reading again. With the lines for changes in `mcp.ini`, harness
+started the server and listed its eight tools. Not tried: the page in a
+harness of the owner's with a real account behind it (approving an app is
+the owner's to do), a change asked for in the chat and answered at the
+gate (the changes themselves were made from the command line, against
+Stripe's test mode), macOS and Linux by hand, a pay file with more than a
+few dozen findings.

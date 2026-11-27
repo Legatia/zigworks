@@ -128,6 +128,8 @@
     if (one.rows_more > 0) rows.append(el("li", "source", "…and " + one.rows_more + " more rows."));
     into.append(rows);
     into.append(el("p", null, "Proposed: " + one.proposal));
+    if (one.can_do) into.append(el("p", "meta", "paymcp can do this when you ask for it in the chat, and harness asks you first: " + one.can_do));
+    if (one.changed) into.append(el("p", "meta", "Changed through paymcp on " + one.changed + "."));
     var facts = [];
     if (one.first_found) facts.push("first found " + one.first_found);
     if (one.due) facts.push("to be answered by " + one.due);

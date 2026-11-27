@@ -129,7 +129,7 @@ pub fn apply(a: Allocator, c: *stripe.Client, f: audit.Finding, now: i64) !Outco
             if (inv.collects_itself == x.by_hand) return stopped(a, "how invoice {s} is collected has changed since it was found. Read the account again.", .{x.invoice});
             _ = c.post(a, try std.fmt.allocPrint(a, "{s}/finalize", .{path}), &.{.{ "auto_advance", "true" }}, try idem(a, f.key, now, 0)) catch |e| return if (e == error.OutOfMemory) e else failed(a, c);
             var what = try std.fmt.allocPrint(a, "finalised invoice {s}", .{x.invoice});
-            var sent_note: []const u8 = "The provider now charges the payment method on file by itself; whether that payment goes through is seen at the next reading.";
+            var sent_note: []const u8 = "The provider now charges the payment method on file by itself. If the customer has none, or it is refused, the invoice stays open and a later reading says so.";
             if (x.by_hand) {
                 _ = c.post(a, try std.fmt.allocPrint(a, "{s}/send", .{path}), &.{}, try idem(a, f.key, now, 1)) catch |e| {
                     if (e == error.OutOfMemory) return e;

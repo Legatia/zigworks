@@ -467,7 +467,7 @@ fn invoices(c: *Ctx) !void {
                 .proposal = "Look at it, then send it or delete it. A draft that should not go out is better deleted than left.",
                 .change = .{ .finalize = .{ .invoice = inv.id, .by_hand = !inv.collects_itself } },
                 .does = if (inv.collects_itself)
-                    try c.p("Finalise the draft invoice {s} for {s}: the provider then charges the payment method {s} has on file, by itself.", .{ inv.id, try c.money(inv.total, inv.currency), c.nameOf(inv.customer) })
+                    try c.p("Finalise the draft invoice {s} for {s}: the provider then charges the payment method {s} has on file, by itself (with none on file it stays open).", .{ inv.id, try c.money(inv.total, inv.currency), c.nameOf(inv.customer) })
                 else
                     try c.p("Finalise the draft invoice {s} for {s} and have the provider send it to {s} to pay.", .{ inv.id, try c.money(inv.total, inv.currency), c.nameOf(inv.customer) }),
             });

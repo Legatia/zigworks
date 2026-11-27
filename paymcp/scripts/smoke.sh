@@ -276,12 +276,17 @@ try:
     check("the page's script writes what it reads as text, never as markup", "innerHTML" not in app and "eval(" not in app and "document.write" not in app)
     status, out = act("billing/billing_audit", {"format": "json", "limit": 20})
     page = json.loads(out) if status == 200 else {}
-    check("the page's first call: a page of findings as data", status == 200 and page.get("total") == 14 and len(page["findings"]) == 14 and len(out.encode()) < 16384, out)
-    status, out = act("billing/billing_decide", {"key": page["findings"][0]["key"], "decision": "intended", "reason": "a gift"})
+    check("the page's first call: a page of findings as data", status == 200 and page.get("total") == 17 and len(page["findings"]) == 17 and page["findings"][0]["kind"] == "dispute" and page["findings"][0]["due"] and len(out.encode()) < 16384, out)
+    status, out = act("billing/billing_decide", {"key": "free:sub_elm", "decision": "intended", "reason": "a gift"})
     check("a decision from the page is written down", status == 200 and out.startswith("Written down: free:sub_elm"), out)
     status, out = act("billing/billing_audit", {"format": "json"})
     after = json.loads(out) if status == 200 else {}
-    check("and the list leaves it out, saying so", after.get("total") == 13 and after.get("hidden") == 1 and after.get("hidden_sums") == "87.00 EUR a month", out)
+    check("and the list leaves it out, saying so", after.get("total") == 16 and after.get("hidden") == 1 and after.get("hidden_sums") == "87.00 EUR a month", out)
+    status, out = act("billing/billing_finding", {"key": "dispute:du_birch", "format": "json"})
+    one = json.loads(out) if status == 200 else {}
+    check("a dispute opens to its evidence draft and a note to the customer", "What only you have" in (one.get("evidence") or "") and (one.get("letter") or {}).get("subject") == "A question from your bank about a payment to us" and one.get("can_do") is None, out)
+    status, out = act("billing/billing_change", {"key": "paused:sub_gorse", "amount": 2900})
+    check("the page can't ask for a change: the tool is not in its manifest", status == 403, out)
     status, out = act("billing/billing_refund", {})
     check("a tool the app's manifest doesn't list is refused", status == 403 and "not in the app's acts" in out, out)
 finally:

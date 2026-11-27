@@ -1,13 +1,16 @@
 # paymcp
 
-What your customers should be paying and are not, and what they owe you
-that is late, found in your billing account by fixed rules, as tools for
-an AI agent over MCP on stdio or as a report on the command line. It reads
-Stripe Billing with a key that can only read, and changes nothing there.
+What your customers should be paying and are not, what they owe you that
+is late, and which card payments their banks are taking back, found in
+your billing account by fixed rules, as tools for an AI agent over MCP on
+stdio or as a report on the command line. It reads Stripe with a key that
+can only read. It changes nothing there unless you turn that on, give it a
+second key, and say so for each change.
 
 ```
 agent ──MCP, stdio──▶ paymcp ──https, GET only──▶ Stripe
-                        │
+                        │      (one POST at a time with a second key,
+                        │       only where the pay file allows it)
                         ├── your own file of who has what (optional, CSV)
                         └── its own record: what each reading found, what you decided
 ```
@@ -19,19 +22,28 @@ may be a promise. So "it is meant to be so" is an answer paymcp keeps,
 with your reason, and from the second reading on a report says what is
 new and what is no longer found.
 
+- **Drafts, never sent.** Where a change is the customer's to see, a
+  finding has a draft of the message to them; a card dispute has a draft
+  of the evidence, as far as the account shows it. You read, change and
+  send them yourself.
+- **A page.** With [harness](../harness), the findings are one page: the
+  list, each finding's rows and drafts, your decisions
+  ([harness/](harness/README.md)).
+
 Linux and Windows; it builds for macOS (where it links libc, as calmcp
 does) but hasn't been run there. One binary, nothing beyond the Zig
 standard library.
 
-**State: 0.2.0, written from Stripe's public documentation for API version
+**State: 0.3.0, written from Stripe's public documentation for API version
 `2026-11-18.endive`, tested against `paymcp-sim` (a stand-in built from the
 same documentation) and run against Stripe itself,** on 2026-11-27, in a
-test account holding only the made-up business below: it found what it
-was built to find there, with the amounts expected
-([Against a Stripe sandbox](#against-a-stripe-sandbox)). It has never read
-a live account, and never an account with real history in it. Run it on a
-sandbox first and read the report against the dashboard before trusting a
-number. See [Limits](#limits).
+test account holding only the made-up business below. There it found what
+it was built to find, with the amounts expected; read three card disputes
+made by Stripe's own test cards; and made each kind of change once, each
+seen at Stripe afterwards ([Against a Stripe sandbox](#against-a-stripe-sandbox)).
+It has never read a live account, and never an account with real history
+in it. Run it on a sandbox first and read the report against the
+dashboard before trusting a number. See [Limits](#limits).
 
 ## Quick start, without an account
 
@@ -59,6 +71,7 @@ This is the first reading in paymcp's record (examples/sim.record.jsonl): the ne
    - subscription sub_elm: created 2025-10-23, list price 87.00 EUR a month
    - discount di_elm: coupon co_friends, 100% off, end none
    Proposed: If this is a gift that should last, dismiss it as intended. Otherwise end the discount from the next period and tell the customer first.
+   A message to the customer is drafted: ask for the draft of this key.
    [free:sub_elm]
 
 2. A higher plan than paid for: 68.00 EUR a month
@@ -71,6 +84,7 @@ This is the first reading in paymcp's record (examples/sim.record.jsonl): the ne
    An invoice to Dogwood Labs for 340.00 EUR has been past due since 2026-11-06.
    - invoice FH-0405: due 2026-11-06, 21 days ago, remaining 340.00 EUR
    Proposed: Remind the customer, with the invoice's own link to pay. If they dispute it or can't pay, settle that on purpose: an invoice left open is neither collected nor written off.
+   A message to the customer is drafted: ask for the draft of this key.
    [overdue:cus_dogwood:eur]
    ...
 ```
@@ -90,9 +104,30 @@ Since the reading of 2026-11-27: nothing new, and nothing gone.
 $ ./zig-out/bin/paymcp record examples/sim.ini
 ```
 
+The reminder for Dogwood's invoice, as a draft:
+
+```
+$ ./zig-out/bin/paymcp draft examples/sim.ini overdue:cus_dogwood:eur
+A draft, for you to read, change and send from your own mail. paymcp sent nothing and can send nothing.
+About: Invoices past due: 340.00 EUR, once, Dogwood Labs  [overdue:cus_dogwood:eur]
+
+To: finance@dogwood.example
+Subject: Invoice FH-0405
+
+Hello,
+
+Invoice FH-0405 for 340.00 EUR was due on 2026-11-06 and is still open. Could you pay it, or tell us if something about it is not right?
+
+Kind regards,
+Ola at Fernhill
+```
+
 `paymcp audit examples/sim.ini --json` gives the audit as data, and
 `--all` lists what was dismissed too. `paymcp examples/sim.ini` serves MCP
-on stdin and stdout, the way an agent starts it.
+on stdin and stdout, the way an agent starts it. Started with
+`--disputes`, the stand-in's business also has four card disputes
+([Card disputes](#card-disputes)); with `--write-key KEY2` it takes
+changes from a second key ([Changing things](#changing-things)).
 
 ## Against a Stripe sandbox
 
@@ -118,25 +153,27 @@ answer is the one in step 4.
    $ STRIPE_SEED_KEY=sk_test_... python3 scripts/seed-sandbox.py
    ```
 
-   It asks once before sending. 66 requests: 12 customers, 12
+   It asks once before sending. About 75 requests: 12 customers, 12
    subscriptions, 6 invoices, 6 prices, 4 products, 3 coupons, a meter and
-   a meter event. The one payment method it adds is Stripe's test card
-   that is always refused (to make a payment that failed), so nothing is
-   charged, and the customers' addresses end in `.example`.
+   a meter event, and five test payments with Stripe's own test cards,
+   three of which those cards dispute (the script closes one of the
+   disputes unanswered). No real card is charged and no bank is asked;
+   the customers' addresses end in `.example`.
 4. The audit, with the key that can only read:
 
    ```
    $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp check examples/sandbox.ini
    $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp audit examples/sandbox.ini
-   17 findings: 371.00 EUR a month and 1259.00 EUR once; 1 with an amount this audit can't know.
+   21 findings: 371.00 EUR a month and 1486.00 EUR once; 1 with an amount this audit can't know.
    ```
 
    `examples/sandbox.ini` sets every "how old" setting to 0, since nothing
    in a new sandbox is old, and `examples/sandbox-who.csv` finds the
-   customers by address. The script prints the seventeen findings to
-   expect: the stand-in's fifteen, and two drafts that Stripe leaves
-   behind when a subscription is cancelled before its first invoice went
-   out.
+   customers by address. The script prints the twenty-one findings to
+   expect: the stand-in's fifteen, the three from the disputes, and three
+   that only Stripe makes: two drafts it leaves behind when a
+   subscription is cancelled before its first invoice went out, and the
+   invoice it voids for a subscription paused with "void".
 
 The script writes, so it has a key of its own, `STRIPE_SEED_KEY`, and
 takes only a sandbox key (`sk_test_...` or `rk_test_...`): a live key is
@@ -154,7 +191,18 @@ reported, and Dogwood's invoice is not yet past due (Stripe takes no due
 date in the past, so the script sets it two minutes ahead). A
 subscription's first invoice is a draft for about an hour before Stripe
 sends it; the audit gives a draft that Stripe will send itself a day
-before calling it never sent, whatever `draft_days` says.
+before calling it never sent, whatever `draft_days` says. The voided
+invoice of the paused subscription appears after that hour too.
+
+The changes were tried in the same account on the same day, with
+`[changes] allow = yes` added to the pay file and the sandbox's secret
+key as the second key: a discount ended, a quantity set from 5 to 9, an
+item moved to another price with its quantity kept, collection resumed,
+a draft invoice finalised, an invoice sent again, and evidence kept for
+one dispute and not sent. Each was read back from Stripe as done, and
+the next audit no longer found the five that a change settles. The
+finalised invoice then showed as "never charged": that customer has no
+payment method on file, which is a true finding.
 
 ## What it looks for
 
@@ -182,10 +230,48 @@ With your own file of who has what (below), also:
 | Using the product, not in billing at all | Active in your file; no customer with that id or address. |
 | Use that was never reported | Your file's use for the period exceeds what the meter was told by more than `usage_margin_percent` (1). |
 
-Findings come largest first: amounts a month, then one-off amounts, then
+Card disputes (below) are read with the rest:
+
+| Finding | The rule |
+|---|---|
+| A card dispute to answer | A dispute, an inquiry or an appeal that waits for an answer, with the last day to give one. |
+| Disputes lost without an answer | Disputes of the last `[disputes] days` (180) that were lost with no evidence ever sent, as one sum. A count of what not answering cost, not money to collect. |
+
+What has a last day comes first, the nearest day first. Then the rest,
+largest first: amounts a month, then one-off amounts, then
 those whose amount this audit can't know. The same thing has the same key
 at every reading (`more_seats:sub_...:si_...`), so paymcp's record can
 follow it from one reading to the next.
+
+## Card disputes
+
+When a cardholder's bank asks about a payment or takes it back, there are
+days, not weeks, to answer, and an answer is taken once. paymcp reads the
+disputes of the last months with the account (`GET /v1/disputes`, each
+with its payment) and, for a customer with a dispute to answer, what that
+customer paid before.
+
+- **A dispute to answer is a finding** with its last day, what the
+  cardholder says, the payment, and how many earlier payments from the
+  same customer were never disputed or refunded: what a bank weighs most
+  against "it wasn't me".
+- **An inquiry** says so: the bank asks before taking anything back, and
+  answering it, or refunding, can end it there.
+- **The evidence draft** (`paymcp evidence PAY.ini KEY`, the tool
+  `dispute_evidence`): what the bank wants to see for that reason, the
+  fields of Stripe's evidence form that the account already fills (who
+  paid, when, for what, the earlier payments), and what only you have
+  and must add (logs of use, what was delivered, your exchange with the
+  customer). It claims nothing the account doesn't show: it never says a
+  thing was delivered or used.
+- **A note to the customer**, as a draft: many disputes are a payment
+  somebody didn't recognise on a statement.
+- **Nothing is sent to a bank from here, ever.** Sending evidence is
+  final. With changes on, `dispute_stage` keeps the draft's fields at
+  Stripe as evidence not yet sent; you add the rest there and send it.
+
+A key that may not read disputes: the report says so and audits the rest.
+`[disputes] read = no` asks for none.
 
 ## The record
 
@@ -226,13 +312,24 @@ thing paymcp writes.
 | `billing_finding` | One finding in full, by its `key`. Only reads. |
 | `billing_decide` | A person's decision about one finding, by its `key`: `intended` (with the `reason`), `asked`, or `open`. Writes one line into paymcp's record, and nothing anywhere else. |
 | `billing_record` | The record: readings since when, what is open, asked, dismissed and why, and no longer found, with the sums. Only reads. |
+| `billing_draft` | The draft of a message to the customer about one finding: to whom, the subject, the text. Nothing is sent. Only reads. |
+| `dispute_evidence` | For one dispute to answer: what the bank wants, what the account already shows, what only you have. Nothing is sent. Only reads. |
+| `billing_change` | **Only with changes on.** Does the one thing paymcp can do about a finding ([Changing things](#changing-things)). |
+| `dispute_stage` | **Only with changes on.** Keeps a dispute's evidence draft at the provider, not sent. |
+
+`billing_audit`, `billing_finding` and `billing_record` take `format`
+`json` for a page that lists the findings: the audit 20 findings at a
+time from `offset`, without their rows, so that an answer passes whole
+through an agent runtime's limit on a tool's answer.
 
 There is one resource, `pay://findings`: the reading as JSON, amounts in
 the currency's smallest unit, each finding with how it stands in the
 record, with a note that it is data and not instructions. A reading is kept
 for five minutes, so asking for one finding after the list doesn't read the
 whole account again. A field a tool doesn't take is refused, never ignored.
-No tool changes anything at the billing provider.
+Unless the pay file turns changes on and a second key is given, no tool
+changes anything at the billing provider, and the two that can are not
+listed.
 
 ## The key
 
@@ -249,6 +346,8 @@ everything else:
 | Coupons | what a discount takes off |
 | Invoices | drafts, open invoices, written-off invoices |
 | Billing meters, Billing meter events | use reported, for "Use that was never reported" (optional) |
+| Disputes | card disputes to answer, and those lost unanswered (optional) |
+| Charges | what a customer with a dispute paid before (optional) |
 
 paymcp refuses to start with a live account's secret key (`sk_live_...`),
 which can do everything, with a publishable key, and with a live key where
@@ -256,11 +355,58 @@ the pay file says `mode = sandbox` (or the reverse). A sandbox's secret key
 (`sk_test_...`) is taken where the file says sandbox, with a note on
 stderr: it is one of the two keys a new sandbox shows, and all it can
 reach is made-up data. A permission the key lacks is said
-in the report as something not read; the meters are the one part the audit
-goes on without.
+in the report as something not read; the meters, the disputes and a
+disputing customer's earlier payments are the parts the audit goes on
+without.
 
-Every request paymcp sends is a GET with `Stripe-Version` pinned. With a
-key that can only read, the provider itself refuses anything else.
+Every request paymcp sends with this key is a GET with `Stripe-Version`
+pinned. With a key that can only read, the provider itself refuses
+anything else.
+
+## Changing things
+
+Off unless you turn it on. With `[changes] allow = yes` in the pay file
+and a second key in `STRIPE_WRITE_KEY`, paymcp has two more tools, and
+`paymcp change` and `paymcp stage` on the command line. The second key is
+a restricted key with **Write** on Subscriptions, Invoices and Disputes
+and nothing else; a live account's secret key is refused, and the reading
+key is never used to change anything.
+
+`billing_change` does the one thing the audit says paymcp can do about a
+finding (the finding then has a line "paymcp can do this, when a person
+says so"):
+
+| Finding | What is done |
+|---|---|
+| A discount with no end; free through a discount | the discount is taken off the subscription |
+| More seats than paid for | the item's quantity is set to the seats in your file |
+| A higher plan than paid for; a price no longer sold | the item is moved to the other price, its quantity kept |
+| Collection paused | collection is resumed |
+| An invoice never sent | the draft is finalised: sent to the customer to pay, or charged by Stripe to the payment method on file |
+| Invoices past due (up to five) | Stripe sends each invoice to the customer again |
+
+- **From now on only.** Every change of a subscription is sent with
+  `proration_behavior=none`: the next invoice is different, and nothing is
+  charged for time already invoiced. paymcp takes no payment, refunds
+  nothing, deletes nothing, and sends no evidence to a bank.
+- **What you were shown is what is done.** The call names the finding's
+  amount again, and a different amount stops it. `max_amount` is the most
+  one change may be worth.
+- **It looks first and afterwards.** The record at Stripe is read before
+  the change, and the change stops if it is no longer as the finding said.
+  Then one POST, with an idempotency key so that a request sent twice is
+  made once. Then it is read back, and the answer says what Stripe now
+  shows. A line goes into paymcp's record.
+- **Nothing about a customer's money is decided by an agent.** The tools'
+  descriptions say to act only on what a person has said for that one
+  finding; in harness, declare them as money tools ([harness/](harness/README.md))
+  and the gate asks every time, whatever the rules say.
+
+```
+$ paymcp change pay.ini paused:sub_gorse           # the finding, what would be done; nothing is changed
+$ STRIPE_WRITE_KEY=rk_test_... paymcp change pay.ini paused:sub_gorse --yes
+Done: collection on subscription sub_gorse is no longer paused. Its next invoice is collected again; invoices made while it was paused stay as they are.
+```
 
 ## The pay file
 
@@ -286,6 +432,17 @@ who = who.csv                     ; your own file (optional; relative to this fi
 [plans]                           ; a plan's name in your file = the price it means
 team = team_monthly               ; a price's id or lookup key
 pro = pro_monthly
+
+[disputes]
+; read = yes                      ; card disputes: those to answer, and those lost unanswered
+; days = 180                      ; how far back
+
+[letters]
+from = Ola at Fernhill            ; who a drafted message to a customer is from
+
+[changes]
+; allow = no                      ; yes: one thing at a time may be changed, with STRIPE_WRITE_KEY
+; max_amount = 0                  ; the most one change may be worth (smallest unit); 0: no limit here
 ```
 
 A setting the file doesn't have is refused with its line, a key in the
@@ -316,9 +473,11 @@ line, since a row half understood would give a wrong finding.
 
 ## What the agent can't do
 
-- Change anything in your billing account: there is no tool for it, the key can't, and every request is a GET.
-- See the key: it is in paymcp's environment, never in a tool's answer, the report or the record.
-- Widen what is read by asking: the reading tools take only `kind`, `limit`, `fresh`, `all` and `key`.
+- Change anything in your billing account, unless you turned changes on: without `[changes] allow = yes` and a second key there is no tool for it, the reading key can't, and every request is a GET.
+- With changes on: do anything but the one thing a finding names, for the amount you were shown. There is no tool that takes a payment, refunds, deletes, cancels, or sends evidence to a bank, and none that takes a customer or an amount of the agent's choosing.
+- Send a message: drafts are text. paymcp has no way to send mail.
+- See a key: both are in paymcp's environment, never in a tool's answer, the report or the record.
+- Widen what is read by asking: the reading tools take only `kind`, `limit`, `fresh`, `all`, `format`, `offset` and `key`.
 - Write anything but a decision: `billing_decide` adds one line to paymcp's record, about a finding the record already has, and a dismissal needs a reason. It is the one tool not marked as only reading, so a gate can ask before each use. A decision is yours: the tool's description tells the agent to write down only what you have said.
 
 Customers' names, addresses and invoice numbers are text other people
@@ -328,49 +487,18 @@ should still be given a gate that asks before it acts on a finding.
 
 ## With harness
 
-In `mcp.ini`:
-
-```ini
-[pay]
-command = /usr/local/bin/paymcp /path/to/pay.ini
-; stored with `harness secret add stripe`
-secret = STRIPE_KEY:stripe
-```
-
-harness asks before any MCP tool by default. Three of the four only read,
-so these lines in `rules` let them run unasked, if you want that.
-`billing_decide` is best left asked every time: it writes down a decision
-that is yours.
-
-```
-allow mcp pay/billing_audit *
-allow mcp pay/billing_finding *
-allow mcp pay/billing_record *
-```
-
-**Every Monday, by itself.** A schedule in `triggers.ini` and the same
-three lines for it in `rules` (a scheduled run has nobody to ask, so what
-isn't allowed there is refused, a decision among it):
-
-```ini
-[billing-audit]
-at = 09:00
-days = mon
-do = Run billing_audit with fresh set to true. Tell me what is new since the last reading and what is no longer found, each with its amount, then the three largest open findings with what is proposed. If nothing changed, say so in one line. Decide nothing yourself.
-```
-
-```
-[schedule:billing-audit]
-allow mcp pay/billing_audit *
-allow mcp pay/billing_finding *
-allow mcp pay/billing_record *
-[all]
-```
+[harness/](harness/README.md) has what makes this a job harness does for
+you: the server's section for `mcp.ini` (the key from harness's key
+store), the Money page, a reading every Monday, and the rules that let
+those read without a question while a decision, and any change, is still
+yours.
 
 Tried on 2026-11-27 on Windows, with a real model and the Stripe test
 account above: asked in conversation, harness asked once before the
 audit and the answer had the three largest findings with their amounts
-and proposals; run as the schedule, it reported with nobody asked.
+and proposals; run as the schedule, it reported with nobody asked. The
+Money page was seen working inside a harness started for the purpose,
+against the stand-in.
 
 In Claude Code: `claude mcp add --env STRIPE_KEY=... pay -- paymcp
 /path/to/pay.ini`. That stores the key in Claude Code's settings.
@@ -389,19 +517,25 @@ The tests cover the rules one by one, reading lists in pages of two and of
 a hundred, a provider that is busy (429) and one that refuses the key, a
 key without the meters, the record (what is new, gone, found again,
 dismissed and reopened; readings that could not have seen a finding; a
-file that isn't paymcp's), and the whole audit, the decisions and the
+file that isn't paymcp's), the drafts, the disputes and their evidence,
+each change (made once, stopped when the record is no longer as found,
+refused without the second key, and never anything sent to a bank), the
+Money page's files and calls, and the whole audit, the decisions and the
 record through the command line and over MCP against `paymcp-sim`.
 
 ## Limits
 
-- **Run against Stripe on one day, on a made-up business a few hours old** (2026-11-27, a test account, the sandbox's secret key). The lists, the expanded discount, the meters' event summaries, an invoice past due and a payment the test card refused read as the documentation says. Not yet tried: a restricted key (so the names of its permissions in [The key](#the-key) are from the documentation only), a live account, an account with years of history or more than one page of anything, and what the "how old" rules say of things that really are old.
+- **Run against Stripe on one day, on a made-up business a few hours old** (2026-11-27, a test account, the sandbox's secret key as both keys). The lists, the expanded discount, the meters' event summaries, an invoice past due, a payment the test card refused, three disputes from Stripe's test cards and each kind of change read and wrote as the documentation says. Not yet tried: a restricted key for reading or for changing (so the names of the permissions in [The key](#the-key) and [Changing things](#changing-things) are from the documentation only), a live account, an account with years of history or more than one page of anything, a real dispute from a real bank, and what the "how old" rules say of things that really are old.
+- Drafts are in English, and written by fixed rules: they say what the audit found and nothing warmer. Read them as a start.
+- The evidence draft has text only. Files (a log, a screenshot, a contract) are yours to add at the provider, and so is every sentence about delivery or use.
+- A change is from the next invoice on. Charging for the past, taking a failed payment again, refunding and cancelling are not done from here.
 - Amounts are at list price. A customer with a discount and too few seats shows both findings, and the seats are counted at the full price, so the two sums overlap.
 - A tiered or metered price has no single amount a month: such findings say "amount not known".
 - A subscription with two meters is skipped for "Use that was never reported": which meter your file's number belongs to isn't known.
 - A list is read to 200 pages (20,000 records at 100 a page); past that it is cut, and the report says so.
 - Days are UTC.
-- Not looked for yet: payments taken twice or refunded twice, disputes, taxes, trials that never convert, coupons past their redeem-by date.
-- It proposes; it does not fix. Changing a subscription, sending an invoice or reminding a customer is done in the dashboard, or from your own mail, by a person.
+- Not looked for yet: payments taken twice or refunded twice, early fraud warnings, taxes, trials that never convert, coupons past their redeem-by date.
+- Without changes turned on it proposes and does not fix: changing a subscription, sending an invoice or reminding a customer is done in the dashboard, or from your own mail, by a person.
 - "No longer found" is not "put right": a finding also goes when a "how old" setting, your price list or your own file changes. The record keeps what it was worth; what happened to it is yours to say.
 - The record is one file on one computer, written whole each time: two readings at the same moment from two programs can lose one's lines.
 
