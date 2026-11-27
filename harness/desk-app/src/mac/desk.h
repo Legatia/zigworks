@@ -43,9 +43,14 @@ void hdesk_ask_key(const char *title, const char *note);
 // an NSSecureTextField, 0 when no sheet is open, -1 in a build without
 // test hooks (which does nothing).
 int hdesk_test_key(int action);
-// Test hooks only (macOS): a real mouse click, down and up, on the page
-// element with this id. Does nothing in a build without test hooks.
+// Test hooks only: a real mouse click, down and up, on the page element
+// with this id (macOS: a system mouse event; Windows: the browser's own
+// input, through its DevTools protocol; Linux: button events put to GTK).
+// Does nothing in a build without test hooks.
 void hdesk_test_click(const char *id);
+// Test hooks only, Windows and Linux: the same with the mouse's other
+// button, which would open the web view's own menu if it had one.
+void hdesk_test_menu_click(const char *id);
 
 // A sheet on the window with one OK button.
 void hdesk_alert(const char *title, const char *text);
@@ -81,6 +86,13 @@ int hdesk_on_media(const char *proto, const char *host, int port, int main_frame
 void hdesk_on_menu(int item);
 void hdesk_on_key(const char *buf, int len);
 void hdesk_on_crashed(void);
+// Linux: whether the pages' process runs in WebKit's sandbox (it doesn't
+// where bubblewrap can't make a user namespace). Called once, before the
+// window is ready.
+void hdesk_on_sandbox(int on);
+// Windows and Linux: something the layer did on its own, for the test
+// log ("alert desk", "file chooser", "menu kept shut").
+void hdesk_on_native(const char *what);
 // macOS: another start on this data folder asked for the window, and it
 // was shown (Windows and Linux bring it to the front themselves)
 void hdesk_on_reopen(void);

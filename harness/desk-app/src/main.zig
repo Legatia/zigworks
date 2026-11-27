@@ -43,6 +43,7 @@ const sys = struct {
     extern fn hdesk_ask_key(title: [*:0]const u8, note: [*:0]const u8) void;
     extern fn hdesk_test_key(action: c_int) c_int;
     extern fn hdesk_test_click(id: [*:0]const u8) void;
+    extern fn hdesk_test_menu_click(id: [*:0]const u8) void;
     extern fn hdesk_alert(title: [*:0]const u8, text: [*:0]const u8) void;
     extern fn hdesk_post_main(f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
     extern fn hdesk_every(seconds: f64, f: *const fn (?*anyopaque) callconv(.c) void, arg: ?*anyopaque) void;
@@ -737,6 +738,18 @@ export fn hdesk_on_reopen() void {
     log("shown again", .{});
 }
 
+/// Linux: whether the pages' process runs in WebKit's sandbox.
+export fn hdesk_on_sandbox(on: c_int) void {
+    log("sandbox {s}", .{if (on != 0) "on" else "off"});
+}
+
+/// Something the system's layer did on its own, for the test log: a
+/// script's dialog it answered ("alert desk", "confirm frame"), a file
+/// chooser it showed, a menu it kept shut, a runtime it refused.
+export fn hdesk_on_native(what: [*:0]const u8) void {
+    log("native {s}", .{std.mem.span(what)});
+}
+
 export fn hdesk_on_crashed() void {
     log("crashed", .{});
     dispatch(.crashed);
@@ -788,9 +801,8 @@ fn onHooks(_: ?*anyopaque) callconv(.c) void {
             const secure = sys.hdesk_test_key(if (k == .fill) 1 else 0);
             log("key-sheet {t} secure={d}", .{ k, secure });
         },
-        .click => |id| if (comptime @import("builtin").os.tag == .macos) {
-            sys.hdesk_test_click(z(a, id));
-        } else log("unknown click {s}", .{id}),
+        .click => |id| sys.hdesk_test_click(z(a, id)),
+        .menu_click => |id| if (comptime @import("builtin").os.tag != .macos) sys.hdesk_test_menu_click(z(a, id)),
         .nothreads => |n| no_threads = n,
         .nomemory => |n| no_memory = n,
         .quit => sys.hdesk_quit(),

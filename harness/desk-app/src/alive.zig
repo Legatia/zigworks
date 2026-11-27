@@ -48,7 +48,22 @@ const ws = struct {
     extern "ws2_32" fn WSAPoll(fds: [*]pollfd, n: c_ulong, timeout_ms: c_int) callconv(.winapi) c_int;
     extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
+    extern "ws2_32" fn WSASocketW(af: c_int, kind: c_int, proto: c_int, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) SOCKET;
+    extern "kernel32" fn GetHandleInformation(h: SOCKET, flags: *u32) callconv(.winapi) c_int;
+    const WSA_FLAG_OVERLAPPED: u32 = 0x01;
+    const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+
     var started: std.atomic.Value(bool) = .init(false);
+
+    /// A TCP socket that what the app starts doesn't get a copy of. One
+    /// made by socket() can be inherited, and the programs the app starts
+    /// are started with handles inherited (std's spawn): `harness run`,
+    /// started while a check was under way, would keep the check's socket
+    /// for as long as it runs.
+    fn own() SOCKET {
+        return WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, null, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+    }
 
     fn ready(s: SOCKET, events: i16, deadline: i64) bool {
         const left = deadline - nowMs();
@@ -66,9 +81,7 @@ fn checkWindows(port: u16, timeout_ms: u32) !bool {
         if (ws.WSAStartup(0x0202, &data) != 0) return error.NoSocket;
         ws.started.store(true, .release);
     }
-    // (a socket made by socket() is not inherited by what the app starts
-    // unless handed over, so there is no close-on-exec to set)
-    const s = ws.socket(ws.AF_INET, ws.SOCK_STREAM, ws.IPPROTO_TCP);
+    const s = ws.own();
     if (s == ws.INVALID_SOCKET) return error.NoSocket;
     defer _ = ws.closesocket(s);
     var on: c_ulong = 1;
@@ -322,6 +335,18 @@ test "the_answer_is_read_as_it_comes" {
     try t.expectEqual(Answer.no, answer("HTTP/1.1 2000 OK\r\n"));
     // the word in a header is not the answer
     try t.expectEqual(Answer.more, answer("HTTP/1.1 200 OK\r\nserver: harness\r\n"));
+}
+
+test "the_checks_socket_is_not_inherited_by_what_the_app_starts_windows" {
+    if (!is_windows) return error.SkipZigTest;
+    // (a check first: it starts Winsock)
+    _ = check(1, 50);
+    const s = ws.own();
+    try std.testing.expect(s != ws.INVALID_SOCKET);
+    defer _ = ws.closesocket(s);
+    var flags: u32 = 0xffff_ffff;
+    try std.testing.expect(ws.GetHandleInformation(s, &flags) != 0);
+    try std.testing.expectEqual(0, flags & ws.HANDLE_FLAG_INHERIT);
 }
 
 test "nothing_listening_is_not_alive" {

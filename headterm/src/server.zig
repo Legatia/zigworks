@@ -102,6 +102,10 @@ fn nowMs() i64 {
     return sys.milliTimestamp();
 }
 
+/// What `send` answers when its hold for the program's first output ended
+/// with none.
+pub const sent_unseen = "sent before the program printed anything (a program that drops what was typed ahead loses these keys: wait for its first text, then send)";
+
 /// How long `--settle` waits for a program to print anything after keys were
 /// sent, before taking the keys to have no visible effect.
 const settle_grace_ms = 500;
@@ -692,8 +696,15 @@ const Session = struct {
         }
         // Keys sent before a just-started program has drawn anything can be
         // lost (some programs flush typeahead) or misread, so hold them until
-        // its first output has settled.
-        if (!self.output_seen and nowMs() - self.started_ms < 5_000) try self.settleFirstOutput(2_000);
+        // its first output has settled. The hold has an end (a program
+        // that prints nothing must get its keys too): when it ends with
+        // nothing printed, the answer says so, since these keys are the
+        // ones a slow starter can lose.
+        var unseen = false;
+        if (!self.output_seen and nowMs() - self.started_ms < 5_000) {
+            try self.settleFirstOutput(2_000);
+            unseen = !self.output_seen;
+        }
 
         self.last_send_ms = nowMs();
         self.output_since_send = false;
@@ -706,10 +717,12 @@ const Session = struct {
         }
         try self.queueInput(bytes.items[from..]);
         self.flushInput();
-        if (renamed.items.len == 0) return respond(fd, .ok, "");
+        if (renamed.items.len == 0 and !unseen) return respond(fd, .ok, "");
         var note: std.Io.Writer.Allocating = .init(self.gpa);
         defer note.deinit();
-        try note.writer.print("sent as keys: {s} (--literal sends such words as text)\n", .{renamed.items});
+        if (renamed.items.len > 0) try note.writer.print("sent as keys: {s} (--literal sends such words as text)", .{renamed.items});
+        if (unseen) try note.writer.print("{s}" ++ sent_unseen, .{if (renamed.items.len > 0) "; " else ""});
+        try note.writer.writeByte('\n');
         respond(fd, .ok, note.written());
     }
 

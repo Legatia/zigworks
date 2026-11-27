@@ -162,9 +162,14 @@ jobs:
           $sig = Get-AuthenticodeSignature $setup
           if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "the installer isn't signed by Microsoft: $($sig.Status)" }
           Start-Process -FilePath $setup -ArgumentList '/silent', '/install' -Wait
+      # the smoke's setup runs once against the stand-in and once against
+      # this harness (a data folder and secrets of its own), whose provider
+      # is harness-fake: a message typed in the desk is answered through it,
+      # and no real model is called (as the macOS job)
       - run: |
           set -o pipefail
-          zig build smoke -Dwebview2="$RUNNER_TEMP/webview2" 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+          (cd .. && zig build)
+          DESK_SMOKE_HARNESS="$PWD/../zig-out/bin/harness.exe" DESK_SMOKE_FAKE="$PWD/../zig-out/bin/harness-fake.exe" zig build smoke -Dwebview2="$RUNNER_TEMP/webview2" 2>&1 | tee -a "$RUNNER_TEMP/test.log"
       - if: failure()
         run: |
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
@@ -184,10 +189,23 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.17.1
-      # WebKitGTK starts its web process in a bubblewrap sandbox, which needs
-      # user namespaces (restricted on Ubuntu's runners, as for harness)
+      # The app asks WebKitGTK to run its web process in a bubblewrap sandbox
+      # wherever bubblewrap can make a user namespace (linux/desk.c,
+      # sandbox_works), and the smoke requires "sandbox on". Ubuntu's runners
+      # restrict user namespaces, as stock Ubuntu 24.04 does: what the app's
+      # own probe gets there is said first, as a notice on the run, then the
+      # restriction is lifted for the tests. (The smoke also starts the app
+      # once with a bubblewrap that fails, for "sandbox off".)
+      # gstreamer1.0-plugins-bad: WebKitGTK only suggests it, and without it
+      # the page has no recorder (the desk's microphone button); with it the
+      # smoke records a tone, and what the recorder said is a notice too.
       - run: |
-          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends libgtk-3-dev libwebkit2gtk-4.1-dev xvfb bubblewrap gstreamer1.0-plugins-bad
+          if bwrap --unshare-user --unshare-pid --ro-bind / / true 2> /dev/null; then
+            echo "::notice::desk-app (Linux): with the runner's own settings bubblewrap makes a user namespace: the pages would be sandboxed"
+          else
+            echo "::notice::desk-app (Linux): with the runner's own settings bubblewrap can't make a user namespace: the pages would run unsandboxed (the app says sandbox off)"
+          fi
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: |
           set -o pipefail
@@ -197,9 +215,17 @@ jobs:
       - run: sh ../scripts/test-desk-assets.sh
       - run: sh ../scripts/pack-desk-assets.sh "$RUNNER_TEMP/desk-assets"
       - run: DESK_ASSETS="$RUNNER_TEMP/desk-assets" scripts/package-linux.sh 0.0.0 "$RUNNER_TEMP/harness-desk-ci-linux-x86_64.tar.gz"
+      # (against the stand-in, then against this harness with harness-fake
+      # as its provider, as the macOS and Windows jobs)
       - run: |
           set -o pipefail
-          GDK_BACKEND=x11 zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+          (cd .. && zig build)
+          DESK_SMOKE_HARNESS="$PWD/../zig-out/bin/harness" DESK_SMOKE_FAKE="$PWD/../zig-out/bin/harness-fake" GDK_BACKEND=x11 zig build smoke 2>&1 | tee -a "$RUNNER_TEMP/test.log"
+      - if: always()
+        run: |
+          grep -a -E "^# the recorder|a recording comes out" "$RUNNER_TEMP/test.log" | head -3 | while IFS= read -r line; do
+            echo "::notice::desk-app (Linux): ${line:0:300}"
+          done
       - if: failure()
         run: |
           grep -a -E "not ok|FAIL|failed|error:" "$RUNNER_TEMP/test.log" | grep -v "^::error::" | head -12 | while IFS= read -r line; do
