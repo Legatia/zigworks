@@ -992,6 +992,9 @@ const Fix = struct {
     move_to: []const u8 = "",
     web: Web,
     browser: []const u8,
+    /// What the last `act` answered, for `session` to print when the
+    /// browser is gone.
+    last: []const u8 = "",
 
     fn init(f: *Fix, logins_ini: []const u8) !void {
         try f.e.init();
@@ -1003,6 +1006,7 @@ const Fix = struct {
         f.asked = .empty;
         f.refuse = "";
         f.move_to = "";
+        f.last = "";
         f.store = .{ .dir = try std.fs.path.join(a, &.{ f.e.dir, "secrets" }) };
         try f.e.tmp.dir.createDirPath(t.io, "profiles");
         try f.e.tmp.dir.createDirPath(t.io, "tmp");
@@ -1029,7 +1033,7 @@ const Fix = struct {
         const f: *Fix = @ptrCast(@alignCast(ctx));
         f.asked.print(t.allocator, "{s} {s}\n", .{ @tagName(tool), arg }) catch {};
         if (tool == .login and f.move_to.len > 0) {
-            f.web.s.?.navigate(arena, f.move_to) catch {};
+            if (f.web.s) |s| s.navigate(arena, f.move_to) catch {};
             f.move_to = "";
         }
         if (std.mem.eql(u8, f.refuse, @tagName(tool))) return "denied by the owner";
@@ -1051,7 +1055,19 @@ const Fix = struct {
     }
 
     fn act(f: *Fix, json: []const u8) !Output {
-        return f.web.run(f.e.arena.allocator(), json);
+        const out = try f.web.run(f.e.arena.allocator(), json);
+        f.last = out.text;
+        return out;
+    }
+
+    /// The browser's session. With no browser (an `open` that failed, or
+    /// one that was closed) the test fails with what the last action
+    /// answered, where `f.web.s.?` would stop the whole test run on a null.
+    fn session(f: *Fix) !*cdp.Session {
+        return f.web.s orelse {
+            std.debug.print("\nno browser session; the last action answered:\n{s}\n", .{f.last});
+            return error.NoBrowserSession;
+        };
     }
 
     fn openJson(f: *Fix, name: []const u8, login: ?[]const u8) ![]const u8 {
@@ -1061,7 +1077,7 @@ const Fix = struct {
     }
 
     fn eval(f: *Fix, expr: []const u8) ![]const u8 {
-        return f.web.s.?.evaluate(f.e.arena.allocator(), expr);
+        return (try f.session()).evaluate(f.e.arena.allocator(), expr);
     }
 
     fn stored(f: *Fix, name: []const u8) !?[]u8 {
@@ -1281,11 +1297,11 @@ test "web_fill_script_refuses_a_page_that_lies_about_its_host" {
     const a = f.e.arena.allocator();
     const here = try std.fmt.allocPrint(a, "localhost:{d}", .{f.e.server.port});
     for ([_][2][]const u8{ .{ "example.com", here }, .{ "calhost", here }, .{ "localhost", "localhost:1" } }) |c| {
-        const r = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{c[0]}, null, c[1]));
+        const r = try (try f.session()).evaluateIsolated(a, try fillScript(a, 1, "must-not-arrive", &.{c[0]}, null, c[1]));
         try t.expect(std.mem.startsWith(u8, r, "\"wrong-site http://localhost:"));
     }
     try t.expectEqualStrings("\"\"", try f.eval("document.getElementById('pw').value"));
-    const ok = try f.web.s.?.evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null, here));
+    const ok = try (try f.session()).evaluateIsolated(a, try fillScript(a, 1, "fine", &.{"localhost"}, null, here));
     try t.expectEqualStrings("\"ok\"", ok);
     try t.expectEqualStrings("\"fine\"", try f.eval("document.getElementById('pw').value"));
 }
@@ -1409,7 +1425,7 @@ test "web_passkey_made_just_before_close_is_kept" {
     _ = try f.act(try f.openJson("pk.html", "p"));
     const a = f.e.arena.allocator();
     // made by the page after the last action's read-back (a script, a timer)
-    _ = try f.web.s.?.evaluate(a, "document.getElementById('reg').click()");
+    _ = try (try f.session()).evaluate(a, "document.getElementById('reg').click()");
     var tries: u32 = 0;
     while (tries < 40) : (tries += 1) {
         if (std.mem.eql(u8, try f.eval("document.getElementById('out').textContent"), "\"registered\"")) break;
@@ -1458,17 +1474,17 @@ test "web_passkey_for_another_site_is_removed" {
     const a = f.e.arena.allocator();
     // a credential for another site, put there behind harness's back
     // (with a real key: one the security key made for this page)
-    _ = try f.web.s.?.evaluate(a, "document.getElementById('reg').click()");
+    _ = try (try f.session()).evaluate(a, "document.getElementById('reg').click()");
     var tries: u32 = 0;
     const made = while (tries < 40) : (tries += 1) {
-        const got = try f.web.s.?.call(a, "WebAuthn.getCredentials", try std.fmt.allocPrint(a, "{{\"authenticatorId\":\"{s}\"}}", .{f.web.auth_id}));
+        const got = try (try f.session()).call(a, "WebAuthn.getCredentials", try std.fmt.allocPrint(a, "{{\"authenticatorId\":\"{s}\"}}", .{f.web.auth_id}));
         const cs = jv.arr(jv.get(got, "credentials")).?;
         if (cs.len > 0) break cs[0];
         t.io.sleep(.fromMilliseconds(50), .awake) catch {};
     } else return error.TestUnexpectedResult;
     const key = jv.str(jv.get(made, "privateKey")).?;
     const params = try std.fmt.allocPrint(a, "{{\"authenticatorId\":\"{s}\",\"credential\":{{\"credentialId\":\"ZXZpbC1jcmVk\",\"isResidentCredential\":true,\"rpId\":\"example.com\",\"privateKey\":\"{s}\",\"userHandle\":\"dXNlcg==\",\"signCount\":0}}}}", .{ f.web.auth_id, key });
-    _ = try f.web.s.?.call(a, "WebAuthn.addCredential", params);
+    _ = try (try f.session()).call(a, "WebAuthn.addCredential", params);
     const r = try f.act("{\"action\":\"read\"}");
     try expectHas(r.text, "A passkey for example.com was removed");
     try expectHas(f.notes.items, "web passkey removed p example.com");
@@ -1476,7 +1492,7 @@ test "web_passkey_for_another_site_is_removed" {
     const saved = try logins.decode(a, (try f.stored("login-p-passkeys")).?);
     try t.expectEqual(1, saved.len);
     try t.expectEqualStrings("localhost", saved[0].rp_id);
-    const left = try f.web.s.?.call(a, "WebAuthn.getCredentials", try std.fmt.allocPrint(a, "{{\"authenticatorId\":\"{s}\"}}", .{f.web.auth_id}));
+    const left = try (try f.session()).call(a, "WebAuthn.getCredentials", try std.fmt.allocPrint(a, "{{\"authenticatorId\":\"{s}\"}}", .{f.web.auth_id}));
     const lc = jv.arr(jv.get(left, "credentials")).?;
     try t.expectEqual(1, lc.len);
     try t.expectEqualStrings("localhost", jv.str(jv.get(lc[0], "rpId")).?);
@@ -1679,7 +1695,7 @@ test "web_shows_no_dialog_text_from_a_host_not_allowed" {
 /// The page targets the browser has now.
 fn pageTargets(f: *Fix) !usize {
     const a = f.e.arena.allocator();
-    const got = try f.web.s.?.callIn(a, "Target.getTargets", "{}", null);
+    const got = try (try f.session()).callIn(a, "Target.getTargets", "{}", null);
     var n: usize = 0;
     for (jv.arr(jv.get(got, "targetInfos")) orelse &.{}) |ti| {
         if (std.mem.eql(u8, jv.str(jv.get(ti, "type")) orelse "", "page")) n += 1;
@@ -1697,7 +1713,7 @@ test "web_closes_a_new_tab_before_it_loads_and_says_where_it_went" {
     try f.page("tab.html", "<html><body><script>localStorage.setItem('tab', 'loaded')</script></body></html>");
     _ = try f.act(try f.openJson("opener.html", null));
     // as a person's click would (a popup needs one)
-    _ = try f.web.s.?.call(a, "Runtime.evaluate", "{\"expression\":\"document.getElementById('b').click()\",\"userGesture\":true}");
+    _ = try (try f.session()).call(a, "Runtime.evaluate", "{\"expression\":\"document.getElementById('b').click()\",\"userGesture\":true}");
     var tries: u32 = 0;
     var r = try f.act("{\"action\":\"read\"}");
     var said: std.ArrayList(u8) = .empty;
@@ -1715,7 +1731,7 @@ test "web_closes_a_new_tab_before_it_loads_and_says_where_it_went" {
     try f.page("more.html", "<html><body><a id=\"l\" target=\"_blank\" href=\"/page/tab.html?from=link\">link</a><button id=\"e\" onclick=\"window.open()\">empty</button></body></html>");
     _ = try f.act(try f.openJson("more.html", null));
     for ([_][]const u8{ "l", "e" }) |id| {
-        _ = try f.web.s.?.call(a, "Runtime.evaluate", try std.fmt.allocPrint(a, "{{\"expression\":\"document.getElementById('{s}').click()\",\"userGesture\":true}}", .{id}));
+        _ = try (try f.session()).call(a, "Runtime.evaluate", try std.fmt.allocPrint(a, "{{\"expression\":\"document.getElementById('{s}').click()\",\"userGesture\":true}}", .{id}));
         t.io.sleep(.fromMilliseconds(500), .awake) catch {};
     }
     const r2 = try f.act("{\"action\":\"read\"}");
@@ -1866,10 +1882,10 @@ test "web_waits_for_a_load_under_way_when_the_page_is_read" {
     _ = try f.act(try f.openJson("here.html", null));
     // a load that starts later than an action waits for one (a script's
     // timer), still under way when the page is read
-    _ = try f.web.s.?.evaluate(a, "setTimeout(() => { location.href = '/page/late.html'; }, 0)");
+    _ = try (try f.session()).evaluate(a, "setTimeout(() => { location.href = '/page/late.html'; }, 0)");
     var tries: u32 = 0;
-    while (!f.web.s.?.inbox.loading(t.io).busy and tries < 100) : (tries += 1) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
-    try t.expect(f.web.s.?.inbox.loading(t.io).busy);
+    while (!(try f.session()).inbox.loading(t.io).busy and tries < 100) : (tries += 1) t.io.sleep(.fromMilliseconds(10), .awake) catch {};
+    try t.expect((try f.session()).inbox.loading(t.io).busy);
     const r = try f.web.after(a, "");
     try expectHas(r.text, "Title: Arrived");
     try expectHas(r.text, "and all of it");
@@ -1905,7 +1921,7 @@ test "web_snapshot_never_shows_a_host_the_gate_did_not_allow" {
     _ = try f.act(try f.openJson("here.html", null));
     // the page moves to another host behind the tool's back (as between
     // the host check and the snapshot)
-    try f.web.s.?.navigate(a, try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/page/there.html", .{f.e.server.port}));
+    try (try f.session()).navigate(a, try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/page/there.html", .{f.e.server.port}));
     f.refuse = "web";
     const text = f.web.snapshot(a, "") catch "";
     try t.expect(!has(text, "secret page text"));

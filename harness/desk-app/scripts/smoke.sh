@@ -375,6 +375,29 @@ expect_again "ask key Anthropic key" 2 "Replace the key asks for it"
 cmd "key fill"
 expect_again "store $OWN secret add anthropic --stdin --home $H" 2 "and stores it again"
 if wait_count "$H/fake.log" "enter ok" $((enters + 3)) 15; then ok "then the desk again"; else not_ok "then the desk again"; fi
+# the private model: a server of one's own that takes no key
+setups=$(count "$T/log" "show setup")
+cmd "menu provider"
+wait_page $((setups + 1))
+probe private "[document.getElementById('private-title').textContent, document.getElementById('pmodel').value, document.getElementById('purl').value, document.getElementById('warn-private').hidden].join('|')"
+expect_probe "Private model|||true" "Provider and key… has the private model, none set"
+cmd "js $(js_set pmodel llama3.1:8b) $(js_set purl http://192.168.1.20:11434/v1) document.getElementById('purl').dispatchEvent(new Event('input'));"
+probe pwarn "[document.getElementById('warn-private').hidden, document.getElementById('bubble-private').hidden].join('|')"
+expect_probe "false|true" "http:// to another computer is warned about on the page"
+cmd "js document.getElementById('i-private').click()"
+probe pinfo "[document.getElementById('bubble-private').hidden, document.getElementById('i-private').getAttribute('aria-expanded')].join('|')"
+expect_probe "false|true" "the i opens what a private model is"
+cmd "js $(js_set purl http://127.0.0.1:11434/v1) $js_continue"
+expect_log "step $OWN config set model.provider anthropic model.model claude-opus-4-8-x provider local.api openai provider local.url http://127.0.0.1:11434/v1 provider local.auth none model.private_model local:llama3.1:8b --home $H" "the private model is written with its section, in the same call"
+if wait_count "$H/fake.log" "enter ok" $((enters + 4)) 15; then ok "then the desk again"; else not_ok "then the desk again"; fi
+if [ "$(count "$T/log" "ask key")" = $((asks + 1)) ]; then ok "no key is asked for it"; else not_ok "no key is asked for it"; fi
+setups=$(count "$T/log" "show setup")
+cmd "menu provider"
+wait_page $((setups + 1))
+probe private2 "[document.getElementById('pmodel').value, document.getElementById('purl').value.replace(/\\//g, ' '), document.getElementById('papi').value].join('|')"
+expect_probe "llama3.1:8b|http:  127.0.0.1:11434 v1|openai" "and is there the next time"
+cmd "js document.getElementById('cancel').click()"
+if wait_count "$H/fake.log" "enter ok" $((enters + 5)) 15; then ok "Cancel goes back to the desk"; else not_ok "Cancel goes back to the desk"; fi
 
 cmd "menu stop"
 expect_log "run $OWN stop --home $H" "Stop harness runs harness stop"
@@ -587,7 +610,15 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     wait_page 3
     probe real "[document.getElementById('provider').value, document.getElementById('model').value, document.getElementById('api').value].join('|')"
     expect_probe "other|smoke-model|openai" "real harness: the form has them"
-    cmd "js document.getElementById('cancel').click()"
+    # a private model on a dead local address: written, never called
+    desks=$(count "$T/log" "finish http://127.0.0.1:")
+    cmd "js $(js_set pmodel smoke-private) $(js_set purl http://127.0.0.1:9/v1) $js_continue"
+    wait_count "$T/log" "finish http://127.0.0.1:" $((desks + 1)) 30
+    if [ "$("$OWN" config get model.private_model --home "$REAL_HOME")" = local:smoke-private ] && [ "$("$OWN" config get "provider local.url" --home "$REAL_HOME")" = http://127.0.0.1:9/v1 ] && [ "$("$OWN" config get "provider local.auth" --home "$REAL_HOME")" = none ]; then
+        ok "real harness: config.ini has the private model and its keyless section"
+    else
+        not_ok "real harness: config.ini has the private model and its keyless section ($(grep -F "step " "$T/log" | tail -1))"
+    fi
     cmd "menu stop"
     expect_log "run $OWN stop --home $REAL_HOME" "real harness: Stop"
     expect_log "show down" "real harness: it stops" 30

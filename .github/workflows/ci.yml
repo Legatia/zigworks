@@ -2,7 +2,19 @@ name: CI
 
 on:
   push:
+    # branches only: a tag names a commit a branch's run already tested.
+    # harness-logins is always pushed together with main, at the same commit
+    branches-ignore: [harness-logins]
   pull_request:
+
+# One run per branch at a time. A branch's push and its pull request's run
+# share a group (the later one stays), and a newer push replaces an older
+# commit's run; on main a run that has started is left to finish. Without
+# this each push to a branch with a pull request made two full runs, and the
+# macOS jobs of later pushes waited hours behind them.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

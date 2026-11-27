@@ -479,7 +479,13 @@ pub const Controller = struct {
         c.screen = .setup;
         c.note = f.note;
         c.entered_port = null;
-        try fx.add(.{ .show = .{ .screen = .setup, .note = f.note, .view = .{ .mode = f.mode, .form = f.form, .busy = f.step != null } } });
+        try fx.add(.{ .show = .{ .screen = .setup, .note = f.note, .view = .{
+            .mode = f.mode,
+            .form = f.form,
+            .busy = f.step != null,
+            .private_owned = setup.privateOwned(f.before),
+            .private_in_use = if (f.before) |b| b.private_model else "",
+        } } });
     }
 
     /// [Continue]: the form's own problems first, then `harness init`
@@ -657,6 +663,8 @@ fn copyForm(a: std.mem.Allocator, f: setup.Form) !setup.Form {
     var out = f;
     out.model = try a.dupe(u8, f.model);
     out.url = try a.dupe(u8, f.url);
+    out.private_model = try a.dupe(u8, f.private_model);
+    out.private_url = try a.dupe(u8, f.private_url);
     return out;
 }
 
@@ -1466,6 +1474,36 @@ fn toChange(r: *Rig, in_use: setup.InUse) ![]const Effect {
     };
     try t.expectEqualStrings(own_bin, rc.?.binary);
     return r.ev(.{ .read = .{ .gen = rc.?.gen, .ok = true, .in_use = in_use } });
+}
+
+test "provider_and_key_shows_and_writes_the_private_model" {
+    var r: Rig = .initOwn(own_bin);
+    defer r.deinit();
+    const fx = try toChange(&r, .{ .provider = "openrouter", .model = "x/y", .private_model = "local:llama3.1:8b", .private_api = "openai", .private_url = "http://127.0.0.1:11434/v1", .private_auth = "none" });
+    const v = viewOf(fx).?;
+    try t.expect(v.private_owned);
+    try t.expectEqualStrings("llama3.1:8b", v.form.private_model);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", v.form.private_url);
+    // [Continue] with another model: one `harness config set`, no key asked for
+    const go = try builtin(&r, .{ .setup = .{ .provider = .openrouter, .model = "x/y", .private_model = "qwen2:7b", .private_url = "http://127.0.0.1:11434/v1" } });
+    var argv: ?[]const []const u8 = null;
+    for (go) |f| if (f == .step) {
+        argv = f.step.argv;
+    };
+    var at: ?usize = null;
+    for (argv.?, 0..) |w, i| if (std.mem.eql(u8, w, "model.private_model")) {
+        at = i;
+    };
+    try t.expectEqualStrings("local:qwen2:7b", argv.?[at.? + 1]);
+    try t.expectEqual(@as(usize, 0), count(go, .ask_key));
+
+    // config.ini's own: shown as it is, and [Continue] leaves it
+    var r2: Rig = .initOwn(own_bin);
+    defer r2.deinit();
+    const v2 = viewOf(try toChange(&r2, .{ .provider = "openrouter", .model = "x/y", .private_model = "anthropic:claude-x" })).?;
+    try t.expect(!v2.private_owned);
+    try t.expectEqualStrings("anthropic:claude-x", v2.private_in_use);
+    try t.expectEqualStrings("", v2.form.private_model);
 }
 
 test "provider_and_key_reads_the_values_in_use" {

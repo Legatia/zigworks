@@ -20,7 +20,36 @@ You asked for a line on what happens when someone downloads and runs it. The own
 
 Not done, so not known from the released package: anything after Save (I don't type keys): harness set up and started, the one-time code, the desk itself, the 3D head with the packaged fit files. The default data folder (`%LOCALAPPDATA%\harness`) was not used: this machine has none, and I didn't make the owner one. The first-run warning, as said.
 
+This is 0.4.0 as released. 0.4.1 and the private model part of "Provider and key…" were not run here. This branch changes this file only, nothing of the setup screen: your note below expected a conflict there, and there is none.
+
 One thing to look at, not judged: the setup offers `claude-opus-4-8` as Anthropic's model. The owner's trial ran on `claude-sonnet-5-5` and `claude-haiku-5-5`; whether the offered default still answers was not tried.
+
+## For you: CI runs once per branch; the private model is in "Provider and key…" (2026-11-27, night)
+
+- **CI changed, and it changes what you see on your branches.** `ci.yml` has a `concurrency` group per branch:
+  - a branch's push and its pull request's run are one group, so each push to a branch with a pull request gives one run, not two; the other shows as cancelled beside it. That is the group, not a failure;
+  - a newer push to a branch cancels the older commit's run, also one that already started. Push when you want that commit tested; three pushes in a minute test the last one;
+  - on `main` a started run finishes; only a waiting one is replaced;
+  - nothing runs for `harness-logins` (always pushed with `main`) or for tags.
+  - Why: the runs for one commit of mine waited over an hour without starting, behind two full runs for each push to `platform/payrun`, `platform/money-jobs` and `platform/desk-first-run`. If the group gets in your way, say so here.
+- The desk app's "Provider and key…" has a part "Private model" (Model, Address, Format) for a keyless server of the owner's own; Continue adds `provider local.api`, `provider local.url`, `provider local.auth none` and `model.private_model local:MODEL` to the same `harness config set` call. It is all in the shared Zig (`setup.zig`, `pages.zig`, `bridge.zig`, `controller.zig`, `main.zig`): nothing for `windows/desk.c` or `linux/desk.c`. The rules are in `docs/superpowers/specs/2026-11-27-harness-private-model-design.md`, "In the desk app's setup screen".
+  - "Provider and key…" now reads eleven settings after `model.provider` (`setup.read_count`), four of them new; they answer empty when unset, with the stand-in and with a real harness.
+  - `smoke-other.sh` is not changed and its expectations hold (no private model: the argv is what it was). If you want the same checks on your platforms, `scripts/smoke.sh` has them after the "Replace the key" part and at the end of the real-harness part; the ids are `pmodel`, `purl`, `papi`, `i-private`, `bubble-private`, `warn-private`.
+  - `platform/desk-first-run` touches the same screen's first setup: the private part is written only in "Provider and key…" (`privateRows` in `pages.zig`, called for the change mode). Take `main` in before its pull request; a conflict there is mine to help with, say so here.
+- `harness-v0.4.1` is tagged on this commit when its run on `main` is green.
+
+## For you: 0.4.0 was run from its release on macOS; 0.4.1 follows (2026-11-27, evening)
+
+- The owner: "Just do everything necessary to make sure this product works well." The released macOS harness and desk app were downloaded and run (the smoke against the released binary: 183 ok); the Linux arm64 archive was only read. Nobody has run the released Windows or Linux packages yet: still yours if you have a moment, a line here is enough.
+- The proxy met two real agents. Claude Code 2.1.322 connected to 0.4.0 as it is. Hermes 0.21.3 was refused: the MCP Python SDK sends `MCP-Protocol-Version: 2025-11-25` on `initialize` itself. `mcpserve.zig` now judges that header after the method is known and lets `initialize` through (the answer names the version harness speaks); every other method with a foreign version is 400 as before. Codex was not tried.
+- Two changes in the desk page, files you also build on (`src/desk/index.html`, `desk.js`, `desk.css`):
+  - Send is `disabled` in the page as served and `desk.js` enables it once the form's handler is there. If a smoke of yours clicks Send or submits the form right after the page shows, wait for the button to be enabled (or for the page's first message to the shell, as the macOS smoke does).
+  - The conversation may be 34vh tall (22vh before; your "five lines"), and `.chat` shrinks before the stage does. Your shells need nothing for it; say so here if it looks wrong at your window sizes.
+- `web.zig`'s test fixture has `f.session()` in place of `f.web.s.?`: a browser test whose browser is gone fails with "no browser session; the last action answered: …" and no longer crashes on null. A new test of yours in that file: use `try f.session()`.
+- With a bot token stored and nobody paired, a message written on the desk was answered as a "Not delivered" item. Now, once the owner has written on the desk in this run (`Core.desk_written`), a post Telegram refuses with `error.NotPaired` in a conversation the desk shows is delivered to the desk (`DeskTee.unpaired` in `core.zig`), a reply with buttons as its text without them (`sendWithButtons`). Files and approvals are as before. All in `core.zig`; nothing for the shells.
+- `test (windows-latest, calmcp)` failed on `main` for 7b10e54: "The hosted runner lost communication with the server", no log. If you see it again on your side, say so here.
+- The README says the binary is "about 8 MB stripped" (it said 1.9 and 2.3 MB).
+- 0.4.1 is these fixes and the private model part below; the version in both `build.zig.zon` files is 0.4.1. Take `main` into `platform/money` before its pull request.
 
 ## For you: harness 0.4.0 is tagged (2026-11-27, after the browser job)
 

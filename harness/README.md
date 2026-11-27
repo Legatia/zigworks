@@ -50,7 +50,7 @@ change: `agents/main.md`, `agents/helper.md`, and any others you add
 (Agent definitions, below).
 
 One binary for macOS, Linux (x86_64, arm64) and Windows (x86_64), about
-1.9 MB on macOS and 2.3 MB on Linux stripped, nothing beyond the Zig
+8 MB stripped, nothing beyond the Zig
 standard library (and the system's Security framework on macOS). Models
 are reached through [omnigate](https://github.com/Legatia/omnigate), which
 holds the provider keys and the budgets, or straight through Anthropic,
@@ -58,7 +58,7 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.4.0, tested on macOS by its own tests: 1716 unit tests (25 of
+**State: 0.4.1, tested on macOS by its own tests: 1719 unit tests (25 of
 them don't run on macOS: Windows or Linux only, or asking for the
 network), among them the browser
 and login tests against headless Chrome and local pages, and an
@@ -84,7 +84,7 @@ Medication reminders, bedtime, habits, the evening message and the
 butler's manner are tested by unit tests with a fake clock, a written log
 and the stand-ins only: no real household or week of habits yet. Away
 mode, trips and the doorbell are tested against stand-ins only (no real
-doorbell, trip, airline or flight-status server yet). 0.4.0 also passed
+doorbell, trip, airline or flight-status server yet). 0.4.1 also passed
 its tests in CI on Linux and Windows. Emergencies
 (escalation to the household, the leak's fallback, the smoke routine)
 are tested against stand-ins only: no real household, alarm or valve
@@ -98,10 +98,11 @@ added, Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their
 unit tests and the end-to-end script; on macOS 15.7 the sandbox
 (sandbox-exec) and APFS clone tests run with the rest. One day's use on
 Windows 11, in `harness chat` and the desk app, was with a real model
-(Anthropic's). Nothing has run
+(Anthropic's). Claude Code 2.1.322 and Hermes 0.21.3 have connected to
+the proxy on macOS (Hermes listing its tools), with no model turn and no
+tool call; Codex has not been tried. Nothing has run
 yet against a real omnigate, Telegram bot,
-transcription service, MCP server, other agent at the proxy (Claude Code,
-Codex, Hermes), authorization server, website, Home
+transcription service, MCP server, authorization server, website, Home
 Assistant, Smartcar or mail server; mail (the butler's address and your
 mailbox) is tested against a stand-in of mailmcp, and mailmcp against
 its own stand-in IMAP and SMTP server.** See [Limits](#limits).
@@ -272,7 +273,10 @@ machine at home, or a provider you have an agreement with, is yours to
 judge. The model is sent the same tools as any other; one that can't call
 tools answers in text only. `harness config set model.private_model
 local:llama3.1:8b` sets it and `harness config set model.private_model ""`
-clears it, at the next `/reload`.
+clears it, at the next `/reload`. In the desk app, "Provider and key…"
+has a Private model part for a server of your own that takes no key (it
+writes `[provider local]` and `private_model = local:MODEL`); a provider
+that takes a key is set in config.ini.
 
 Not moved by it: voice notes are still transcribed by `[voice] provider`,
 and replies read aloud on the desk still go to `[desk] speak`'s provider.
@@ -2190,7 +2194,10 @@ bot the only way in: replies, briefs, task results, items, urgent alerts
 and the digest all reach it, and a message's own buttons (quick replies,
 Undo, Taken, I'm on it) are pressed there; files a post carries are kept in
 `state/desk-files/` and named on the desk. Posts to a group or a member's
-chat aren't sent while Telegram is off. The avatar takes most
+chat aren't sent while Telegram is off. With a bot token stored and nobody
+paired yet, harness's posts go to the desk once you have written there,
+without a reply's buttons (quick replies, Undo), and a post's files aren't
+delivered until you pair. The avatar takes most
 of it, the chat runs along the bottom, and the side panel holds Needs you,
 Topics and Lately. It's a small app of its own, `harness-desk`, that shows
 harness's pages in the system's web view (WKWebView, WebView2, WebKitGTK);
@@ -4232,7 +4239,7 @@ only while `harness run` holds the folder and has ticked in the last 90 s;
   below it; a site needs a dot (except `localhost`), but harness doesn't
   know the public suffix list, so set the site no wider than needed.
 
-Not in 0.4.0: the Agent Client Protocol server, desktop use (headdesk), a
+Not in 0.4.1: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, email, WhatsApp, Slack and voice as conversations
 (voice notes in Telegram and Home Assistant's voice satellites are in;
 spoken replies in Telegram are not), a reply in the room after you allow
@@ -4325,7 +4332,7 @@ badge; click the Dock icon to bring the window back.
 | Start harness | runs `harness run` in the background; it keeps running after you quit the app |
 | Stop harness | runs `harness stop`: harness exits cleanly on its next tick |
 | Open at login | runs `harness autostart on` or `off`; checked when harness starts at login (the app itself doesn't) |
-| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key, pick a provider whose key is stored under another name, or change the Address to another host (a new port or path on the same host doesn't ask). While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
+| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key, pick a provider whose key is stored under another name, or change the Address to another host (a new port or path on the same host doesn't ask). Under them, Private model: the model, address and format of a keyless server of your own for the conversations set to `/private on` (see Private conversations); shown and not changeable when config.ini's private model is another provider's. While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
 | Reload (⌘R) | loads the desk again |
 | Quit harness (⌘Q) | quits the app; harness keeps running |
 
@@ -4342,7 +4349,7 @@ zig build                     # zig-out/harness-desk.app, for this Mac
 zig build test --summary all  # unit tests
 zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py);
                               # DESK_SMOKE_HARNESS=PATH sets up a real harness once more
-scripts/package-macos.sh 0.4.0 harness-desk-0.4.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
+scripts/package-macos.sh 0.4.1 harness-desk-0.4.1-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
 ```
 
 The package needs the fit files: `harness/scripts/pack-desk-assets.sh`
@@ -4418,7 +4425,7 @@ and SHA-256 in the script, which downloads and checks it):
     zig build test                             # the decisions: no window needed
     zig build app -Dwebview2=../../webview2    # zig-out/harness-desk/
     zig build smoke -Dwebview2=../../webview2  # in a window, against a stand-in harness (Git Bash, python)
-    scripts/package-windows.sh 0.4.0 harness-desk-0.4.0-windows.zip ../../webview2   # with harness.exe and the fit files
+    scripts/package-windows.sh 0.4.1 harness-desk-0.4.1-windows.zip ../../webview2   # with harness.exe and the fit files
 
 `DESK_SMOKE_HARNESS=PATH\harness.exe` adds the setup once more against
 that real harness (a data folder and a file store of the smoke's own, a
@@ -4488,7 +4495,7 @@ desktop's to choose.
     zig build test     # the decisions: no window needed
     zig build app      # zig-out/harness-desk/harness-desk
     zig build smoke    # in a window (under xvfb-run where there is no display), against a stand-in harness
-    scripts/package-linux.sh 0.4.0 harness-desk-0.4.0-linux-x86_64.tar.gz   # with harness and the fit files
+    scripts/package-linux.sh 0.4.1 harness-desk-0.4.1-linux-x86_64.tar.gz   # with harness and the fit files
 
 `DESK_SMOKE_HARNESS=PATH/harness` and `DESK_ASSETS=none` as on Windows.
 
