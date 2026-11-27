@@ -7285,12 +7285,19 @@ pub const Core = struct {
         // a schedule for one day has run: its section goes (it would only
         // sit in triggers.ini, never due again)
         // (its own run, by the scheduler: /trigger run tries it and keeps it)
-        if (job == .task and job.task.on_day != null and job.task.in_triggers and std.mem.startsWith(u8, key, "task:")) {
-            var arena: std.heap.ArenaAllocator = .init(c.gpa);
-            defer arena.deinit();
-            const why = c.removeTrigger(arena.allocator(), job.task.name, "harness") catch null;
-            if (why) |w| c.log.write(.trigger, false, .{ .name = job.task.name, .event = "kept", .why = w }) catch {};
-        }
+        if (job == .task and job.task.on_day != null and job.task.in_triggers and std.mem.startsWith(u8, key, "task:")) c.oneDayRan(job.task.name);
+    }
+
+    /// Takes the section of schedule `name` out of triggers.ini when it is
+    /// one for a single day (`on`): it has run and its message got through.
+    fn oneDayRan(c: *Core, name: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const tr = (c.triggerCopy(a, name) catch return) orelse return;
+        if (tr.on == null) return;
+        const why = c.removeTrigger(a, name, "harness") catch null;
+        if (why) |w| c.log.write(.trigger, false, .{ .name = name, .event = "kept", .why = w }) catch {};
     }
 
     /// Sends again the post delivery item `id` keeps. Delivered: the item is
@@ -7343,6 +7350,9 @@ pub const Core = struct {
         // closing it ends `settling`: no "Send again" slips in before
         _ = c.settle(id, .done, .{ .at = c.now(), .via = .harness });
         if (p.of.len > 0) c.markRan(p.of, p.ran);
+        // a schedule for one day whose message arrives only now: its
+        // section goes now (the scheduler's own run, not /trigger run's)
+        if (std.mem.startsWith(u8, p.of, "task:")) c.oneDayRan(kp.name);
     }
 
     /// The links of a delivered brief count as seen from now.
@@ -7803,6 +7813,16 @@ pub const Core = struct {
         const tr = list[0];
         if (c.nameTaken(tr.name)) |where| return .{ .why = try std.fmt.allocPrint(a, "the name {s} is taken ({s})", .{ tr.name, where }) };
         if (tr.action == .do and !c.defs.has(tr.agent)) return .{ .why = try std.fmt.allocPrint(a, "agent {s} is not defined (no agents/{s}.md)", .{ tr.agent, tr.agent }) };
+        // a day already past would run at once, as one missed: a wrong
+        // year or month is said here instead
+        if (tr.on) |day| {
+            const today = c.localDay(c.now());
+            if (day < today) {
+                const was = util.civil(day);
+                const is = util.civil(today);
+                return .{ .why = try std.fmt.allocPrint(a, "on = {d:0>4}-{d:0>2}-{d:0>2} is already past (today is {d:0>4}-{d:0>2}-{d:0>2})", .{ @as(u64, @intCast(was.y)), was.m, was.d, @as(u64, @intCast(is.y)), is.m, is.d }) };
+            }
+        }
         if (tr.mcp) |m| if (m.tool.len > 0 and c.isMoneyTool(m.server, m.tool))
             return .{ .why = try std.fmt.allocPrint(a, "{s}/{s} moves money: it is never polled", .{ m.server, m.tool }) };
         if (tr.kind == .file) {
@@ -20280,6 +20300,52 @@ test "a_schedule_for_one_day_runs_once_and_its_section_goes" {
     f.core.fixed_now = (today + 6) * 86400 + 9 * 3600 - off;
     f.core.tick();
     try f.rec.waitFor("[dentist] Again: call the dentist.");
+}
+
+test "a_schedule_for_one_day_sent_late_goes_once_its_message_arrives" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const today = f.core.localDay(util.nowSeconds(t.io));
+    const day = util.civil(today + 2);
+    const off = @as(i64, f.core.cfg.chat.utc_offset) * 60;
+    try setTriggers(&f, try std.fmt.allocPrint(a, "[keep]\nsearch = zig\n[dentist]\nat = 10:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Reminder: call the dentist.\n", .{ @as(u32, @intCast(day.y)), day.m, day.d }));
+    // its time comes while nothing gets through: kept, to be sent again
+    const t0 = (today + 2) * 86400 + 12 * 3600 - off;
+    f.rec.setFail(error.ConnectionClosed);
+    f.core.fixed_now = t0;
+    f.core.tick();
+    waitIdle(f.core);
+    try expectHas(try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited), "[dentist]");
+    // it arrives: its section goes then, like one that got through at once
+    f.rec.setFail(null);
+    f.core.fixed_now = t0 + 6 * 60;
+    f.core.tick();
+    try f.rec.waitFor("[dentist] Reminder: call the dentist.");
+    waitIdle(f.core);
+    const text = try Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited);
+    try t.expect(std.mem.indexOf(u8, text, "[dentist]") == null);
+    try expectHas(text, "[keep]\nsearch = zig\n");
+    try expectHas(try logText(&f), "\"kind\":\"trigger\",\"name\":\"dentist\",\"event\":\"removed\",\"by\":\"harness\"");
+    try t.expectEqual(1, f.rec.count("call the dentist"));
+    try t.expectEqual(0, f.e.server.modelRequests());
+}
+
+test "a_schedule_for_a_day_already_past_is_not_added" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    const a = f.e.arena.allocator();
+    const today = f.core.localDay(util.nowSeconds(t.io));
+    const was = util.civil(today - 365);
+    const now = util.civil(today);
+    const said = try f.core.command(a, try std.fmt.allocPrint(a, "/trigger add\n[dentist]\nat = 10:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Reminder: call the dentist.", .{ @as(u32, @intCast(was.y)), was.m, was.d }));
+    try expectHas(said, try std.fmt.allocPrint(a, "is already past (today is {d:0>4}-{d:0>2}-{d:0>2})", .{ @as(u32, @intCast(now.y)), now.m, now.d }));
+    try t.expect(std.mem.indexOf(u8, Io.Dir.cwd().readFileAlloc(t.io, f.core.paths.triggers, a, .unlimited) catch "", "[dentist]") == null);
+    // today's is taken, also when its time has passed (it runs at once)
+    const ok = try f.core.command(a, try std.fmt.allocPrint(a, "/trigger add\n[today]\nat = 00:00\non = {d:0>4}-{d:0>2}-{d:0>2}\nsay = Today.", .{ @as(u32, @intCast(now.y)), now.m, now.d }));
+    try expectHas(ok, "Added today: ");
 }
 
 test "task_paused_after_budget_spent_until_resume" {

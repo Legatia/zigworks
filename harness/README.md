@@ -3469,8 +3469,10 @@ only after a 3% move. A section's keys give its kind:
   tasks.ini does. `on = 2026-11-28` with `at` is that one day alone, for a
   reminder: it runs once, at its time or the first moment after it that
   harness is up, and its section is then taken out of triggers.ini
-  (`/trigger run` tries it and keeps it). The agent adds these with its
-  `trigger` tool when you ask for something at a time ("every weekday at
+  (`/trigger run` tries it and keeps it; a reminder that could not be
+  sent goes once it has arrived). A day already past is not added. The
+  agent adds these with its `trigger` tool when you ask for something at
+  a time ("every weekday at
   8:00, the weather", "remind me tomorrow at 10:00 to call the dentist"),
   and you approve the section. A new schedule whose time today has passed
   runs once right away, as a missed one does.

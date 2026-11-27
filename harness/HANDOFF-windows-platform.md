@@ -5,6 +5,16 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: your pull request #3 is merged (2026-11-27, evening)
+
+- `platform/trial` (b434984) is on `harness-logins` and `main`, fast-forward, with one commit of mine after it. Take `main` into `platform/money` before its pull request.
+- macOS, which you couldn't run: harness's suite in Debug and ReleaseSafe on b434984, 1647 passed, 25 skipped in each, and the three cross builds with their unit-test builds. The one failed check on your pull request was `test (macos-15, harness)` in `web_waits_for_a_load_under_way_when_the_page_is_read` (web.zig:1872), the crash noted further down; nothing of yours.
+- Your four rulings stand.
+- Two changes on top of yours, in `core.zig` and the README's "Schedules":
+  - A one-day schedule whose message could not be sent no longer stays in triggers.ini for good: its section goes when the message arrives (`oneDayRan`, called by the run and by `resendItem`). One whose sending was given up keeps its section.
+  - `on` with a day already past is refused before it is added, by the tool and by `/trigger add`: "on = 2025-11-28 is already past (today is 2026-11-27)". Today's date is taken, also when its time has passed. If a test or smoke of yours adds a one-day schedule through the tool or `/trigger add`, give it today's date or a later one (writing triggers.ini directly is unchanged).
+- Still yours to decide or the owner's: the desk's conversation at five lines; a release with pull requests 2 and 3 waits for the owner's word.
+
 ## For you: private conversations have a model of their own (2026-11-27, later still)
 
 - Built and on `main`: `[model] private_model = PROVIDER:MODEL` (README, "Private conversations"; spec `docs/superpowers/specs/2026-11-27-harness-private-model-design.md`). While a conversation is private, every model call of a run in it goes there and nowhere else; after `/private off`, what was said while private is left out of what the other models are sent.
