@@ -43,7 +43,7 @@ const usage =
     \\  config set SECTION.KEY VALUE
     \\                             write one setting in config.ini (comments kept; a
     \\                             value that doesn't read is refused, the file untouched)
-    \\  config get SECTION.KEY     the value in use; a named section: provider NAME.url
+    \\  config get SECTION.KEY     the value in use; a named section: provider NAME.url, client NAME.servers
     \\  secret add NAME [--stdin]  store a secret (typed, not shown)
     \\  secret rm NAME             remove a stored secret
     \\  secret list                which of the configured secrets are stored
@@ -519,7 +519,7 @@ fn initCmd(app: *App, args: []const []const u8) !Exit {
     return .ok;
 }
 
-const config_usage = "usage: harness config set SECTION.KEY VALUE [SECTION.KEY VALUE]... | config get SECTION.KEY (a named section: provider NAME.KEY)";
+const config_usage = "usage: harness config set SECTION.KEY VALUE [SECTION.KEY VALUE]... | config get SECTION.KEY (a named section: provider NAME.KEY, client NAME.KEY)";
 
 /// Whether a `harness config` line has what it takes: `set` a key and its
 /// value (more pairs: written together), `get` a key; a key is one

@@ -14,7 +14,7 @@ pub const Error = error{ BadConfig, OutOfMemory };
 
 /// What `parse` refuses besides a bad line: the `[provider NAME]`
 /// sections' problems, which `reason` says.
-pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk, SpeechOnlyModel, BadPrivateModel };
+pub const ParseError = Error || error{ BadProvider, BadHeader, ProviderNeedsApiAndUrl, UnknownProvider, BadVoice, BadVoiceAgent, BadDesk, SpeechOnlyModel, BadPrivateModel, BadProxy, BadClient };
 
 pub const Config = struct {
     model: Model = .{},
@@ -34,6 +34,10 @@ pub const Config = struct {
     voice_agent: VoiceAgent = .{},
     mail: Mail = .{},
     desk: Desk = .{},
+    proxy: Proxy = .{},
+    /// The `[client NAME]` sections, in the order their names first
+    /// appear (not a section of its own: `parse` reads them apart).
+    clients: []const Client = &.{},
     /// The `[provider NAME]` sections, in the order their names first
     /// appear (not a section of its own: `parse` reads them apart).
     providers: []const model.Section = &.{},
@@ -184,6 +188,25 @@ pub const Config = struct {
         /// The language spoken, as its ISO 639-1 code; "": the service
         /// finds it.
         language: []const u8 = "",
+    };
+    /// MCP for other agents on this machine, through the gate (README:
+    /// MCP, "For other agents").
+    pub const Proxy = struct {
+        /// 127.0.0.1 or [::1] and a port (`parseLoopback`); `off`: no
+        /// proxy. It runs with `harness run` while a client's token is
+        /// stored.
+        listen: []const u8 = "127.0.0.1:8766",
+    };
+    /// An outside agent the proxy serves: a `[client NAME]` section.
+    pub const Client = struct {
+        name: []const u8,
+        /// The stored secret its bearer token must be (`client-NAME`
+        /// when the section names none).
+        token: []const u8,
+        /// mcp.ini's servers it may reach; none: it sees no tools.
+        servers: []const []const u8 = &.{},
+        /// Whether it may call tools that move money (asked every time).
+        money: bool = false,
     };
     /// Home Assistant's conversation agent: speech in the house, answered
     /// by harness (README: Home Assistant's voice).
@@ -340,9 +363,15 @@ pub fn stripComment(raw: []const u8) []const u8 {
 pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
     var cfg: Config = .{};
     var provs: std.ArrayList(ProviderLines) = .empty;
-    for (try lines(arena, text)) |l| {
+    const all = try lines(arena, text);
+    const clients = try clientSections(arena, text);
+    for (all) |l| {
         if (providerSection(l.section)) |name| {
             try providerLine(arena, &provs, name, l);
+            continue;
+        }
+        if (clientSection(l.section)) |name| {
+            try clientLine(arena, clients, name, l);
             continue;
         }
         // the computer's own zone: the offset is the core's to fill in
@@ -364,7 +393,7 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         }
         var found = false;
         inline for (@typeInfo(Config).@"struct".field_names) |sname| {
-            if (comptime !std.mem.eql(u8, sname, "providers") and !std.mem.eql(u8, sname, "utc_auto")) {
+            if (comptime !std.mem.eql(u8, sname, "providers") and !std.mem.eql(u8, sname, "clients") and !std.mem.eql(u8, sname, "utc_auto")) {
                 if (std.mem.eql(u8, l.section, sname)) {
                     found = true;
                     try setField(&@field(cfg, sname), l);
@@ -395,6 +424,8 @@ pub fn parse(arena: std.mem.Allocator, text: []const u8) ParseError!Config {
         if (api == .gemini) return error.SpeechOnlyModel;
         if (colon + 1 == value.len) return error.BadPrivateModel;
     }
+    cfg.clients = clients;
+    if (!std.mem.eql(u8, cfg.proxy.listen, "off") and parseLoopback(cfg.proxy.listen) == null) return error.BadProxy;
     const va = cfg.voice_agent;
     if (!std.mem.eql(u8, va.listen, "off") and parseListen(va.listen) == null) return error.BadVoiceAgent;
     if (va.seconds < 5 or va.seconds > 60 or !secretName(va.token)) return error.BadVoiceAgent;
@@ -445,6 +476,18 @@ pub fn parseListen(text: []const u8) ?std.Io.net.IpAddress {
             if (std.mem.allEqual(u8, &x.bytes, 0)) return null;
             if (std.mem.allEqual(u8, x.bytes[0..10], 0) and x.bytes[10] == 0xff and x.bytes[11] == 0xff) return null;
         },
+    }
+    return ip;
+}
+
+/// `[proxy] listen`: this machine's own address and a port
+/// (`127.0.0.1:8766`, `[::1]:8766`); null for any other. The proxy's
+/// requests are plain HTTP with a bearer token: they stay on the machine.
+pub fn parseLoopback(text: []const u8) ?std.Io.net.IpAddress {
+    const ip = parseListen(text) orelse return null;
+    switch (ip) {
+        .ip4 => |x| if (!std.mem.eql(u8, &x.bytes, &.{ 127, 0, 0, 1 })) return null,
+        .ip6 => |x| if (!std.mem.allEqual(u8, x.bytes[0..15], 0) or x.bytes[15] != 1) return null,
     }
     return ip;
 }
@@ -515,6 +558,8 @@ pub fn reason(e: anyerror) ?[]const u8 {
         error.UnknownProvider => "no provider has that name: use a preset (omnigate, anthropic, openrouter, opencode, openai) or a [provider NAME] section with api and url",
         error.BadVoice => "[voice] provider = openai or a [provider NAME] section with api = openai (Groq, a whisper.cpp server), model = its transcription model (whisper-large-v3-turbo at Groq, gpt-4o-mini-transcribe at OpenAI), language = a two-letter code (pl) or nothing",
         error.BadVoiceAgent => "[voice_agent] listen = an IP address of this machine and a port, like 127.0.0.1:8765 or 192.168.1.20:8765 (not a name, not 0.0.0.0 or ::), or off; seconds = 5 to 60; token = a stored secret's name (a-z, 0-9, - and _)",
+        error.BadProxy => "[proxy] listen = 127.0.0.1 or [::1] and a port, like 127.0.0.1:8766, or off (the proxy answers on this machine only; from another one, use an SSH tunnel)",
+        error.BadClient => "[client NAME]: NAME is a-z, 0-9, - and _ (at most 32, at most 16 clients); its keys are servers (names from mcp.ini, separated by commas), token (a stored secret's name) and money (on or off)",
         error.SpeechOnlyModel => "api = gemini is for speech only for now ([desk] speak); a model needs a provider with api = anthropic or openai",
         error.BadPrivateModel => "[model] private_model = PROVIDER:MODEL, where PROVIDER is a preset or a [provider NAME] section with api = anthropic or openai (the provider's name is required here, so that a mistyped one is never read as a model of the default provider)",
         error.BadDesk => "[desk] avatar = a folder name in avatars/ (a-z, 0-9, -); speak = off, browser, openai, gemini, or a [provider NAME] with api = openai or gemini; speak_model and speak_voice are that provider's (unset: its default)",
@@ -530,10 +575,79 @@ const ProviderLines = struct {
 
 /// "provider NAME" → NAME as written (the caller checks it).
 fn providerSection(section: []const u8) ?[]const u8 {
-    const word = "provider";
+    return namedSection(section, "provider");
+}
+
+/// "WORD NAME" → NAME as written.
+fn namedSection(section: []const u8, word: []const u8) ?[]const u8 {
     if (section.len <= word.len or !std.mem.startsWith(u8, section, word)) return null;
     if (section[word.len] != ' ' and section[word.len] != '\t') return null;
     return std.mem.trim(u8, section[word.len..], " \t");
+}
+
+/// The most `[client NAME]` sections config.ini holds.
+pub const max_clients = 16;
+
+/// A client's name: a-z, 0-9, `-` and `_`, starting with a letter or
+/// digit, at most 32 (its who is `client:NAME`, its token `client-NAME`).
+pub fn validClientName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    if (!(std.ascii.isLower(name[0]) or std.ascii.isDigit(name[0]))) return false;
+    for (name) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
+    return true;
+}
+
+/// "client NAME" → NAME as written (the caller checks it).
+fn clientSection(section: []const u8) ?[]const u8 {
+    return namedSection(section, "client");
+}
+
+/// The `[client NAME]` sections in the order their headers first appear,
+/// a header with no keys under it too (a client that sees no tools), each
+/// with its default token's name.
+fn clientSections(arena: std.mem.Allocator, text: []const u8) ParseError![]Config.Client {
+    var out: std.ArrayList(Config.Client) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, stripComment(raw), " \t\r");
+        if (line.len < 2 or line[0] != '[' or line[line.len - 1] != ']') continue;
+        const name = clientSection(std.mem.trim(u8, line[1 .. line.len - 1], " \t")) orelse continue;
+        if (!validClientName(name)) return error.BadClient;
+        for (out.items) |o| {
+            if (std.mem.eql(u8, o.name, name)) break;
+        } else {
+            if (out.items.len >= max_clients) return error.BadClient;
+            try out.append(arena, .{ .name = name, .token = try std.fmt.allocPrint(arena, "client-{s}", .{name}) });
+        }
+    }
+    return out.items;
+}
+
+fn clientLine(arena: std.mem.Allocator, clients: []Config.Client, name: []const u8, l: Line) ParseError!void {
+    const c = for (clients) |*x| {
+        if (std.mem.eql(u8, x.name, name)) break x;
+    } else return error.BadClient;
+    const v = l.value;
+    if (std.mem.eql(u8, l.key, "servers")) {
+        // nothing is offered unless named: no pattern, no "all"
+        var out: std.ArrayList([]const u8) = .empty;
+        if (v.len > 0) {
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |raw| {
+                const s = std.mem.trim(u8, raw, " \t");
+                if (!mcp.validName(s)) return error.BadClient;
+                for (out.items) |o| {
+                    if (std.mem.eql(u8, o, s)) break;
+                } else try out.append(arena, s);
+            }
+        }
+        c.servers = out.items;
+    } else if (std.mem.eql(u8, l.key, "token")) {
+        if (!secretName(v)) return error.BadClient;
+        c.token = v;
+    } else if (std.mem.eql(u8, l.key, "money")) {
+        c.money = parseBool(v) orelse return error.BadClient;
+    } else return error.BadClient;
 }
 
 fn providerLine(arena: std.mem.Allocator, provs: *std.ArrayList(ProviderLines), name: []const u8, l: Line) ParseError!void {
@@ -984,6 +1098,13 @@ pub const defaults_ini =
     \\; listen = 192.168.1.20:8765         ; for Home Assistant on another machine: this one's LAN address (default: this machine only)
     \\; token = ha-agent                   ; the secret Home Assistant's API key must be: harness secret add ha-agent
     \\; seconds = 20                       ; a spoken answer's time
+    \\
+    \\[proxy]                             ; MCP for other agents on this machine, through the gate (README: MCP)
+    \\; listen = off                       ; no proxy (default: this machine only, port 8766, while a client's token is stored)
+    \\
+    \\; [client claude-code]               ; an outside agent; its token: harness secret add client-claude-code
+    \\; servers = github, notes            ; mcp.ini's servers it may reach (none named: none)
+    \\; money = off                        ; on: it may call tools that move money (asked every time)
     \\
     \\[mail]                              ; mail (README: Mail); /setup mail writes it
     \\; owner = me@example.com             ; your addresses: only your mail to the butler's address is a message
@@ -1859,6 +1980,85 @@ test "butler_bedtime_and_evening_read" {
         try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nbedtime = {s}\n", .{v})));
         try t.expectError(error.BadConfig, parse(a, try std.fmt.allocPrint(a, "[butler]\nevening = {s}\n", .{v})));
     }
+}
+
+test "the_proxy_and_its_clients_parse" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // nothing listed: the address is there, no client is
+    const d = try parse(a, "");
+    try t.expectEqualStrings("127.0.0.1:8766", d.proxy.listen);
+    try t.expectEqual(0, d.clients.len);
+    try t.expectEqual(0, (try parse(a, defaults_ini)).clients.len);
+    const one = try parse(a, "[proxy]\nlisten = 127.0.0.1:8766     ; off: no proxy\n\n[client claude-code]\nservers = github, notes     ; mcp.ini's servers\n");
+    try t.expectEqualStrings("127.0.0.1:8766", one.proxy.listen);
+    try t.expectEqual(1, one.clients.len);
+    try t.expectEqualStrings("claude-code", one.clients[0].name);
+    try t.expectEqualStrings("client-claude-code", one.clients[0].token);
+    try t.expectEqual(2, one.clients[0].servers.len);
+    try t.expectEqualStrings("github", one.clients[0].servers[0]);
+    try t.expectEqualStrings("notes", one.clients[0].servers[1]);
+    try t.expect(!one.clients[0].money);
+    try t.expect(@import("who.zig").isValue("client:claude-code"));
+    // a token's name and money of its own; a section with no lines is a
+    // client with no servers; sections of one name are one client; a
+    // server named twice is there once
+    const more = try parse(a, "[client codex]\ntoken = my-token\nmoney = on\nservers = notes\n[client empty]\n[model]\nmax_tokens = 9000\n[client codex]\nservers = github,github , pay_1\n[client blank]\nservers =\n");
+    try t.expectEqual(3, more.clients.len);
+    try t.expectEqualStrings("codex", more.clients[0].name);
+    try t.expectEqualStrings("my-token", more.clients[0].token);
+    try t.expect(more.clients[0].money);
+    try t.expectEqual(2, more.clients[0].servers.len);
+    try t.expectEqualStrings("github", more.clients[0].servers[0]);
+    try t.expectEqualStrings("pay_1", more.clients[0].servers[1]);
+    try t.expectEqualStrings("empty", more.clients[1].name);
+    try t.expectEqualStrings("client-empty", more.clients[1].token);
+    try t.expectEqual(0, more.clients[1].servers.len);
+    try t.expectEqual(0, more.clients[2].servers.len);
+    // this machine only
+    try t.expectEqualStrings("off", (try parse(a, "[proxy]\nlisten = off\n")).proxy.listen);
+    try t.expectEqualStrings("[::1]:9000", (try parse(a, "[proxy]\nlisten = [::1]:9000\n")).proxy.listen);
+    for ([_][]const u8{ "192.168.1.5:8766", "0.0.0.0:1", "localhost:8766", "127.0.0.1", "127.0.0.2:8766", "[::ffff:127.0.0.1]:8766", "on" }) |v| {
+        const text = try std.fmt.allocPrint(a, "[proxy]\nlisten = {s}\n", .{v});
+        t.expectError(error.BadProxy, parse(a, text)) catch |e| {
+            std.debug.print("read: {s}\n", .{v});
+            return e;
+        };
+    }
+    try t.expectError(error.BadConfig, parse(a, "[proxy]\nport = 1\n"));
+    const long: [33]u8 = @splat('a');
+    var seventeen: std.ArrayList(u8) = .empty;
+    for (0..17) |i| try seventeen.print(a, "[client c{d}]\n", .{i});
+    try t.expectEqual(16, (try parse(a, seventeen.items["[client c0]\n".len..])).clients.len);
+    for ([_][]const u8{
+        "[client Bad Name]\n",                 "[client -x]\nservers = a\n",
+        try std.fmt.allocPrint(a, "[client {s}]\n", .{&long}), "[client cc]\ncolour = red\n",
+        "[client cc]\nservers = a__b\n",       "[client cc]\nservers = *\n",
+        "[client cc]\nservers = a,,b\n",       "[client cc]\nservers = a b\n",
+        "[client cc]\ntoken = -x\n",           "[client cc]\ntoken =\n",
+        "[client cc]\nmoney = maybe\n",        "[client a:b]\n",
+        seventeen.items,
+    }) |text| {
+        t.expectError(error.BadClient, parse(a, text)) catch |e| {
+            std.debug.print("read: {s}\n", .{text});
+            return e;
+        };
+    }
+    try t.expect(validClientName(long[0..32]));
+    try t.expect(!validClientName(&long));
+    try t.expect(validClientName("9_x-y"));
+    try t.expect(!validClientName(""));
+    try t.expect(!validClientName("_x"));
+    // not a section of their own
+    try t.expectError(error.BadConfig, parse(a, "[client]\nservers = a\n"));
+    try t.expectError(error.BadConfig, parse(a, "[clients]\nx = 1\n"));
+    try t.expectError(error.BadConfig, parse(a, "[clientcc]\nservers = a\n"));
+    const core = @import("core.zig");
+    const why = (try core.parseProblem(a, "config.ini", "[proxy]\nlisten = 192.168.1.5:8766\n", parse)).?;
+    try t.expect(std.mem.indexOf(u8, why, "the proxy answers on this machine only") != null);
+    const why2 = (try core.parseProblem(a, "config.ini", "[client cc]\ncolour = red\n", parse)).?;
+    try t.expect(std.mem.indexOf(u8, why2, "its keys are servers") != null);
 }
 
 test "voice_agent_settings_read_and_checked" {

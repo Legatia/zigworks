@@ -9,7 +9,8 @@ const mail = @import("mail.zig");
 
 const model = @import("model.zig");
 
-/// `SECTION.KEY`; a named section's SECTION is `provider NAME`.
+/// `SECTION.KEY`; a named section's SECTION is `provider NAME` or
+/// `client NAME`.
 pub const Key = struct { section: []const u8, key: []const u8 };
 
 /// What `set` or `get` came to: the new text or the value, else the one
@@ -49,11 +50,24 @@ fn providerName(section: []const u8) ?[]const u8 {
 
 const provider_keys = [_][]const u8{ "api", "url", "auth", "key", "cache", "header" };
 
+/// NAME of a section `client NAME`.
+fn clientName(section: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, section, "client ")) return null;
+    return section["client ".len..];
+}
+
+const client_keys = [_][]const u8{ "servers", "token", "money" };
+
 /// Whether config.ini has setting `k`.
 fn known(k: Key) bool {
     if (providerName(k.section)) |name| {
         if (!model.validName(name)) return false;
         for (provider_keys) |pk| if (std.mem.eql(u8, pk, k.key)) return true;
+        return false;
+    }
+    if (clientName(k.section)) |name| {
+        if (!config.validClientName(name)) return false;
+        for (client_keys) |ck| if (std.mem.eql(u8, ck, k.key)) return true;
         return false;
     }
     const ci = @typeInfo(config.Config).@"struct";
@@ -217,6 +231,10 @@ pub fn getValue(a: std.mem.Allocator, text: []const u8, k: Key) !Result {
     }
     if (found) |v| return .{ .value = v };
     if (providerName(k.section) != null) return .{ .value = "" };
+    if (clientName(k.section)) |name| {
+        if (std.mem.eql(u8, k.key, "token")) return .{ .value = try std.fmt.allocPrint(a, "client-{s}", .{name}) };
+        return .{ .value = if (std.mem.eql(u8, k.key, "money")) "off" else "" };
+    }
     const d: config.Config = .{};
     const ci = @typeInfo(config.Config).@"struct";
     inline for (ci.field_names, ci.field_types) |sname, ST| {
@@ -294,6 +312,34 @@ test "a_named_section_is_one_argument_or_two" {
     const text = "[model]\nprovider = local\nmodel = gpt\n\n[provider local]\napi = openai\nurl = https://a.example/v1\n";
     try t.expectEqualStrings("[model]\nprovider = local\nmodel = gpt\n\n[provider local]\napi = openai\nurl = https://b.example/v1\n", (try setText(x, text, one, "https://b.example/v1")).text.?);
     try t.expectEqualStrings("https://a.example/v1", (try getValue(x, text, two)).value.?);
+}
+
+test "a_clients_settings_are_set_like_a_providers" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const text = "[model]\nmodel = gpt\n";
+    const servers = parseKey(x, &.{ "client", "cc.servers" }).?;
+    try t.expectEqualStrings("client cc", servers.section);
+    const one = (try setText(x, text, servers, "github, notes")).text.?;
+    try t.expectEqualStrings("[model]\nmodel = gpt\n\n[client cc]\nservers = github, notes\n", one);
+    try t.expectEqualStrings("[model]\nmodel = gpt\n\n[client cc]\nservers = notes\n", (try setText(x, one, parseKey(x, &.{"client cc.servers"}).?, "notes")).text.?);
+    try t.expectEqualStrings("[model]\nmodel = gpt\n\n[client cc]\nservers = github, notes\nmoney = on\n", (try setText(x, one, parseKey(x, &.{"client cc.money"}).?, "on")).text.?);
+    try t.expectEqualStrings("github, notes", (try getValue(x, one, servers)).value.?);
+    // unset: what harness uses
+    try t.expectEqualStrings("client-cc", (try getValue(x, one, parseKey(x, &.{"client cc.token"}).?)).value.?);
+    try t.expectEqualStrings("off", (try getValue(x, one, parseKey(x, &.{"client cc.money"}).?)).value.?);
+    try t.expectEqualStrings("", (try getValue(x, text, servers)).value.?);
+    // no such key, no such name, a server that can't be one: refused
+    try t.expectEqualStrings("config.ini has no setting client cc.colour", (try setText(x, text, parseKey(x, &.{"client cc.colour"}).?, "red")).refused.?);
+    try t.expectEqualStrings("config.ini has no setting client Bad.servers", (try setText(x, text, parseKey(x, &.{"client Bad.servers"}).?, "a")).refused.?);
+    try t.expect(std.mem.indexOf(u8, (try setText(x, text, servers, "*")).refused.?, "its keys are servers") != null);
+    // the token is a stored secret's name, never the token
+    try t.expect(std.mem.indexOf(u8, (try setText(x, text, parseKey(x, &.{"client cc.token"}).?, "S3cret Token Value")).refused.?, "harness secret add") != null);
+    // the address: this machine's only
+    try t.expectEqualStrings("127.0.0.1:8766", (try getValue(x, text, parseKey(x, &.{"proxy.listen"}).?)).value.?);
+    try t.expect(std.mem.indexOf(u8, (try setText(x, text, parseKey(x, &.{"proxy.listen"}).?, "0.0.0.0:8766")).refused.?, "this machine only") != null);
+    try t.expectEqualStrings("[model]\nmodel = gpt\n\n[proxy]\nlisten = off\n", (try setText(x, text, parseKey(x, &.{"proxy.listen"}).?, "off")).text.?);
 }
 
 test "a_change_that_does_not_parse_is_refused" {
