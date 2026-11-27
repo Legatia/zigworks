@@ -387,7 +387,12 @@ pub const Server = struct {
         var body_buf: [8192]u8 = undefined;
         const r = req.readerExpectContinue(&body_buf) catch return false;
         const body = r.allocRemaining(a, .limited(s.max_body)) catch |e| switch (e) {
-            error.StreamTooLong => return s.refuse(req, .size, .payload_too_large, "the message is over the proxy's limit"),
+            error.StreamTooLong => {
+                // a body with no length (chunked): the rest is read off
+                // through the reader already open, a second one can't be
+                _ = r.discardShort(4 << 20) catch {};
+                return s.turnAway(req, .size, .payload_too_large, "the message is over the proxy's limit");
+            },
             else => return false,
         };
         const answer = try s.message(a, client, conn, body);
@@ -439,7 +444,6 @@ pub const Server = struct {
 
     /// A request turned away at the door; the connection ends with it.
     fn refuse(s: *Server, req: *std.http.Server.Request, why: Refusal, status: std.http.Status, comptime message_text: []const u8) !bool {
-        s.noteRefusal(why, status);
         // what it sent is read off first, unkept (up to 4 MiB, within the
         // head's time): closed with its body unread, the connection is
         // reset and the answer lost
@@ -449,6 +453,12 @@ pub const Server = struct {
                 _ = r.discardRemaining() catch {};
             } else |_| {}
         }
+        return s.turnAway(req, why, status, message_text);
+    }
+
+    /// `refuse`'s answer, for a request whose body was already read at.
+    fn turnAway(s: *Server, req: *std.http.Server.Request, why: Refusal, status: std.http.Status, comptime message_text: []const u8) !bool {
+        s.noteRefusal(why, status);
         const body = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"" ++ message_text ++ "\"}}";
         const base = [_]std.http.Header{ .{ .name = "content-type", .value = "application/json" }, .{ .name = "cache-control", .value = "no-store" } };
         const extra: []const std.http.Header = switch (why) {
@@ -983,6 +993,32 @@ test "a_body_over_the_limit_is_refused" {
     const got = try f.rpc(tok_a, big.items);
     try t.expectEqual(413, got.status);
     try t.expectEqual([2]u32{ 0, 0 }, f.rec.counts());
+    try t.expectEqual(200, (try f.rpc(tok_a, call_body)).status);
+}
+
+test "a_chunked_body_over_the_limit_is_refused" {
+    var f: Fix = undefined;
+    var o = plain;
+    o.max_body = 4096;
+    try f.init(o);
+    defer f.deinit();
+    const a = f.arena.allocator();
+    // no Content-Length to refuse it by: the size shows only while reading
+    const h = try sock.connect(t.io, "127.0.0.1", f.s.port, 2000);
+    const rbuf = try a.alloc(u8, 64 * 1024);
+    var wbuf: [4096]u8 = undefined;
+    var sk: sock.Socket = undefined;
+    sk.init(t.io, h, rbuf, &wbuf, 20_000);
+    defer sk.close();
+    try sk.writer.print("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{ f.s.port, tok_a });
+    try sk.writer.writeAll("1388\r\n");
+    for (0..5000) |_| try sk.writer.writeByte('x');
+    try sk.writer.writeAll("\r\n0\r\n\r\n");
+    try sk.writer.flush();
+    const all = try sk.reader.allocRemaining(a, .limited(1 << 20));
+    try t.expect(std.mem.startsWith(u8, all, "HTTP/1.1 413"));
+    try t.expectEqual([2]u32{ 0, 0 }, f.rec.counts());
+    // and the proxy still answers
     try t.expectEqual(200, (try f.rpc(tok_a, call_body)).status);
 }
 

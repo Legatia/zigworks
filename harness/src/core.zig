@@ -3324,6 +3324,9 @@ pub const Core = struct {
         c.proxy_mutex.lockUncancelable(c.io);
         defer c.proxy_mutex.unlock(c.io);
         if (c.proxy_note.len == 0) return "";
+        // what /reload waits for, and /stop ends
+        const going = c.proxy_active.load(.acquire);
+        if (going > 0) return std.fmt.allocPrint(a, "\nProxy: {s}. Clients' requests going or waiting: {d}.", .{ c.proxy_note, going });
         return std.fmt.allocPrint(a, "\nProxy: {s}.", .{c.proxy_note});
     }
 
@@ -7138,6 +7141,8 @@ pub const Core = struct {
     pub fn stopAll(c: *Core) []const u8 {
         const chat_busy = c.busy.load(.acquire);
         const bg = c.bg_active.load(.acquire);
+        // the proxy's clients' requests (their calls wait for an approval)
+        const clients = c.proxy_active.load(.acquire);
         var dropped: usize = 0;
         {
             c.queue_mutex.lockUncancelable(c.io);
@@ -7149,13 +7154,13 @@ pub const Core = struct {
         c.stopRuns();
         // by the clock: a 20 ms sleep lasts longer than that on Windows
         const until = Io.Clock.awake.now(c.io).nanoseconds + @as(i96, c.stop_wait_ms) * std.time.ns_per_ms;
-        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        while ((c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0 or c.proxy_active.load(.acquire) > 0) and Io.Clock.awake.now(c.io).nanoseconds < until) c.io.sleep(.fromMilliseconds(20), .awake) catch {};
         // Commands and their processes end at once. A model call under way
         // cannot be cut off: the owner is not kept waiting for it, and is
         // told (the run's stop flag stays set, so nothing follows it).
         const still = c.busy.load(.acquire) or c.bg_active.load(.acquire) > 0;
-        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .queued_dropped = dropped, .still_ending = still }) catch {};
-        if (!chat_busy and bg == 0 and dropped == 0) return "Nothing was running.";
+        c.log.write(.chat, false, .{ .event = "stop", .chat_turn = chat_busy, .background_runs = bg, .client_requests = clients, .queued_dropped = dropped, .still_ending = still }) catch {};
+        if (!chat_busy and bg == 0 and clients == 0 and dropped == 0) return "Nothing was running.";
         if (still) return "Stopped. A model call already under way ends on its own; its answer is dropped and nothing it asked for runs.";
         return "Stopped everything that was running.";
     }
@@ -38896,6 +38901,9 @@ test "hanging_up_withdraws_the_approval" {
     const lt = try logText(&f);
     try t.expect(std.mem.indexOf(u8, lt, "\"decision\":\"allow\"") == null);
     try t.expect(std.mem.indexOf(u8, lt, "allowed once by the owner") == null);
+    // and the log doesn't say the owner stopped it
+    try t.expect(std.mem.indexOf(u8, lt, "stopped by the owner") == null);
+    try t.expect(std.mem.indexOf(u8, lt, "stopped (its client hung up, or /stop)") != null);
 }
 
 test "stop_ends_a_clients_waiting_call" {
@@ -38908,7 +38916,7 @@ test "stop_ends_a_clients_waiting_call" {
     defer call.deinit(&f);
     try waitInbox(&f, "\"by\":\"client:cc\"");
     try f.rec.waitFor("[client:cc] fake__echo");
-    _ = f.core.stopAll();
+    try t.expectEqualStrings("Stopped everything that was running.", f.core.stopAll());
     const got = try call.join();
     try t.expectEqual(200, got.status);
     try expectHas(got.body, "\"isError\":true");
@@ -38927,8 +38935,11 @@ test "reload_waits_for_a_clients_call" {
     defer call.deinit(&f);
     try f.rec.waitFor("[client:cc] fake__echo");
     try t.expectEqualStrings("Busy; send /reload again when nothing is running.", try f.core.reload());
+    // /status says what /reload waits for
+    try expectHas(try f.core.command(f.e.arena.allocator(), "/status"), "). Clients' requests going or waiting: 1.");
     try f.press("once");
     try expectHas((try call.join()).body, "\"text\":\"held\"");
+    try t.expect(std.mem.indexOf(u8, try f.core.command(f.e.arena.allocator(), "/status"), "going or waiting") == null);
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());
 }
 
@@ -39003,6 +39014,10 @@ test "clients_without_a_good_token_are_not_served" {
     // the one with a good token is served; the short one's answers nothing
     try t.expectEqual(200, (try clientPost(a, port, cc_token, tools_list)).status);
     try t.expectEqual(401, (try clientPost(a, port, "a-token-too-short", tools_list)).status);
+    // a refused token is a stored secret all the same: masked like the others
+    const scrubbed = try f.core.masks.scrubAlloc(t.allocator, "a-token-too-short in room 1234");
+    defer t.allocator.free(scrubbed);
+    try t.expectEqualStrings("[secret:client-short] in room 1234", scrubbed);
     // none that can be served: nothing listens, and /status says why
     try setClients(&f, "[client none]\nservers = fake\n");
     try t.expectEqualStrings("Settings reloaded.", try f.core.reload());

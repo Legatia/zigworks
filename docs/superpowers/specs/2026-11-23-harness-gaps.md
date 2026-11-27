@@ -50,7 +50,9 @@ on. Update it when something lands.
   spec 2026-11-24-harness-injection-checks-design.md, plan
   2026-11-24-injection-checks.md); import of a Hermes setup and
   agentskills.io skills (built, below); the gate as an MCP proxy for
-  other agents (open).
+  other agents (built 2026-11-27: spec
+  2026-11-27-harness-mcp-proxy-design.md, plan 2026-11-27-mcp-proxy.md;
+  README, "MCP", "For other agents (the proxy)").
 - ~~Import of a Hermes setup and agentskills.io skills~~ **built
   (2026-11-24, platform/hermes-import)**: `harness import hermes` (memory,
   SOUL.md, skills, cron jobs, MCP servers, deny rules, the model; a plan

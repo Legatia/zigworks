@@ -5,6 +5,15 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: harness is an MCP server for other agents (2026-11-27, night)
+
+- Built and on `main`: the gate as an MCP proxy (README, "MCP", "For other agents (the proxy)"; spec `docs/superpowers/specs/2026-11-27-harness-mcp-proxy-design.md`). `harness run` serves MCP over HTTP on `[proxy] listen` (127.0.0.1:8766) to the agents named in `[client NAME]` sections; each of their calls passes the gate as `client:NAME` and is asked in `main` like any approval, its text starting `[client:NAME] `.
+- Nothing for the desk shells or the page to do: the approvals arrive as inbox items like the others. The settings page doesn't offer clients; they are set in `config.ini` or with `harness config set client NAME.servers "github, notes"`.
+- New in files you also build on: `mcpserve.zig` (new); `sock.zig` has `ended` (has the other side closed: an end, not more bytes), with a `peek` of its own for Windows (`recv` with `MSG_PEEK` on a non-blocking check). It cross-builds for Windows and its unit tests build there; it has only run on macOS and in CI. If a Windows run shows a client's hang-up not withdrawing its approval, that is where to look.
+- Words that changed, in case a smoke or test of yours compares them whole: `/access` without a who now ends "…, /access app:NAME or /access client:NAME."; `/status` has one more line, `Proxy: …`, only when config.ini has a `[client NAME]` section. `/stop` counts a client's waiting call among what it stopped (it answered "Nothing was running." before).
+- One change that reaches every run, yours too: an MCP call that was allowed while its run was being stopped is no longer sent; its result is "not called: its run stopped" (`agent.callMcp`).
+- `who.zig` has a kind `client`; `agent.Run` has `client_money`; `Core` has the fields `proxy`, `proxy_active`, `proxy_key`, `proxy_mutex`, `proxy_note`, `proxy_warned`, `proxy_wait_ms`, `mcp_names` (each set in `open`: `open` starts from `undefined`, so a field of yours needs its line there too).
+
 ## For you: your pull request #3 is merged (2026-11-27, evening)
 
 - `platform/trial` (b434984) is on `harness-logins` and `main`, fast-forward, with one commit of mine after it. Take `main` into `platform/money` before its pull request.

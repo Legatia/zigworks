@@ -96,14 +96,16 @@ claude mcp add --transport http harness http://127.0.0.1:8766/mcp \
   characters, or equals an earlier client's is not served; `/status` and
   a message to the owner say which and why. With no `[client]` section
   nothing runs and nothing is said.
-- Only the SHA-256 of each token is kept in memory; the token itself is
-  masked wherever harness writes.
+- The proxy itself keeps only the SHA-256 of each token and compares
+  digests. The token, like every stored secret, is also in harness's list
+  of values to mask, so it is masked wherever harness writes.
 - `/reload` applies changes (the proxy restarts when its address, a
   client's name, token, servers or money changed). `harness config set
   client NAME.servers "github, notes"` works like the provider sections.
 - `/status` has a line: `Proxy: MCP for other agents on 127.0.0.1:8766:
   claude-code (github, notes).`, and names a server a client lists that
-  mcp.ini doesn't have.
+  mcp.ini doesn't have. While clients' requests go or wait for an
+  approval it ends `Clients' requests going or waiting: N.`
 - `/access client:NAME` answers as `/access app:NAME` does.
 
 ## The protocol
@@ -127,8 +129,10 @@ claude mcp add --transport http harness http://127.0.0.1:8766/mcp \
 - An unknown method: -32601. A batch (an array): -32600. A body that is
   not JSON: -32700. A `MCP-Protocol-Version` header naming another
   version than the two: 400.
-- The token is checked before the body is read: `Authorization: Bearer
-  TOKEN`, else 401. The body is at most 1 MiB (413).
+- The token is checked before the body is looked at: `Authorization:
+  Bearer TOKEN`, else 401. A refused request's body is read off and thrown
+  away (up to 4 MiB, so the client gets its answer), never parsed. The
+  body is at most 1 MiB (413), with a length or chunked.
 - A request with an `Origin` header is refused (403) unless the origin is
   the proxy's own address (`http://127.0.0.1:PORT`, `http://localhost:PORT`
   or `http://[::1]:PORT`): a web page in a browser never reaches it.

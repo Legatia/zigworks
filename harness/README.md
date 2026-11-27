@@ -463,6 +463,7 @@ every call.
 | `[agent:helper]` | helpers' calls |
 | `[agent:NAME]` | the calls of definition NAME (`agents/NAME.md`), wherever it runs |
 | `[room]`, `[room:NAME]` | speech in the house, through Home Assistant's voice satellites (see Home Assistant's voice) |
+| `[client]`, `[client:NAME]` | another agent's calls of your MCP servers' tools, through the proxy (see MCP, "For other agents") |
 | `[harness:NAME]` | harness's own jobs, which nobody watches: `away` and `trips` (Away and travel), `warm-car`, `people`, `lists`, `reorder`, `deliveries`, `upkeep`, `habits`, `evening`. No task, brief, schedule or trigger is ever one, so a task you call `away` never gets `[harness:away]`'s lines |
 
 A kind alone covers all its names (`[schedule]`), and `*` works as in
@@ -1881,7 +1882,8 @@ and on macOS and Windows `Notes/A`, are `notes/a`; `notes2` is not in
 `notes`. `/folders` shows the sections (variable names and the secrets
 they come from, never values); `/access WHO` says where WHO may read,
 write and start commands (`/access agent:helper`, `/access
-schedule:NAME`, `/access agent:main trigger:NAME`).
+schedule:NAME`, `/access agent:main trigger:NAME`, `/access
+client:NAME`).
 
 Roles bind harness's own file tools and where a command starts. On this
 machine an approved command still runs as you and can `cd` anywhere (see
@@ -3035,6 +3037,121 @@ In mcp.ini, `amount =` and the caps need a `money =` line in the same
 section, a per-tool `amount` names only tools listed there, and `none` is
 said per tool, never alone. A server whose `money =` names a tool it does
 not have is not started.
+
+### For other agents (the proxy)
+
+Another agent on this machine (Claude Code, Codex, Hermes, a script) can
+be given harness as its one MCP server instead of your servers and their
+keys. Each of its calls is decided by the gate as a call of that agent,
+asked of you where a rule or the default says ask, logged, and only then
+passed to the real server. The other agent never holds the server's key.
+
+```ini
+; config.ini
+[proxy]
+listen = 127.0.0.1:8766     ; off: no proxy
+
+[client claude-code]
+servers = github, notes     ; mcp.ini's servers this client may reach
+; token = client-claude-code  ; the stored secret holding its token
+; money = off                 ; on: it may call tools that move money (asked every time)
+```
+
+```
+harness secret add client-claude-code     # a token of 32 characters or more, yours to make up
+```
+
+The proxy runs inside `harness run`, at `http://127.0.0.1:8766/mcp`
+(Streamable HTTP, a bearer token, this machine only: an address that is
+not 127.0.0.1 or ::1 is refused when the file is read; an agent on
+another machine reaches it through an SSH tunnel). harness never prints
+the token; you paste it into the other agent's settings:
+
+```
+# Claude Code
+claude mcp add --transport http harness http://127.0.0.1:8766/mcp \
+  --header "Authorization: Bearer THE-TOKEN"
+```
+
+```toml
+# Codex: ~/.codex/config.toml, with the token in the variable HARNESS_TOKEN
+[mcp_servers.harness]
+url = "http://127.0.0.1:8766/mcp"
+bearer_token_env_var = "HARNESS_TOKEN"
+tool_timeout_sec = 660
+```
+
+```yaml
+# Hermes: ~/.hermes/config.yaml
+mcp_servers:
+  harness:
+    url: "http://127.0.0.1:8766/mcp"
+    headers:
+      Authorization: "Bearer THE-TOKEN"
+    timeout: 660
+```
+
+- **What a client sees.** The tools of the servers its section names,
+  under the names harness's own agent sees (`github__list_issues`), with
+  their descriptions and input schemas. A server that is not named is not
+  there for it, and there is no `servers = *`: a new server in mcp.ini
+  reaches no outside agent until you name it. harness's own tools (files,
+  shell, web, send, memory) are not offered. Tools that move money are
+  listed only with `money = on`.
+- **A call is that client's.** It runs as `client:NAME`, with no agent
+  definition, no model call and no conversation of its own: hard limits,
+  deny rules, grants, the default for MCP tools (ask), allow and ask
+  rules. Rules for it go in `[client:NAME]` or `[client]` sections of
+  rules.ini (see The gate); `/access client:NAME` answers as `/access
+  app:NAME` does.
+- **Asking.** A call the gate asks about is an approval in your inbox
+  (conversation `main`), its text starting `[client:NAME] `. The other
+  agent's request waits for your answer, at most `[limits]
+  approval_seconds`. "Allow 24 h" covers that tool for that client only.
+  A denial, no answer in time, or a refusal comes back as the tool's
+  result with `isError` and the gate's sentence ("refused by the gate:
+  ...").
+- **The other agent's own timeout.** Set it above `approval_seconds`
+  (10 minutes unless you changed it), as `tool_timeout_sec = 660` and
+  `timeout: 660` do above: Codex waits 60 seconds for a tool by default
+  and Hermes 300, Claude Code long enough as it is. When the other agent
+  gives up first or you stop it, it hangs up: the approval is withdrawn
+  ("its run stopped") and the call is not made, also when you press
+  "Allow once" a moment later. `/stop` ends waiting calls too. The log
+  says of such a call "stopped (its client hung up, or /stop)": harness
+  can't tell which of the two it was.
+- **Money.** Without `money = on` a money tool is refused for a client.
+  With it, each call is asked every time (there is no "Allow 24 h"),
+  within the caps of `[money]` and the server, and written to the money
+  record.
+- **What goes back** is the server's answer as text, with your stored
+  secrets masked, as harness's own agent would get it.
+- **The log** has each decision and call with `"run":"client NAME"`,
+  `"by":"client:NAME"`, never the token. While `main` is private
+  (`/private on`), a client's calls are logged as every run's are then:
+  the tool, the decision and who, with sizes and hashes in place of the
+  arguments and the answer.
+
+A client's name uses a-z, 0-9, - and _, up to 32; at most 16 clients. A
+client whose token is not stored, is shorter than 32 characters, or is the
+same as an earlier client's is not served: `/status` says which and why
+on its `Proxy:` line (with the servers a client names that mcp.ini doesn't
+have), and you are told once. With no `[client NAME]` section nothing
+listens. `harness config set client claude-code.servers "github, notes"`
+works as for the provider sections.
+
+`/reload` applies changes: the proxy restarts, and its connections end,
+only when its address or a served client's name, token, servers or money
+changed. While a client's call goes or waits for your answer, `/reload`
+answers "Busy; send /reload again when nothing is running." and
+`/status`'s `Proxy:` line ends "Clients' requests going or waiting: 1.";
+a request
+that arrives while the servers restart waits up to 3 seconds, then is
+answered with an error to ask again. After a reload that changes the
+tools, a client learns of it when it lists again. A client may have 4
+calls going at once; the proxy takes 32 connections, bodies up to 1 MiB,
+and refuses a request a web page sends (one with a foreign `Origin`).
+MCP resources and prompts are not passed.
 
 ## Skills
 
