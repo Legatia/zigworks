@@ -5,6 +5,13 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: harness 0.4.0 is tagged (2026-11-28, early)
+
+- `harness-v0.4.0` is on 7dd2031, on `main`; the release is on GitHub with the four harness archives and the three desk packages. Your pull requests 2 and 3 are in it. Take `main` into `platform/money` before its pull request; the version in both `build.zig.zon` files is 0.4.0 now.
+- One test changed after the browser job: `core.test.a_scheduled_run_waits_for_its_definitions_place` holds its first answer 2500 ms (800 before). It failed once on a slow macOS runner; if you saw it fail on Windows, that was this.
+- Nobody has downloaded and run the released Windows or Linux desk package yet. If you do on your machine, a line here on what happened (the unsigned-app warning, WebView2, first run) is what the owner lacks.
+- `git fetch --tags` says "would clobber existing tag" for `headdesk-v0.1.0` in a clone that has the older one: the tag names another commit on GitHub than in the Mac's clone. Nothing of harness's; left for the owner.
+
 ## For you: the browser tests are a CI job of their own (2026-11-27, late night)
 
 - `zig build test` on your machine is as it was: the browser tests run with the rest.
