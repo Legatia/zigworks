@@ -23,7 +23,7 @@ pub const Reading = struct {
 /// The reading as paymcp's record takes it: what was found, and what the
 /// reading could not have seen.
 pub fn forRecord(r: Reading) record.Reading {
-    return .{ .findings = r.findings, .now = r.now, .whole = r.data.whole, .who_given = r.who_given, .usage_read = r.data.usage_read };
+    return .{ .findings = r.findings, .now = r.now, .whole = r.data.whole, .who_given = r.who_given, .usage_read = r.data.usage_read, .disputes_read = r.data.disputes_read };
 }
 
 /// error.Failed with `why` set when the business's file can't be read or

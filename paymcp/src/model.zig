@@ -183,6 +183,57 @@ pub const Customer = struct {
     }
 };
 
+/// A card payment the cardholder's bank asks about or has taken back.
+pub const Dispute = struct {
+    id: []const u8 = "",
+    charge: []const u8 = "",
+    customer: []const u8 = "",
+    amount: i64 = 0,
+    currency: []const u8 = "",
+    /// The provider's word for why: fraudulent, product_not_received, ...
+    reason: []const u8 = "",
+    /// needs_response, warning_needs_response (an inquiry), under_review, won, lost, ...
+    status: []const u8 = "",
+    created: i64 = 0,
+    /// The last moment an answer is taken; null: none is, or it isn't said.
+    due_by: ?i64 = null,
+    /// Evidence is already kept at the provider, not yet sent to the bank.
+    has_evidence: bool = false,
+    past_due: bool = false,
+    /// Times evidence was sent to the bank.
+    submissions: u32 = 0,
+    brand: []const u8 = "",
+    /// The card network's own code for the reason.
+    code: []const u8 = "",
+    // from the charge, when it came with the dispute
+    charge_known: bool = false,
+    charged: i64 = 0,
+    description: []const u8 = "",
+    payer_name: []const u8 = "",
+    payer_email: []const u8 = "",
+    payer_address: []const u8 = "",
+
+    pub fn needsAnswer(d: Dispute) bool {
+        for ([_][]const u8{ "needs_response", "warning_needs_response", "appeal_needs_response" }) |s| if (std.mem.eql(u8, d.status, s)) return true;
+        return false;
+    }
+
+    /// The bank asks before taking the money back: answering, or
+    /// refunding, can end it here.
+    pub fn inquiry(d: Dispute) bool {
+        return std.mem.startsWith(u8, d.status, "warning_");
+    }
+};
+
+/// A payment of a customer's, as far as an answer to a dispute counts it.
+pub const Charge = struct {
+    id: []const u8 = "",
+    created: i64 = 0,
+    amount: i64 = 0,
+    /// Paid, and neither disputed nor refunded.
+    clean: bool = false,
+};
+
 // ---- from the provider's JSON ----
 
 fn strOf(v: ?jv.Value, key: []const u8) []const u8 {
@@ -299,6 +350,57 @@ pub fn invoice(v: ?jv.Value) Invoice {
 
 pub fn customer(v: ?jv.Value) Customer {
     return .{ .id = strOf(v, "id"), .email = strOf(v, "email"), .name = strOf(v, "name") };
+}
+
+/// A dispute; its charge's details where the charge came expanded.
+pub fn dispute(a: std.mem.Allocator, v: ?jv.Value) !Dispute {
+    var d: Dispute = .{
+        .id = strOf(v, "id"),
+        .charge = idOf(jv.get(v, "charge")),
+        .amount = jv.int(jv.get(v, "amount")) orelse 0,
+        .currency = strOf(v, "currency"),
+        .reason = strOf(v, "reason"),
+        .status = strOf(v, "status"),
+        .created = jv.int(jv.get(v, "created")) orelse 0,
+        .has_evidence = jv.boolean(jv.at(v, &.{ "evidence_details", "has_evidence" })) orelse false,
+        .past_due = jv.boolean(jv.at(v, &.{ "evidence_details", "past_due" })) orelse false,
+        .submissions = @intCast(@max(0, @min(jv.int(jv.at(v, &.{ "evidence_details", "submission_count" })) orelse 0, 1 << 20))),
+        .brand = strOf(jv.at(v, &.{ "payment_method_details", "card" }), "brand"),
+        .code = strOf(jv.at(v, &.{ "payment_method_details", "card" }), "network_reason_code"),
+    };
+    // (0: the bank takes no answer)
+    if (jv.int(jv.at(v, &.{ "evidence_details", "due_by" }))) |due| if (due > 0) {
+        d.due_by = due;
+    };
+    const ch = jv.get(v, "charge");
+    if (ch != null and ch.? == .object) {
+        d.charge_known = true;
+        d.customer = idOf(jv.get(ch, "customer"));
+        d.charged = jv.int(jv.get(ch, "created")) orelse 0;
+        d.description = strOf(ch, "description");
+        const bill = jv.get(ch, "billing_details");
+        d.payer_name = strOf(bill, "name");
+        d.payer_email = strOf(bill, "email");
+        if (d.payer_email.len == 0) d.payer_email = strOf(ch, "receipt_email");
+        const ad = jv.get(bill, "address");
+        var parts: std.ArrayList([]const u8) = .empty;
+        for ([_][]const u8{ "line1", "line2", "postal_code", "city", "state", "country" }) |k| {
+            const part = strOf(ad, k);
+            if (part.len > 0) try parts.append(a, part);
+        }
+        d.payer_address = try std.mem.join(a, ", ", parts.items);
+    }
+    return d;
+}
+
+pub fn charge(v: ?jv.Value) Charge {
+    const paid = (jv.boolean(jv.get(v, "paid")) orelse false) and std.mem.eql(u8, strOf(v, "status"), "succeeded");
+    return .{
+        .id = strOf(v, "id"),
+        .created = jv.int(jv.get(v, "created")) orelse 0,
+        .amount = jv.int(jv.get(v, "amount")) orelse 0,
+        .clean = paid and !(jv.boolean(jv.get(v, "disputed")) orelse false) and !(jv.boolean(jv.get(v, "refunded")) orelse false) and (jv.int(jv.get(v, "amount_refunded")) orelse 0) == 0,
+    };
 }
 
 // ---- amounts and days, as a person reads them ----

@@ -51,8 +51,10 @@ EXPECTED = """\
 With examples/sandbox.ini (every "how old" setting at 0, since nothing in a
 new sandbox is old) the audit should say:
 
-  17 findings: 371.00 EUR a month and 1259.00 EUR once; 1 with an amount this audit can't know.
+  21 findings: 371.00 EUR a month and 1486.00 EUR once; 1 with an amount this audit can't know.
 
+   60.00 once      A card dispute to answer             Alder Works (an inquiry: the bank asks)
+   48.00 once      A card dispute to answer             Birch Studio (says nothing was received; 2 earlier payments)
    87.00 a month   Free, and has been for a while       Elm & Sons (everything off, for ever)
    68.00 a month   A higher plan than paid for          Birch Studio (pro in the product, billed for team)
    58.00 a month   Using the product, not paying        Cedar Co (subscription cancelled)
@@ -65,19 +67,24 @@ new sandbox is old) the audit should say:
   340.00 once      Invoices past due                    Dogwood Labs (due two minutes after seeding)
   126.00 once      Use that was never reported          Fir Analytics (15300 used, 9000 reported)
   120.00 once      Invoices written off                 Ivy Partners (one uncollectible, one void)
+   90.00 once      Disputes lost without an answer      Cedar Co (a dispute the script closed unanswered)
    58.00 once      An invoice never sent                Cedar Co (the cancelled subscription's draft)
    58.00 once      An invoice never sent                Ivy Partners (the cancelled subscription's draft)
    48.00 once      Payments that failed                 Birch Studio (the test card that is always refused)
    29.00 once      An invoice never charged             Hazel Design
+   29.00 once      Invoices written off                 Gorse Ltd (voided by the pause, about an hour after seeding)
    not known       Free, and has been for a while       Larch (a price of zero)
 
 Nothing about Juniper (a yearly plan, a discount that ends) or Kapok (in
 trial). Where Stripe's answer differs from this list, the difference is
 what the run is for: note it.
 
-This is what a run on 2026-11-27 gave. The two drafts at 58.00 are not in
-paymcp-sim's business: Stripe leaves a cancelled subscription's first
-invoice a draft that it will never send.
+This is what a run on 2026-11-27 gave. The first two come first, by the
+day they are to be answered; the test card for an inquiry gives the reason
+"fraudulent". Three are not in paymcp-sim's business: Stripe leaves a
+cancelled subscription's first invoice a draft that it will never send
+(the two at 58.00), and it voids the invoice of a subscription whose
+collection is paused with "void" (Gorse's 29.00).
 
 For the first minutes after seeding: Dogwood's invoice is not yet past
 due (Stripe takes no due date in the past, so it is due two minutes after
@@ -309,6 +316,43 @@ def late(s, cus):
         raise Fail(f"the payment of invoice {unpaid} was meant to be refused and wasn't (status {paid.get('status')})")
 
 
+def disputes_there(s, cus):
+    got = s.call("GET", "/v1/payment_intents", [("customer", cus["birch"]), ("limit", "100")]).get("data") or []
+    return any((pi.get("metadata") or {}).get("paymcp_seed") == "dispute" for pi in got)
+
+
+def disputes(s, cus):
+    """Card disputes, made by Stripe's own test cards: a payment with one
+    of them succeeds and is disputed at once. Test payments: no card is
+    charged and no bank is asked."""
+    tag = ("metadata[paymcp_seed]", "dispute")
+
+    def pay(who, amount, what, card):
+        pi = s.make("payment", "/v1/payment_intents", [("amount", str(amount)), ("currency", "eur"), ("customer", cus[who]), ("payment_method", card), ("automatic_payment_methods[enabled]", "true"), ("automatic_payment_methods[allow_redirects]", "never"), ("confirm", "true"), ("description", what), tag])
+        return pi
+
+    # Birch paid twice before, then says nothing was received
+    pay("birch", 4800, "Team plan, September", "pm_card_visa")
+    pay("birch", 4800, "Team plan, October", "pm_card_visa")
+    if not s.dry:
+        time.sleep(2)  # the disputed payment is later than the two before it
+    pay("birch", 4800, "Team plan, November", "pm_card_createDisputeProductNotReceived")
+    # Alder's bank asks before taking anything back
+    pay("alder", 6000, "Team plan, November", "pm_card_createDisputeInquiry")
+    # Cedar's is closed with no answer sent: lost, as one nobody saw in time
+    lost = pay("cedar", 9000, "Pro plan, October", "pm_card_createDispute")
+    dp = "dry_dispute"
+    for _ in range(15):
+        got = s.call("GET", "/v1/disputes", [("payment_intent", lost), ("limit", "1")]).get("data") or []
+        if got or s.dry:
+            dp = got[0]["id"] if got else dp
+            break
+        time.sleep(2)
+    else:
+        raise Fail(f"the payment {lost} was meant to be disputed and no dispute came within 30 seconds")
+    s.call("POST", f"/v1/disputes/{dp}/close")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Fill a Stripe sandbox with paymcp-sim's made-up business.")
     ap.add_argument("--dry-run", action="store_true", help="print the requests, send nothing (needs no key)")
@@ -329,8 +373,9 @@ def main():
             if not sys.stdin.isatty():
                 sys.exit("seed-sandbox: nobody to ask (no terminal). Run it with --yes once you have read what it does.")
             print("This creates, in the Stripe sandbox the key belongs to: 12 customers, 12 subscriptions,")
-            print("6 invoices, 6 prices, 4 products, 3 coupons, a meter and a meter event. The one payment")
-            print("method added is the test card that is always refused, so nothing is charged; the")
+            print("6 invoices, 6 prices, 4 products, 3 coupons, a meter and a meter event, and five test")
+            print("payments with Stripe's own test cards, three of which those cards dispute (one dispute")
+            print("is then closed unanswered). No real card is charged and no bank is asked; the")
             print("customers' addresses end in .example.")
             try:
                 answer = input("Go on? [y/N] ")
@@ -342,13 +387,16 @@ def main():
     s = Stripe(args.url.rstrip("/"), key, args.dry_run)
     try:
         cus, made = seed(s)
-        if not s.dry and late_there(s, cus):
-            if not made:
-                raise Fail("the made-up business is already in this sandbox, with nothing missing. Nothing was sent. Use a new sandbox to start again.")
-        else:
-            if not made:
-                print("The made-up business is already in this sandbox: adding only the money owed and late.")
+        no_late = s.dry or not late_there(s, cus)
+        no_disputes = s.dry or not disputes_there(s, cus)
+        if not made and not no_late and not no_disputes:
+            raise Fail("the made-up business is already in this sandbox, with nothing missing. Nothing was sent. Use a new sandbox to start again.")
+        if not made:
+            print("The made-up business is already in this sandbox: adding only what is missing (" + " and ".join(x for x, missing in (("the money owed and late", no_late), ("the card disputes", no_disputes)) if missing) + ").")
+        if no_late:
             late(s, cus)
+        if no_disputes:
+            disputes(s, cus)
     except Fail as e:
         print(f"seed-sandbox: {e}", file=sys.stderr)
         if s.made:
@@ -357,7 +405,7 @@ def main():
     if args.dry_run:
         print(f"\n{s.n} requests would be sent. Nothing was sent.")
         return 0
-    print(f"Done: {s.n} requests, {len(s.made)} objects made. Nothing was charged.\n")
+    print(f"Done: {s.n} requests, {len(s.made)} objects made. No real card was charged: the payments are test payments.\n")
     print("Now, with a restricted key that can only read (README, The key), or this sandbox's secret key:\n")
     print("  STRIPE_KEY=rk_test_... paymcp check examples/sandbox.ini")
     print("  STRIPE_KEY=rk_test_... paymcp audit examples/sandbox.ini\n")

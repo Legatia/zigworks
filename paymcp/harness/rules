@@ -6,6 +6,7 @@ allow mcp billing/billing_audit *
 allow mcp billing/billing_finding *
 allow mcp billing/billing_record *
 allow mcp billing/billing_draft *
+allow mcp billing/dispute_evidence *
 
 # The Money page: it may read, and write the decision you press.
 [app:money]

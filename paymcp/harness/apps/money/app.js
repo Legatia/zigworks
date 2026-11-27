@@ -151,6 +151,14 @@
       pickRow.append(pick);
       into.append(pickRow);
     }
+    if (one.evidence) {
+      into.append(el("h2", null, "The evidence draft"));
+      into.append(el("p", "meta", "What the account already shows, and what only you have. Nothing here sends it: sending is final, and yours to do at the provider."));
+      var ev = el("textarea");
+      ev.readOnly = true;
+      ev.value = one.evidence;
+      into.append(ev);
+    }
     if (one.state == null) {
       into.append(el("p", "meta", "No record is kept (the pay file says record = none), so a decision has nowhere to be written."));
       return;

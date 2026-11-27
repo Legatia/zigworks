@@ -23,6 +23,9 @@ pub const Options = struct {
     now: i64,
     /// Whether the key may read the meters.
     meters: bool = true,
+    /// Card disputes: the business has none, has some, or the key may not
+    /// read them.
+    disputes: enum { none, some, denied } = .none,
 };
 
 pub const customer_count = 12;
@@ -62,6 +65,7 @@ pub const Sim = struct {
     prices: std.ArrayList(Obj) = .empty,
     subscriptions: std.ArrayList(Obj) = .empty,
     invoices: std.ArrayList(Obj) = .empty,
+    disputes: std.ArrayList(Obj) = .empty,
     /// Requests refused for what they were (not a GET, no pinned version).
     refused: u32 = 0,
     /// Answer 429 to this many requests before answering again.
@@ -74,6 +78,7 @@ pub fn start(gpa: Allocator, io: Io, opts: Options) !*Sim {
     const s = try gpa.create(Sim);
     s.* = .{ .gpa = gpa, .io = io, .opts = opts };
     try seed(s);
+    if (opts.disputes == .some) try seedDisputes(s);
     s.listener = try sock.Listener.open(opts.port);
     s.port = s.listener.port;
     const th = try std.Thread.spawn(.{}, acceptLoop, .{s});
@@ -261,6 +266,52 @@ fn seed(s: *Sim) !void {
     }
 }
 
+const Dp = struct { id: []const u8, customer: []const u8, payer: []const u8, email: []const u8, amount: i64, reason: []const u8, status: []const u8, age_days: i64, due_in_days: ?i64 = null, sent: u8 = 0, code: []const u8 = "", what: []const u8 = "Team plan" };
+
+/// The disputes of the made-up business (with `disputes = .some`): one to
+/// answer, one inquiry, one lost with nothing ever sent, one won.
+const sim_disputes = [_]Dp{
+    .{ .id = "du_birch", .customer = "cus_birch", .payer = "Ola Birch", .email = "ola@birch.example", .amount = 4800, .reason = "product_not_received", .status = "needs_response", .age_days = 5, .due_in_days = 9, .code = "13.1" },
+    .{ .id = "du_alder_inq", .customer = "cus_alder", .payer = "A. Alder", .email = "billing@alder.example", .amount = 6000, .reason = "unrecognized", .status = "warning_needs_response", .age_days = 2, .due_in_days = 5 },
+    .{ .id = "du_ivy_lost", .customer = "cus_ivy", .payer = "Ivy Partners", .email = "accounts@ivy.example", .amount = 9000, .reason = "fraudulent", .status = "lost", .age_days = 60, .code = "10.4" },
+    .{ .id = "du_juniper_won", .customer = "cus_juniper", .payer = "J. Juniper", .email = "j@juniper.example", .amount = 2900, .reason = "duplicate", .status = "won", .age_days = 90, .sent = 1 },
+};
+
+fn chargeJson(a: Allocator, d: Dp, now: i64) ![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\{{"id":"ch_{s}","object":"charge","amount":{d},"amount_refunded":0,"billing_details":{{"address":{{"city":"Gdansk","country":"PL","line1":"1 Harbour Street","line2":null,"postal_code":"80-001","state":null}},"email":"{s}","name":"{s}","phone":null}},"created":{d},"currency":"eur","customer":"{s}","description":"{s}","disputed":true,"livemode":false,"paid":true,"receipt_email":"{s}","refunded":false,"status":"succeeded"}}
+    , .{ d.id[3..], d.amount, d.email, d.payer, now - (d.age_days + 12) * day, d.customer, d.what, d.email });
+}
+
+fn seedDisputes(s: *Sim) !void {
+    const a = s.gpa;
+    const now = s.opts.now;
+    for (sim_disputes) |d| {
+        const created = now - d.age_days * day;
+        const fmt =
+            \\{{"id":"{s}","object":"dispute","amount":{d},"balance_transactions":[],"charge":{s},"created":{d},"currency":"eur","evidence_details":{{"due_by":{s},"has_evidence":false,"past_due":false,"submission_count":{d}}},"is_charge_refundable":false,"livemode":false,"metadata":{{}},"payment_intent":null,"payment_method_details":{{"card":{{"brand":"visa","case_type":"{s}","network_reason_code":{s}}},"type":"card"}},"reason":"{s}","status":"{s}"}}
+        ;
+        const due = if (d.due_in_days) |n| try std.fmt.allocPrint(a, "{d}", .{now + n * day}) else "null";
+        const case = if (std.mem.startsWith(u8, d.status, "warning_")) "inquiry" else "chargeback";
+        const plain = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try std.fmt.allocPrint(a, "\"ch_{s}\"", .{d.id[3..]}), created, due, d.sent, case, try q(a, d.code), d.reason, d.status });
+        const full = try std.fmt.allocPrint(a, fmt, .{ d.id, d.amount, try chargeJson(a, d, now), created, due, d.sent, case, try q(a, d.code), d.reason, d.status });
+        try s.disputes.append(a, .{ .id = d.id, .status = d.status, .created = created, .json = plain, .expanded = full });
+    }
+}
+
+/// What a customer paid before, for an answer to a dispute: Birch six
+/// times since last spring, nobody else anything.
+fn chargesJson(a: Allocator, customer: []const u8, now: i64) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (std.mem.eql(u8, customer, "cus_birch")) {
+        // the disputed one, then the six before it
+        try out.print(a, "{{\"id\":\"ch_birch\",\"object\":\"charge\",\"amount\":4800,\"amount_refunded\":0,\"created\":{d},\"currency\":\"eur\",\"customer\":\"cus_birch\",\"disputed\":true,\"paid\":true,\"refunded\":false,\"status\":\"succeeded\"}}", .{now - 17 * day});
+        var i: i64 = 1;
+        while (i <= 6) : (i += 1) try out.print(a, ",{{\"id\":\"ch_birch_{d}\",\"object\":\"charge\",\"amount\":4800,\"amount_refunded\":0,\"created\":{d},\"currency\":\"eur\",\"customer\":\"cus_birch\",\"disputed\":false,\"paid\":true,\"refunded\":false,\"status\":\"succeeded\"}}", .{ i, now - (17 + 30 * i) * day });
+    }
+    return std.fmt.allocPrint(a, "{{\"object\":\"list\",\"data\":[{s}],\"has_more\":false,\"url\":\"/v1/charges\"}}", .{out.items});
+}
+
 /// Use reported to the meter in the current period, a customer.
 fn reported(customer: []const u8) f64 {
     if (std.mem.eql(u8, customer, "cus_fir")) return 9000;
@@ -406,6 +457,11 @@ fn handle(s: *Sim, a: Allocator, req: Req) !Res {
     if (std.mem.eql(u8, p, "/v1/prices")) return page(s, a, req, s.prices.items, "/v1/prices", .active);
     if (std.mem.eql(u8, p, "/v1/subscriptions")) return page(s, a, req, s.subscriptions.items, "/v1/subscriptions", .subscription);
     if (std.mem.eql(u8, p, "/v1/invoices")) return page(s, a, req, s.invoices.items, "/v1/invoices", .invoice);
+    if (std.mem.eql(u8, p, "/v1/disputes")) {
+        if (s.opts.disputes == .denied) return err(a, 403, "invalid_request_error", "", "The provided key does not have the required permissions for this endpoint. Having the 'dispute_read' permission would allow this request to continue.");
+        return page(s, a, req, s.disputes.items, "/v1/disputes", .any);
+    }
+    if (std.mem.eql(u8, p, "/v1/charges")) return .{ .status = 200, .body = try chargesJson(a, try param(a, req.query, "customer"), s.opts.now) };
     const meters = "/v1/billing/meters/";
     if (std.mem.startsWith(u8, p, meters) and std.mem.endsWith(u8, p, "/event_summaries")) {
         if (!s.opts.meters) return err(a, 403, "invalid_request_error", "", "The provided key does not have the required permissions for this endpoint. Having the 'billing_meter_event_read' permission would allow this request to continue.");
@@ -436,7 +492,7 @@ fn page(s: *Sim, a: Allocator, req: Req, all: []const Obj, url: []const u8, filt
     const status = try param(a, req.query, "status");
     const active = try param(a, req.query, "active");
     const since = std.fmt.parseInt(i64, try param(a, req.query, "created[gte]"), 10) catch std.math.minInt(i64);
-    const expand = try hasParam(a, req.query, "expand[]", "data.discounts.source.coupon");
+    const expand = try hasParam(a, req.query, "expand[]", "data.discounts.source.coupon") or try hasParam(a, req.query, "expand[]", "data.charge");
     const after = try param(a, req.query, "starting_after");
     var out: std.ArrayList(u8) = .empty;
     var started = after.len == 0;

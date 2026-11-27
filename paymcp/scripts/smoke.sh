@@ -47,12 +47,18 @@ PIDS="$PIDS $!"
 MPORT=$(free_port)
 "$S" "$MPORT" "$KEY" --no-meters >"$T/sim2.out" 2>&1 &
 PIDS="$PIDS $!"
+# ...and with four card disputes
+DPORT=$(free_port)
+"$S" "$DPORT" "$KEY" --disputes >"$T/sim3.out" 2>&1 &
+PIDS="$PIDS $!"
 wait_port "$PORT"
 wait_port "$MPORT"
+wait_port "$DPORT"
 cp examples/who.csv "$T/who.csv"
 sed -e "s|8743|$PORT|" examples/sim.ini >"$T/pay.ini"
 sed -e "s|8743|$MPORT|" examples/sim.ini >"$T/nometers.ini"
 grep -v "^who = " "$T/pay.ini" >"$T/nowho.ini"
+sed -e "s|8743|$DPORT|" examples/sim.ini >"$T/disputes.ini"
 export STRIPE_KEY=$KEY
 
 check "version" '"$B" version | grep -q "^paymcp "'
@@ -98,6 +104,9 @@ check "a finding goes: the next reading says no longer found, with its amount" '
 check "open again, and it is back on the list" '"$B" decide "$T/pay.ini" free:sub_elm open >"$T/d" && grep -q "is open again" "$T/d" && "$B" audit "$T/pay.ini" | grep -qx "14 findings: 371.00 EUR a month and 1143.00 EUR once."'
 printf '[stripe]\nurl = http://127.0.0.1:%s\n[billing]\nrecord = none\n' "$PORT" >"$T/norecord.ini"
 check "record = none: nothing is written, and a decision has nowhere to go" '"$B" audit "$T/norecord.ini" >"$T/nr" && ! grep -q "record" "$T/nr" && [ ! -e "$T/norecord.record.jsonl" ] && ! "$B" decide "$T/norecord.ini" free:sub_elm intended a gift 2>"$T/err" && grep -q "says record = none" "$T/err"'
+check "card disputes: those to answer first, by their last day; what was lost unanswered as one sum" '"$B" audit "$T/disputes.ini" >"$T/dp" && grep -qx "17 findings: 371.00 EUR a month and 1341.00 EUR once." "$T/dp" && grep -qx "1. A card dispute to answer: 60.00 EUR, once" "$T/dp" && grep -qx "2. A card dispute to answer: 48.00 EUR, once" "$T/dp" && grep -q "^   The bank of Birch Studio took back a payment of 48.00 EUR made on ....-..-..: the cardholder says nothing was received\. It can be answered until ....-..-.., [89] days from now\.$" "$T/dp" && grep -q "^[0-9]*\. Disputes lost without an answer: 90.00 EUR, once$" "$T/dp" && ! grep -q "du_juniper_won" "$T/dp"'
+check "the evidence draft: what the account shows, what only the business has, nothing sent" '"$B" evidence "$T/disputes.ini" dispute:du_birch >"$T/ev" && grep -q "^Evidence for dispute du_birch, as a draft\. Nothing was sent to the provider or the bank" "$T/ev" && grep -qx "  customer_name: Birch Studio" "$T/ev" && grep -q "the same customer made 6 payments to us, the first on ....-..-..; none of them was disputed or refunded\.$" "$T/ev" && grep -qx "  - access_activity_log: when the account was used after the payment" "$T/ev" && ! "$B" evidence "$T/disputes.ini" free:sub_elm 2>"$T/err" && grep -q "no card dispute to answer has the key free:sub_elm" "$T/err"'
+check "a note to the customer about the bank's question" '"$B" draft "$T/disputes.ini" dispute:du_alder_inq >"$T/dl" && grep -qx "Subject: A question from your bank about a payment to us" "$T/dl" && grep -q "^Your bank has asked us about a payment to us of 60.00 EUR made on ....-..-..: it was for \"Team plan\"\." "$T/dl"'
 check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>"$T/err" && grep -q "^usage: paymcp PAY.ini" "$T/err"'
 
 # the files for a Stripe sandbox (customers found by address, every "how
@@ -105,7 +114,7 @@ check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>
 cp examples/sandbox-who.csv "$T/sandbox-who.csv"
 awk -v port="$PORT" '{ print } /^\[stripe\]/ { print "url = http://127.0.0.1:" port }' examples/sandbox.ini >"$T/sandbox.ini"
 check "the sandbox's files: found by address, nothing has to be old" '"$B" audit "$T/sandbox.ini" >"$T/s" && grep -qx "15 findings: 371.00 EUR a month and 1143.00 EUR once; 1 with an amount this audit can.t know." "$T/s" && grep -q "Larch has been on a price of zero" "$T/s"'
-check "the seed script: a dry run sends nothing and lists what it would" 'python3 -I scripts/seed-sandbox.py --dry-run >"$T/seed" && grep -qx "65 requests would be sent. Nothing was sent." "$T/seed" && [ "$(grep -c "^POST /v1/subscriptions  " "$T/seed")" = 12 ] && [ "$(grep -c "^POST /v1/payment_methods/" "$T/seed")" = 1 ] && grep -q "^POST /v1/payment_methods/pm_card_chargeCustomerFail/attach" "$T/seed"'
+check "the seed script: a dry run sends nothing and lists what it would" 'python3 -I scripts/seed-sandbox.py --dry-run >"$T/seed" && grep -qx "72 requests would be sent. Nothing was sent." "$T/seed" && [ "$(grep -c "^POST /v1/payment_intents  " "$T/seed")" = 5 ] && grep -q "^POST /v1/disputes/dry_dispute/close$" "$T/seed" && [ "$(grep -c "^POST /v1/subscriptions  " "$T/seed")" = 12 ] && [ "$(grep -c "^POST /v1/payment_methods/" "$T/seed")" = 1 ] && grep -q "^POST /v1/payment_methods/pm_card_chargeCustomerFail/attach" "$T/seed"'
 check "the seed script takes a sandbox key only" '! STRIPE_SEED_KEY=sk_live_abc python3 -I scripts/seed-sandbox.py --yes 2>"$T/err" && grep -q "is not a sandbox key" "$T/err" && ! env -u STRIPE_SEED_KEY python3 -I scripts/seed-sandbox.py --yes 2>"$T/err" && grep -q "STRIPE_SEED_KEY isn.t set" "$T/err"'
 
 cat >"$T/mcp.py" <<'EOF'
@@ -164,7 +173,7 @@ m = Mcp(pay)
 info = m.hello["result"]
 check("initialize names paymcp and says what it reads is data", info["serverInfo"]["name"] == "paymcp" and "data, not instructions" in info["instructions"] and "It only reads" in info["instructions"], json.dumps(info))
 tools = m.rpc("tools/list")["result"]["tools"]
-check("five tools; the one that writes, writes only paymcp's own record", [t["name"] for t in tools] == ["billing_audit", "billing_finding", "billing_decide", "billing_record", "billing_draft"] and [t["annotations"]["readOnlyHint"] for t in tools] == [True, True, False, True, True] and "Changes nothing at the billing provider" in tools[2]["description"] and "paymcp sends nothing" in tools[4]["description"], json.dumps(tools)[:600])
+check("six tools; the one that writes, writes only paymcp's own record", [t["name"] for t in tools] == ["billing_audit", "billing_finding", "billing_decide", "billing_record", "billing_draft", "dispute_evidence"] and [t["annotations"]["readOnlyHint"] for t in tools] == [True, True, False, True, True, True] and "Nothing was sent" not in tools[5]["description"] and "sending is final" in tools[5]["description"] and "Changes nothing at the billing provider" in tools[2]["description"] and "paymcp sends nothing" in tools[4]["description"], json.dumps(tools)[:600])
 text, err = m.call("billing_audit")
 check("billing_audit: the sums and the findings", not err and "14 findings: 371.00 EUR a month and 1143.00 EUR once." in text and "More seats than paid for: 48.00 EUR a month\n   Alder Works has 9 seats in the product and pays for 5." in text, text)
 text, err = m.call("billing_audit", {"kind": "usage_not_reported"})

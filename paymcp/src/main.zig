@@ -11,6 +11,7 @@ const server = @import("server.zig");
 const report = @import("report.zig");
 const record = @import("record.zig");
 const job = @import("job.zig");
+const dispute = @import("dispute.zig");
 
 const usage =
     \\usage: paymcp PAY.ini                        serve MCP on stdin and stdout (what an agent starts)
@@ -20,6 +21,7 @@ const usage =
     \\                                             a person's decision about one finding, into paymcp's record
     \\       paymcp record PAY.ini                 the record: what is open, dismissed, and no longer found
     \\       paymcp draft PAY.ini KEY              the draft of a message to the customer about one finding
+    \\       paymcp evidence PAY.ini KEY           what the account already shows against one card dispute
     \\       paymcp version
     \\
     \\The key comes from the environment, never from the file: STRIPE_KEY, a
@@ -30,7 +32,7 @@ const usage =
     \\
 ;
 
-const Cmd = enum { serve, check, audit, decide, record, draft };
+const Cmd = enum { serve, check, audit, decide, record, draft, evidence };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -49,6 +51,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (eql(word, "record")) break :blk if (args.len == 3) .record else return fail(io, usage, 2);
         if (eql(word, "decide")) break :blk if (args.len >= 5) .decide else return fail(io, usage, 2);
         if (eql(word, "draft")) break :blk if (args.len == 4) .draft else return fail(io, usage, 2);
+        if (eql(word, "evidence")) break :blk if (args.len == 4) .evidence else return fail(io, usage, 2);
         if (eql(word, "audit")) {
             if (args.len < 3) return fail(io, usage, 2);
             for (args[3..]) |flag| {
@@ -107,6 +110,12 @@ pub fn main(init: std.process.Init) !u8 {
         try out(io, try std.fmt.allocPrint(a, "{s}{d} requests, every one a GET. The key works and nothing was changed.\n", .{ try report.readText(a, r, &cfg), r.requests }));
         return 0;
     }
+    if (cmd == .evidence) {
+        const wanted = std.mem.trim(u8, args[3], " \t[]");
+        const dp = dispute.find(r.data, wanted) orelse return fail(io, try std.fmt.allocPrint(a, "paymcp: no card dispute to answer has the key {s} now: paymcp audit lists them (dispute:du_...)\n", .{wanted}), 1);
+        try out(io, try dispute.text(a, r.data, dp, r.now));
+        return 0;
+    }
     if (cmd == .draft) {
         // (a reading for a draft is not one for the record: the audit is)
         const wanted = std.mem.trim(u8, args[3], " \t[]");
@@ -146,6 +155,7 @@ test {
     _ = @import("report.zig");
     _ = @import("job.zig");
     _ = @import("record.zig");
+    _ = @import("dispute.zig");
     _ = @import("server.zig");
     _ = @import("jv.zig");
     _ = @import("ini.zig");

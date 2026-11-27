@@ -24,6 +24,10 @@
 //!   team = team_monthly
 //!   pro = price_1Qx...
 //!
+//!   [disputes]
+//!   read = yes                      ; card disputes: those to answer, and those lost unanswered
+//!   days = 180                      ; how far back
+//!
 //!   [letters]
 //!   from = Ola at Fernhill          ; who a drafted message to a customer is from
 //!
@@ -132,6 +136,14 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 }
                 c.rules.current = list.items;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[billing] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "disputes")) {
+            if (eql(e.key, "read")) {
+                if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "read is yes or no");
+                c.rules.disputes = eql(e.value, "yes");
+            } else if (eql(e.key, "days")) {
+                c.rules.dispute_days = try days(a, diag, e);
+                if (c.rules.dispute_days < 1) return bad(diag, e.line, "days is 1 or more");
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[disputes] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "letters")) {
             if (eql(e.key, "from")) {
                 c.letter_from = e.value;
@@ -139,7 +151,7 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans] and [letters]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes] and [letters]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;

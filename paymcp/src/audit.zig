@@ -36,7 +36,15 @@ pub const Rules = struct {
     plans: []const Plan = &.{},
     /// Use in the product may exceed use reported by this much before it is asked about.
     usage_margin_percent: u32 = 1,
+    /// Whether card disputes are read.
+    disputes: bool = true,
+    /// How far back disputes are read, and lost ones counted.
+    dispute_days: u32 = 180,
 };
+
+/// What a customer paid before a disputed payment, and never took back:
+/// what a bank weighs most against "it wasn't me".
+pub const Earlier = struct { customer: []const u8, paid: u32 = 0, first: i64 = 0 };
 
 /// Use the provider was told of, for one metered subscription item in its
 /// current period.
@@ -49,6 +57,10 @@ pub const Data = struct {
     invoices: []const model.Invoice = &.{},
     rows: []const who.Row = &.{},
     usage: []const Usage = &.{},
+    disputes: []const model.Dispute = &.{},
+    earlier: []const Earlier = &.{},
+    /// The disputes could be read (false: none are known, not none exist).
+    disputes_read: bool = true,
     /// Something could not be read whole (a page limit, a permission): said
     /// with the findings, since what wasn't read can't be found.
     gaps: []const []const u8 = &.{},
@@ -73,6 +85,8 @@ pub const Kind = enum {
     not_paying,
     usage_not_reported,
     no_customer,
+    dispute,
+    disputes_unanswered,
 
     pub fn title(k: Kind) []const u8 {
         return switch (k) {
@@ -90,6 +104,8 @@ pub const Kind = enum {
             .not_paying => "Using the product, not paying",
             .usage_not_reported => "Use that was never reported",
             .no_customer => "Using the product, not in billing at all",
+            .dispute => "A card dispute to answer",
+            .disputes_unanswered => "Disputes lost without an answer",
         };
     }
 };
@@ -191,11 +207,18 @@ pub fn run(a: Allocator, d: Data, r: Rules, now: i64) ![]Finding {
     try writtenOff(&c);
     try late(&c);
     try whoRows(&c);
+    try disputes(&c);
     std.mem.sort(Finding, c.out.items, {}, lessThan);
     return c.out.items;
 }
 
 fn lessThan(_: void, x: Finding, y: Finding) bool {
+    // what has a last day comes first, the nearest day first
+    if (x.due != null or y.due != null) {
+        if (x.due == null) return false;
+        if (y.due == null) return true;
+        if (x.due.? != y.due.?) return x.due.? < y.due.?;
+    }
     if (x.per != y.per) return @intFromEnum(x.per) < @intFromEnum(y.per);
     if (x.amount != y.amount) return x.amount > y.amount;
     return std.mem.lessThan(u8, x.key, y.key);
@@ -462,7 +485,7 @@ fn writtenOff(c: *Ctx) !void {
             .amount = sum,
             .currency = first.currency,
             .per = .once,
-            .what = try c.p("{d} invoice{s} to {s}, {s} together, were marked uncollectible or voided after being sent in the last {d} days.", .{ list.items.len, if (list.items.len == 1) "" else "s", c.nameOf(first.customer), try c.money(sum, first.currency), c.r.written_off_days }),
+            .what = try c.p("{d} invoice{s} to {s}, {s} together, {s} marked uncollectible or voided after being sent in the last {d} days.", .{ list.items.len, if (list.items.len == 1) "" else "s", c.nameOf(first.customer), try c.money(sum, first.currency), if (list.items.len == 1) "was" else "were", c.r.written_off_days }),
             .rows = list.items,
             .proposal = "Check each was given up on purpose. One written off by a rule (after failed payments, or on a pause) can still be asked for.",
         });
@@ -570,6 +593,140 @@ fn isWrittenOff(inv: model.Invoice, since: i64) bool {
     if (inv.status == .uncollectible) return true;
     // a void counts only if the invoice had been sent
     return inv.status == .void and inv.finalized_at != null;
+}
+
+// ---- card disputes ----
+
+pub const Reason = struct {
+    /// What the cardholder says, in a few words.
+    says: []const u8,
+    /// What a bank wants to see against it.
+    wants: []const u8,
+};
+
+/// The provider's reasons in plain words, and what answers each.
+pub fn reasonOf(reason: []const u8) Reason {
+    const eql = std.mem.eql;
+    if (eql(u8, reason, "fraudulent")) return .{ .says = "the cardholder says they didn't make it", .wants = "that the person who paid is your customer: the name and address on the account against the card's, earlier payments from them that were never disputed, and logins or use after the payment" };
+    if (eql(u8, reason, "product_not_received")) return .{ .says = "the cardholder says nothing was received", .wants = "that it was delivered: when the account was used after the payment, and what was delivered and when" };
+    if (eql(u8, reason, "product_unacceptable")) return .{ .says = "the cardholder says it was not as described", .wants = "what was promised and what was delivered, and your reply to any complaint" };
+    if (eql(u8, reason, "subscription_canceled")) return .{ .says = "the cardholder says the subscription was cancelled", .wants = "that it was not cancelled before this payment, or that your terms were shown: the cancellation terms, when a cancellation came in if one did, and use after it" };
+    if (eql(u8, reason, "duplicate")) return .{ .says = "the cardholder says it was charged twice", .wants = "that the two payments are for different things: the other payment and what each paid for. If it was charged twice, refund it" };
+    if (eql(u8, reason, "credit_not_processed")) return .{ .says = "the cardholder says a refund was promised and not given", .wants = "your refund terms and why no refund was due; if one was due, refund it" };
+    if (eql(u8, reason, "unrecognized")) return .{ .says = "the cardholder doesn't recognise the payment", .wants = "what the payment was for and the name it has on a statement; a note to the customer often settles it" };
+    return .{ .says = "no closer reason is given", .wants = "what was sold, that it was delivered, and any exchange with the customer about it" };
+}
+
+fn earlierOf(c: *Ctx, customer: []const u8) ?Earlier {
+    if (customer.len == 0) return null;
+    for (c.d.earlier) |e| if (std.mem.eql(u8, e.customer, customer)) return e;
+    return null;
+}
+
+/// Who a dispute's payment came from, as a person knows them.
+pub fn payerOf(d: Data, dp: model.Dispute) []const u8 {
+    for (d.customers) |cu| if (dp.customer.len > 0 and std.mem.eql(u8, cu.id, dp.customer)) return cu.label();
+    if (dp.payer_name.len > 0) return dp.payer_name;
+    if (dp.payer_email.len > 0) return dp.payer_email;
+    if (dp.customer.len > 0) return dp.customer;
+    return "a payer billing doesn't name";
+}
+
+/// Disputes waiting for an answer, each with its last day; and, as one
+/// sum, those lost in the last months with no answer ever sent.
+fn disputes(c: *Ctx) !void {
+    const since = c.now - @as(i64, c.r.dispute_days) * day_s;
+    var lost: std.StringArrayHashMapUnmanaged(struct { sum: i64 = 0, rows: std.ArrayList(Row) = .empty }) = .empty;
+    for (c.d.disputes) |dp| {
+        const name = payerOf(c.d, dp);
+        const sum = try c.money(dp.amount, dp.currency);
+        if (std.mem.eql(u8, dp.status, "lost") and dp.submissions == 0 and dp.created >= since) {
+            const gop = try lost.getOrPut(c.a, dp.currency);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.sum += dp.amount;
+            try gop.value_ptr.rows.append(c.a, .{ .source = try c.p("dispute {s}", .{dp.id}), .value = try c.p("lost, {s}, {s}, opened {s}, no evidence was ever sent", .{ sum, name, try c.date(dp.created) }) });
+            continue;
+        }
+        if (!dp.needsAnswer()) continue;
+        const why = reasonOf(dp.reason);
+        const paid_on = if (dp.charge_known and dp.charged > 0) try c.p(" made on {s}", .{try c.date(dp.charged)}) else "";
+        const open = dp.due_by != null and !dp.past_due and dp.due_by.? > c.now;
+        const until = if (dp.due_by) |due|
+            (if (open)
+                try c.p("It can be answered until {s}, {d} day{s} from now.", .{ try c.date(due), @divFloor(due - c.now, day_s), if (@divFloor(due - c.now, day_s) == 1) "" else "s" })
+            else
+                try c.p("The time to answer ended on {s}.", .{try c.date(due)}))
+        else
+            "The provider gives no day to answer by.";
+        const what = if (dp.inquiry())
+            try c.p("The bank of {s} asks about a payment of {s}{s}: {s}. It is an inquiry, not yet money taken back. {s}", .{ name, sum, paid_on, why.says, until })
+        else if (std.mem.eql(u8, dp.status, "appeal_needs_response"))
+            try c.p("The dispute over a payment of {s}{s} from {s} is in appeal ({s}). {s}", .{ sum, paid_on, name, why.says, until })
+        else
+            try c.p("The bank of {s} took back a payment of {s}{s}: {s}. {s}", .{ name, sum, paid_on, why.says, until });
+        var rows: std.ArrayList(Row) = .empty;
+        try rows.append(c.a, .{ .source = try c.p("dispute {s}", .{dp.id}), .value = try c.p("status {s}, reason {s}{s}, opened {s}, evidence kept at the provider {s}, sent to the bank {d} time{s}", .{
+            dp.status,
+            if (dp.reason.len > 0) dp.reason else "not given",
+            if (dp.code.len > 0) try c.p(" ({s} code {s})", .{ if (dp.brand.len > 0) dp.brand else "network", dp.code }) else "",
+            try c.date(dp.created),
+            if (dp.has_evidence) "yes" else "no",
+            dp.submissions,
+            if (dp.submissions == 1) "" else "s",
+        }) });
+        if (dp.charge_known) try rows.append(c.a, .{ .source = try c.p("charge {s}", .{dp.charge}), .value = try c.p("{s}{s}{s}{s}", .{
+            if (dp.charged > 0) try c.p("paid {s}", .{try c.date(dp.charged)}) else "paid",
+            if (dp.description.len > 0) try c.p(", for \"{s}\"", .{dp.description}) else "",
+            if (dp.payer_name.len > 0) try c.p(", card of {s}", .{dp.payer_name}) else "",
+            if (dp.payer_email.len > 0) try c.p(" <{s}>", .{dp.payer_email}) else "",
+        }) });
+        if (earlierOf(c, dp.customer)) |e| {
+            try rows.append(c.a, .{ .source = try c.p("customer {s}", .{dp.customer}), .value = if (e.paid > 0)
+                try c.p("{d} earlier payment{s} since {s}, none disputed or refunded", .{ e.paid, if (e.paid == 1) "" else "s", try c.date(e.first) })
+            else
+                "no earlier payment that was neither disputed nor refunded" });
+        }
+        const email = if (c.emailOf(dp.customer).len > 0) c.emailOf(dp.customer) else dp.payer_email;
+        try c.add(.{
+            .kind = .dispute,
+            .key = try c.p("dispute:{s}", .{dp.id}),
+            .customer = dp.customer,
+            .name = name,
+            .amount = dp.amount,
+            .currency = dp.currency,
+            .per = .once,
+            .what = what,
+            .rows = rows.items,
+            .due = if (open) dp.due_by else null,
+            .proposal = if (!open and dp.due_by != null)
+                "Nothing more can be sent to the bank. If the payment was right, the customer can still be asked to pay again."
+            else if (dp.inquiry())
+                try c.p("Answer the bank, or refund the payment: either can end it before it becomes a dispute with a fee. The bank wants to see {s}. The evidence draft has what the account already shows; sending it is final, and yours to do at the provider.", .{why.wants})
+            else
+                try c.p("Answer once, and in time: an answer is taken one time only. The bank wants to see {s}. The evidence draft has what the account already shows; sending it is final, and yours to do at the provider. If the cardholder is right, accept it there instead.", .{why.wants}),
+            .letter = if (email.len == 0 or !open) null else .{
+                .to = email,
+                .subject = "A question from your bank about a payment to us",
+                .body = try c.p("Hello,\n\nYour bank has asked us about a payment to us of {s}{s}{s}. If you did not recognise it, that is what it was.\n\nIf something about it is not right, reply to this message and we will put it right with you directly, which is quicker than through the bank. If it was a mistake at the bank's end, telling them the payment is yours ends it.", .{ sum, paid_on, if (dp.description.len > 0) try c.p(": it was for \"{s}\"", .{dp.description}) else "" }),
+            },
+        });
+    }
+    var it = lost.iterator();
+    while (it.next()) |kv| {
+        const n = kv.value_ptr.rows.items.len;
+        try c.add(.{
+            .kind = .disputes_unanswered,
+            .key = try c.p("disputes_unanswered:{s}", .{kv.key_ptr.*}),
+            .customer = "",
+            .name = try c.p("{d} dispute{s}", .{ n, if (n == 1) "" else "s" }),
+            .amount = kv.value_ptr.sum,
+            .currency = kv.key_ptr.*,
+            .per = .once,
+            .what = try c.p("{d} dispute{s} in the last {d} days, {s} together, {s} lost without an answer ever being sent to the bank.", .{ n, if (n == 1) "" else "s", c.r.dispute_days, try c.money(kv.value_ptr.sum, kv.key_ptr.*), if (n == 1) "was" else "were" }),
+            .rows = kv.value_ptr.rows.items,
+            .proposal = "Nothing brings these back, and this is a count, not money to collect. It is what not answering cost: a reading every week shows the next dispute while there is still time. Dismiss it once you have seen it.",
+        });
+    }
 }
 
 // ---- with the business's own file ----

@@ -198,6 +198,47 @@ pub const Client = struct {
             try usage.append(a, .{ .item = hit.item.id, .value = sum });
         }
         data.usage = usage.items;
+
+        // card disputes of the last months, each with its charge; and for
+        // those to answer, what the same customer paid before
+        if (cfg.rules.disputes) disputes: {
+            raw = .empty;
+            c.list(a, try std.fmt.allocPrint(a, "/v1/disputes?created%5Bgte%5D={d}&expand%5B%5D=data.charge", .{now - @as(i64, cfg.rules.dispute_days) * 86400}), &raw, &complete) catch |e| {
+                if (e == error.OutOfMemory) return e;
+                try gaps.append(a, try std.fmt.allocPrint(a, "card disputes weren't read: {s}. Disputes to answer aren't checked", .{c.why}));
+                data.disputes_read = false;
+                break :disputes;
+            };
+            if (!complete) whole = false;
+            if (!complete) try gaps.append(a, "the list of disputes was cut at the page limit");
+            var list_d: std.ArrayList(model.Dispute) = .empty;
+            for (raw.items) |v| try list_d.append(a, try model.dispute(a, v));
+            data.disputes = list_d.items;
+            var earlier: std.ArrayList(audit.Earlier) = .empty;
+            for (list_d.items) |dp| {
+                if (!dp.needsAnswer() or dp.customer.len == 0) continue;
+                for (earlier.items) |e| {
+                    if (std.mem.eql(u8, e.customer, dp.customer)) break;
+                } else {
+                    // (one page: the newest hundred say enough)
+                    const v = c.get(a, try std.fmt.allocPrint(a, "/v1/charges?customer={s}&limit=100", .{dp.customer})) catch |e| {
+                        if (e == error.OutOfMemory) return e;
+                        try gaps.append(a, try std.fmt.allocPrint(a, "a disputing customer's earlier payments weren't read: {s}. The evidence drafts don't count them", .{c.why}));
+                        break;
+                    };
+                    var seen: audit.Earlier = .{ .customer = dp.customer };
+                    for (jv.arr(jv.get(v, "data")) orelse &.{}) |cv| {
+                        const ch = model.charge(cv);
+                        if (!ch.clean or std.mem.eql(u8, ch.id, dp.charge)) continue;
+                        if (dp.charged > 0 and ch.created >= dp.charged) continue;
+                        seen.paid += 1;
+                        if (seen.first == 0 or ch.created < seen.first) seen.first = ch.created;
+                    }
+                    try earlier.append(a, seen);
+                }
+            }
+            data.earlier = earlier.items;
+        }
         data.gaps = gaps.items;
         data.whole = whole;
         data.usage_read = !meters_refused;

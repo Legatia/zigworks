@@ -169,6 +169,7 @@ pub const Reading = struct {
     whole: bool = true,
     who_given: bool = true,
     usage_read: bool = true,
+    disputes_read: bool = true,
 };
 
 /// Writes one reading into the book and gives the lines to add to the
@@ -212,6 +213,7 @@ pub fn note(a: Allocator, b: *Book, r: Reading) ![]const u8 {
         if (!r.whole) continue;
         if (!r.who_given and needsWho(e.kind)) continue;
         if (!r.usage_read and eql(e.kind, "usage_not_reported")) continue;
+        if (!r.disputes_read and std.mem.startsWith(u8, e.kind, "dispute")) continue;
         try gone.append(a, kv.key_ptr.*);
     }
     for (gone.items) |key| try add(a, b, &lines, try std.fmt.allocPrint(a, "{{\"at\":{d},\"event\":\"gone\",\"key\":{f}}}", .{ r.now, std.json.fmt(key, .{}) }));

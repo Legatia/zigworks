@@ -77,7 +77,6 @@ fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8
     try o.print(a, "{s}{s}: {s}{s}\n   {s}\n", .{ head, f.kind.title(), try amountText(a, f), suffix, try flat(a, f.what) });
     for (f.rows) |row| try o.print(a, "   - {s}: {s}\n", .{ try flat(a, row.source), try flat(a, row.value) });
     if (decided) |d| try o.print(a, "   {s}\n", .{d});
-    if (f.due) |d| try o.print(a, "   To be answered by {s}.\n", .{try model.day(a, d)});
     try o.print(a, "   Proposed: {s}\n", .{f.proposal});
     if (f.letter != null) try o.appendSlice(a, "   A message to the customer is drafted: ask for the draft of this key.\n");
     try o.print(a, "   [{s}]\n", .{try flat(a, f.key)});
@@ -409,7 +408,7 @@ const max_rows = 40;
 
 /// One finding as data: its rows, what is proposed, how it stands in the
 /// record and the draft to the customer.
-pub fn oneJson(a: Allocator, f: audit.Finding, cfg: *const config.Config, book: ?*const record.Book) ![]const u8 {
+pub fn oneJson(a: Allocator, f: audit.Finding, cfg: *const config.Config, book: ?*const record.Book, evidence: ?[]const u8) ![]const u8 {
     var rows: std.ArrayList(JRow) = .empty;
     for (f.rows[0..@min(f.rows.len, max_rows)]) |row| try rows.append(a, .{ .source = try flat(a, row.source), .value = try flat(a, row.value) });
     const entry: ?record.Entry = if (book) |b| b.entries.get(f.key) else null;
@@ -435,6 +434,8 @@ pub fn oneJson(a: Allocator, f: audit.Finding, cfg: *const config.Config, book: 
         .first_found = if (entry) |e| (if (e.first > 0) @as(?[]const u8, try model.day(a, e.first)) else null) else null,
         .due = if (f.due) |d| @as(?[]const u8, try model.day(a, d)) else null,
         .letter = if (body) |b| @as(?struct { to: []const u8, subject: []const u8, body: []const u8 }, .{ .to = try flat(a, f.letter.?.to), .subject = try flat(a, f.letter.?.subject), .body = b }) else null,
+        // a card dispute's evidence, as far as the account shows it
+        .evidence = evidence,
     }, .{});
 }
 
