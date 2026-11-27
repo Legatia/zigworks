@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Money</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<h1>Money</h1>
+<p class="state" id="state">Reading…</p>
+<p class="sums" id="sums"></p>
+<div id="notes"></div>
+<p class="tools">
+<button id="again" type="button">Read the account again</button>
+<label><input type="checkbox" id="all"> Show what was dismissed</label>
+</p>
+<ul class="list" id="list"></ul>
+<p><button id="more" type="button" hidden>Show more</button></p>
+<section id="payrun" hidden>
+<h1>Payments going out</h1>
+<p class="meta">A batch of payments to suppliers, checked before you pay it. Export it into the pay file's folder and give its name here. Nothing is paid, and no bank is asked.</p>
+<div class="row">
+<input type="text" id="batch" maxlength="200" placeholder="The batch file's name, as run-2026-12-01.csv">
+<button id="check" type="button">Check this batch</button>
+<button id="lookback" type="button">Search past payments for ones made twice</button>
+</div>
+<pre id="payrun-out"></pre>
+</section>
+<h1>The record</h1>
+<p class="state" id="record-state"></p>
+<div id="record"></div>
+<script src="app.js"></script>
+</body>
+</html>
