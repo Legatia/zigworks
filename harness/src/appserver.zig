@@ -2044,6 +2044,28 @@ test "the_desk_page_draws_an_empty_stage_and_says_when_the_fit_files_are_missing
     try expectHas(js, "$(\"upControls\").disabled = !fit;");
 }
 
+test "the_desk_page_sends_nothing_before_its_script_runs_and_gives_the_conversation_room" {
+    const html = deskFile("index.html").?;
+    const js = deskFile("desk.js").?;
+    const css = deskFile("desk.css").?;
+    // Send is off in the page as served: a click or Enter before desk.js
+    // runs would submit the form to the server and lose the text
+    try expectHas(html, "<button type=\"submit\" id=\"sendBtn\" class=\"send cut-s\" disabled>Send</button>");
+    // on from the moment its handler is there
+    const handler = std.mem.indexOf(u8, js, "$(\"compose\").addEventListener(\"submit\"").?;
+    const on = std.mem.indexOf(u8, js, "$(\"sendBtn\").disabled = false;").?;
+    try t.expect(on > handler);
+    try t.expectEqual(1, std.mem.count(u8, js, "$(\"sendBtn\").disabled"));
+    // the conversation may take a third of the window before it scrolls;
+    // the stage keeps its least height
+    const log = std.mem.indexOf(u8, css, "\n.log {").?;
+    const log_end = std.mem.indexOfScalarPos(u8, css, log, '}').?;
+    try expectHas(css[log..log_end], "max-height: 34vh;");
+    try expectHas(css, ".stage { position: relative; flex: 1 1 auto; min-height: 240px;");
+    // in a short window the conversation gives way, never the stage or the field
+    try expectHas(css, ".chat { flex: 0 1 auto; min-height: 0;");
+}
+
 test "the_desk_page_keeps_to_its_own_facts_and_says_where_speech_goes" {
     const js = deskFile("desk.js").?;
     // while speaking the card says so, never the reply's words

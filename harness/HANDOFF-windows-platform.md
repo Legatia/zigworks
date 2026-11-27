@@ -5,6 +5,19 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: 0.4.0 was run from its release on macOS; 0.4.1 follows (2026-11-27, evening)
+
+- The owner: "Just do everything necessary to make sure this product works well." The released macOS harness and desk app were downloaded and run (the smoke against the released binary: 183 ok); the Linux arm64 archive was only read. Nobody has run the released Windows or Linux packages yet: still yours if you have a moment, a line here is enough.
+- The proxy met two real agents. Claude Code 2.1.322 connected to 0.4.0 as it is. Hermes 0.21.3 was refused: the MCP Python SDK sends `MCP-Protocol-Version: 2025-11-25` on `initialize` itself. `mcpserve.zig` now judges that header after the method is known and lets `initialize` through (the answer names the version harness speaks); every other method with a foreign version is 400 as before. Codex was not tried.
+- Two changes in the desk page, files you also build on (`src/desk/index.html`, `desk.js`, `desk.css`):
+  - Send is `disabled` in the page as served and `desk.js` enables it once the form's handler is there. If a smoke of yours clicks Send or submits the form right after the page shows, wait for the button to be enabled (or for the page's first message to the shell, as the macOS smoke does).
+  - The conversation may be 34vh tall (22vh before; your "five lines"), and `.chat` shrinks before the stage does. Your shells need nothing for it; say so here if it looks wrong at your window sizes.
+- `web.zig`'s test fixture has `f.session()` in place of `f.web.s.?`: a browser test whose browser is gone fails with "no browser session; the last action answered: …" and no longer crashes on null. A new test of yours in that file: use `try f.session()`.
+- With a bot token stored and nobody paired, a message written on the desk was answered as a "Not delivered" item. Now, once the owner has written on the desk in this run (`Core.desk_written`), a post Telegram refuses with `error.NotPaired` in a conversation the desk shows is delivered to the desk (`DeskTee.unpaired` in `core.zig`), a reply with buttons as its text without them (`sendWithButtons`). Files and approvals are as before. All in `core.zig`; nothing for the shells.
+- `test (windows-latest, calmcp)` failed on `main` for 7b10e54: "The hosted runner lost communication with the server", no log. If you see it again on your side, say so here.
+- The README says the binary is "about 8 MB stripped" (it said 1.9 and 2.3 MB).
+- 0.4.1 is these fixes; the version in both `build.zig.zon` files is 0.4.1 with the next commit. Take `main` into `platform/money` before its pull request.
+
 ## For you: harness 0.4.0 is tagged (2026-11-27, after the browser job)
 
 - `harness-v0.4.0` is on 7dd2031, on `main`; the release is on GitHub with the four harness archives and the three desk packages. Your pull requests 2 and 3 are in it. Take `main` into `platform/money` before its pull request; the version in both `build.zig.zon` files is 0.4.0 now.

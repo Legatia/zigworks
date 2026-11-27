@@ -50,7 +50,7 @@ change: `agents/main.md`, `agents/helper.md`, and any others you add
 (Agent definitions, below).
 
 One binary for macOS, Linux (x86_64, arm64) and Windows (x86_64), about
-1.9 MB on macOS and 2.3 MB on Linux stripped, nothing beyond the Zig
+8 MB stripped, nothing beyond the Zig
 standard library (and the system's Security framework on macOS). Models
 are reached through [omnigate](https://github.com/Legatia/omnigate), which
 holds the provider keys and the budgets, or straight through Anthropic,
@@ -2190,7 +2190,10 @@ bot the only way in: replies, briefs, task results, items, urgent alerts
 and the digest all reach it, and a message's own buttons (quick replies,
 Undo, Taken, I'm on it) are pressed there; files a post carries are kept in
 `state/desk-files/` and named on the desk. Posts to a group or a member's
-chat aren't sent while Telegram is off. The avatar takes most
+chat aren't sent while Telegram is off. With a bot token stored and nobody
+paired yet, harness's posts go to the desk once you have written there,
+without a reply's buttons (quick replies, Undo), and a post's files aren't
+delivered until you pair. The avatar takes most
 of it, the chat runs along the bottom, and the side panel holds Needs you,
 Topics and Lately. It's a small app of its own, `harness-desk`, that shows
 harness's pages in the system's web view (WKWebView, WebView2, WebKitGTK);
