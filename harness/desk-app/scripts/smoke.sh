@@ -483,11 +483,13 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     # a message typed in the desk is answered by the model: the stand-in's
     # one answer, asked for by the model's name with the key from the sheet
     if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
-        cmd "js document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
+        # typed with a note of the page's state then, and of whether the page took the submit
+        cmd "js window.__smokeAt = document.readyState + ' at ' + Math.round(performance.now()) + ' ms'; document.getElementById('compose').addEventListener('submit', function (e) { window.__smokeTaken = e.defaultPrevented ? 'taken by the page' : 'not taken, the page had no handler'; }, { once: true }); document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
         if ! desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60; then
             # why not: what the page holds, and what harness and the stand-in said
-            desk_probe unanswered "[location.href, 'field: ' + document.getElementById('msg').value, 'note: ' + document.getElementById('composeNote').textContent, Array.prototype.map.call(document.querySelectorAll('#log li'), function (e) { return e.className + ': ' + e.textContent; }).join(' / ')].join(' | ')"
+            desk_probe unanswered "[location.href, 'typed when ' + window.__smokeAt + ', ' + window.__smokeTaken + ', now ' + Math.round(performance.now()) + ' ms', 'field: '  + document.getElementById('msg').value, 'note: ' + document.getElementById('composeNote').textContent, Array.prototype.map.call(document.querySelectorAll('#log li'), function (e) { return e.className + ': ' + e.textContent; }).join(' / ')].join(' | ')"
             echo "# the desk, unanswered: ${PROBE:-nothing}"
+            echo "# the app's loads, by line of its log (the first answer asked for at line $(grep -n -m1 '"answered"' "$T/log" | cut -d: -f1)):" && grep -n "^load \|^response \|^finish \|^state \|^nav \|^failed \|^message desk {\"badge" "$T/log" | tail -16 | cut -c1-160 | sed 's/^/#   /'
             echo "# the app's and harness's output:" && tail -20 "$D/app.out" 2>/dev/null | sed 's/^/#   /'
             echo "# the stand-in's requests: $(ls "$MODEL_DIR/requests" 2>/dev/null | tr '\n' ' ')"
             echo "# harness's own log:" && tail -15 "$REAL_HOME/log/actions.jsonl" 2>/dev/null | cut -c1-400 | sed 's/^/#   /'
