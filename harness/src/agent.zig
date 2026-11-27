@@ -590,6 +590,9 @@ pub const Run = struct {
     /// Tools of the MCP servers that are running.
     mcp: []const McpTool = &.{},
     money: config.Config.Money = .{},
+    /// An outside agent's call (`client:NAME`) may move money: its
+    /// section's `money = on`.
+    client_money: bool = false,
     /// What money tools moved today; shared by all runs.
     money_ledger: ?*MoneyLedger = null,
     /// Where each automated spend is told (main, with a pause button);
@@ -2463,6 +2466,12 @@ fn callToolRaw(r: *Run, a: std.mem.Allocator, name: []const u8, raw_input: []con
     // owner decides ([money] apps)
     if (tool == .money and std.mem.startsWith(u8, r.who.by, "app:") and (r.who.agent.len == 0 or !r.money.apps)) {
         const why = if (r.who.agent.len == 0) "an app's acts move no money" else "money is not moved in runs an app starts ([money] apps = off)";
+        try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
+        return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
+    }
+    // an outside agent's calls move money only when its section says so
+    if (tool == .money and std.mem.startsWith(u8, r.who.by, "client:") and !r.client_money) {
+        const why = try std.fmt.allocPrint(a, "a client's calls move no money ([client {s}] money = on)", .{r.who.by["client:".len..]});
         try r.logRun(.gate, r.isPrivate(), .{ .tool = name, .decision = "deny", .why = why, .arg = arg });
         return .{ .text = try std.fmt.allocPrint(a, "refused by the gate: {s}", .{why}), .is_error = true };
     }
@@ -9101,6 +9110,30 @@ test "app_save_asked_every_time" {
     try t.expectEqual(1, desk.dropped);
     try t.expect(std.mem.indexOf(u8, try f.e.request(6), "refused by the gate") != null);
     try t.expect(std.mem.indexOf(u8, try f.logText(), "\"tool\":\"app_save\"") != null);
+}
+
+test "a_clients_money_call_is_refused_without_money_on" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    const s = try withMcp(&f, true);
+    defer s.deinit();
+    f.run.who = .{ .by = "client:cc", .agent = "" };
+    f.run.money = .{ .max_per_call = 10 };
+    var got = try stepCall(&f.run, f.e.arena.allocator(), "fake__echo", "{\"text\":\"one\",\"amount\":1}");
+    try t.expect(got.is_error);
+    try t.expectEqualStrings("refused by the gate: a client's calls move no money ([client cc] money = on)", got.text);
+    try t.expectEqual(0, f.asked);
+    try t.expect(std.mem.indexOf(u8, try f.logText(), "\"decision\":\"deny\",\"why\":\"a client's calls move no money ([client cc] money = on)\"") != null);
+    // switched on: asked every time, never for a day
+    f.run.client_money = true;
+    f.answer = .day;
+    got = try stepCall(&f.run, f.e.arena.allocator(), "fake__echo", "{\"text\":\"two\",\"amount\":1}");
+    try t.expect(!got.is_error);
+    try t.expectEqual(1, f.asked);
+    try t.expect(!f.last_allow_day);
+    try t.expectEqual(0, f.grants.items.items.len);
+    try t.expectEqual(@as(f64, 1), f.ledger.sum());
 }
 
 test "an_apps_acts_and_runs_move_no_money" {

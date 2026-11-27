@@ -51,7 +51,7 @@ pub fn reason(e: anyerror) ?[]const u8 {
     return switch (e) {
         error.BadUrlRule => "an allow rule for fetch or browse takes an address: scheme://host/path, the host a name, *.name or *, like https://*.example.com/*; a port, when given, is a number or *",
         error.BadHostRule => "an allow rule for web takes a host: a name, *.name or *, like *.example.com; a port, when given, is a number or *",
-        error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME, agent:NAME, member:NAME, room:NAME or harness:NAME (harness's own jobs); a kind alone covers all its names, and * works as in rules",
+        error.BadSection => "a section is [all] or a who: owner, schedule:NAME, trigger:NAME, workflow:NAME/STEP, app:NAME, agent:NAME, member:NAME, room:NAME, client:NAME (an outside agent on the proxy) or harness:NAME (harness's own jobs); a kind alone covers all its names, and * works as in rules",
         error.BadEnv => "only shell takes an environment: shell@NAME, the name in a-z, 0-9, - and _",
         error.BadRoomSection => "a room's section names it as harness does: the area's name in lower case, spaces as _, no apostrophes, like [room:living_room] or [room:łazienka]",
         else => null,
