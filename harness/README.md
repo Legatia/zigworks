@@ -273,7 +273,10 @@ machine at home, or a provider you have an agreement with, is yours to
 judge. The model is sent the same tools as any other; one that can't call
 tools answers in text only. `harness config set model.private_model
 local:llama3.1:8b` sets it and `harness config set model.private_model ""`
-clears it, at the next `/reload`.
+clears it, at the next `/reload`. In the desk app, "Provider and key…"
+has a Private model part for a server of your own that takes no key (it
+writes `[provider local]` and `private_model = local:MODEL`); a provider
+that takes a key is set in config.ini.
 
 Not moved by it: voice notes are still transcribed by `[voice] provider`,
 and replies read aloud on the desk still go to `[desk] speak`'s provider.
@@ -4329,7 +4332,7 @@ badge; click the Dock icon to bring the window back.
 | Start harness | runs `harness run` in the background; it keeps running after you quit the app |
 | Stop harness | runs `harness stop`: harness exits cleanly on its next tick |
 | Open at login | runs `harness autostart on` or `off`; checked when harness starts at login (the app itself doesn't) |
-| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key, pick a provider whose key is stored under another name, or change the Address to another host (a new port or path on the same host doesn't ask). While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
+| Provider and key… | the Set up screen with the values in use (`harness config get`); the key is asked for again only when you tick Replace the key, pick a provider whose key is stored under another name, or change the Address to another host (a new port or path on the same host doesn't ask). Under them, Private model: the model, address and format of a keyless server of your own for the conversations set to `/private on` (see Private conversations); shown and not changeable when config.ini's private model is another provider's. While harness runs, it shows `harness config set`'s own line ("send /reload to use it") and goes back to the desk; you send `/reload` in the chat |
 | Reload (⌘R) | loads the desk again |
 | Quit harness (⌘Q) | quits the app; harness keeps running |
 

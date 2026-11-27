@@ -551,7 +551,7 @@ const ReadJob = struct {
 
     fn read(j: *ReadJob) !void {
         const provider = try j.get("model.provider");
-        var values: [7][]const u8 = undefined;
+        var values: [setup.read_count][]const u8 = undefined;
         for (try setup.readKeys(j.arena.allocator(), provider), 0..) |key, i| values[i] = try j.get(key);
         j.in_use = setup.inUse(provider, values);
         j.ok = true;
