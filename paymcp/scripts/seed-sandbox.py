@@ -7,10 +7,12 @@ so that paymcp can be run against Stripe itself with nothing real in it.
 
 It writes, so it has a key of its own (STRIPE_SEED_KEY, never paymcp's
 STRIPE_KEY) and takes only a sandbox key: sk_test_... or rk_test_...
-A live key is refused before anything is sent. Nothing is charged: no
-payment method is added to any customer. Use a sandbox made for this and
-delete the sandbox afterwards; the script stops if the business is
-already there.
+A live key is refused before anything is sent. Nothing is charged: the one
+payment method it adds is the test card that is always refused
+(pm_card_chargeCustomerFail), to make a payment that failed. Use a sandbox
+made for this and delete the sandbox afterwards. Run again on a sandbox
+that has the business, it adds only what a newer script has and the
+sandbox lacks, and stops if nothing is missing.
 
 Written from Stripe's API reference for version 2026-11-18.endive.
 Needs python3 and nothing else.
@@ -49,7 +51,7 @@ EXPECTED = """\
 With examples/sandbox.ini (every "how old" setting at 0, since nothing in a
 new sandbox is old) the audit should say:
 
-  15 findings: 371.00 EUR a month and 871.00 EUR once; 1 with an amount this audit can't know.
+  17 findings: 371.00 EUR a month and 1259.00 EUR once; 1 with an amount this audit can't know.
 
    87.00 a month   Free, and has been for a while       Elm & Sons (everything off, for ever)
    68.00 a month   A higher plan than paid for          Birch Studio (pro in the product, billed for team)
@@ -60,10 +62,12 @@ new sandbox is old) the audit should say:
    29.00 a month   Collection paused                    Gorse Ltd
    15.00 a month   A discount with no end               Alder Works (Launch, 25% off)
   480.00 once      An invoice never sent                Gorse Ltd (a draft)
+  340.00 once      Invoices past due                    Dogwood Labs (due two minutes after seeding)
   126.00 once      Use that was never reported          Fir Analytics (15300 used, 9000 reported)
   120.00 once      Invoices written off                 Ivy Partners (one uncollectible, one void)
    58.00 once      An invoice never sent                Cedar Co (the cancelled subscription's draft)
    58.00 once      An invoice never sent                Ivy Partners (the cancelled subscription's draft)
+   48.00 once      Payments that failed                 Birch Studio (the test card that is always refused)
    29.00 once      An invoice never charged             Hazel Design
    not known       Free, and has been for a while       Larch (a price of zero)
 
@@ -75,9 +79,10 @@ This is what a run on 2026-11-27 gave. The two drafts at 58.00 are not in
 paymcp-sim's business: Stripe leaves a cancelled subscription's first
 invoice a draft that it will never send.
 
-For a few minutes after seeding, Stripe has not yet counted the meter
-event, and "Use that was never reported" says 0 was reported (306.00,
-and 1051.00 once in all).
+For the first minutes after seeding: Dogwood's invoice is not yet past
+due (Stripe takes no due date in the past, so it is due two minutes after
+the script ran), and Stripe has not yet counted the meter event, so "Use
+that was never reported" says 0 was reported (306.00).
 """
 
 
@@ -93,8 +98,9 @@ class Stripe:
         self.n = 0
         self.made = []
 
-    def call(self, method, path, fields=None):
-        """One request; the answer as a dict. `fields`: a list of (name, value)."""
+    def call(self, method, path, fields=None, refused_ok=False):
+        """One request; the answer as a dict. `fields`: a list of (name, value).
+        `refused_ok`: a payment the card refuses (402) is the answer wanted."""
         fields = fields or []
         self.n += 1
         if self.dry:
@@ -132,6 +138,8 @@ class Stripe:
                 except (ValueError, KeyError, TypeError):
                     message = body[:300]
                 last = f"{e.code}: {message}"
+                if e.code == 402 and refused_ok:
+                    return {"refused": message}
                 if e.code != 429 and e.code < 500:
                     break
             except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
@@ -150,9 +158,17 @@ class Stripe:
 
 
 def seed(s):
+    """The business; the customers' ids by short name, and whether it was
+    made now (False: it was there already)."""
     found = s.call("GET", "/v1/customers", [("email", CUSTOMERS[0][2]), ("limit", "1")])
     if found.get("data"):
-        raise Fail(f"this sandbox already has {CUSTOMERS[0][2]}: the made-up business is there (or half of it). Use a new sandbox.")
+        there = {}
+        for key, _name, email in CUSTOMERS:
+            got = s.call("GET", "/v1/customers", [("email", email), ("limit", "1")]).get("data")
+            if not got:
+                raise Fail(f"this sandbox has {CUSTOMERS[0][2]} and not {email}: half the made-up business is there. Use a new sandbox.")
+            there[key] = got[0]["id"]
+        return there, False
 
     tag = ("metadata[paymcp_seed]", "1")
 
@@ -264,6 +280,33 @@ def seed(s):
 
     # what billing was told of Fir's use
     s.call("POST", "/v1/billing/meter_events", [("event_name", METER_EVENT), ("payload[stripe_customer_id]", cus["fir"]), ("payload[value]", "9000")])
+    return cus, True
+
+
+def late_there(s, cus):
+    got = s.call("GET", "/v1/invoices", [("customer", cus["dogwood"]), ("limit", "100")]).get("data") or []
+    return any((inv.get("metadata") or {}).get("paymcp_seed") == "late" for inv in got)
+
+
+def late(s, cus):
+    """Money owed now and late: an invoice sent to be paid by hand that is
+    past due two minutes from now, and a card payment that fails."""
+    tag = ("metadata[paymcp_seed]", "late")
+
+    def invoice(who, amount, what, extra):
+        inv = s.make("invoice", "/v1/invoices", [("customer", cus[who]), ("currency", "eur"), ("auto_advance", "false"), ("description", what)] + extra + [tag])
+        s.call("POST", "/v1/invoiceitems", [("customer", cus[who]), ("invoice", inv), ("amount", str(amount)), ("currency", "eur"), ("description", what)])
+        s.call("POST", f"/v1/invoices/{inv}/finalize", [("auto_advance", "false")])
+        return inv
+
+    # (Stripe takes no due date in the past: two minutes ahead, then it is late)
+    invoice("dogwood", 34000, "Annual support", [("collection_method", "send_invoice"), ("due_date", str(int(time.time()) + 120))])
+    # the test card that is always refused: the payment fails, nothing is charged
+    card = s.make("payment method", "/v1/payment_methods/pm_card_chargeCustomerFail/attach", [("customer", cus["birch"])])
+    unpaid = invoice("birch", 4800, "Team, one extra month", [("collection_method", "charge_automatically"), ("default_payment_method", card)])
+    paid = s.call("POST", f"/v1/invoices/{unpaid}/pay", refused_ok=True)
+    if not s.dry and "refused" not in paid:
+        raise Fail(f"the payment of invoice {unpaid} was meant to be refused and wasn't (status {paid.get('status')})")
 
 
 def main():
@@ -286,8 +329,9 @@ def main():
             if not sys.stdin.isatty():
                 sys.exit("seed-sandbox: nobody to ask (no terminal). Run it with --yes once you have read what it does.")
             print("This creates, in the Stripe sandbox the key belongs to: 12 customers, 12 subscriptions,")
-            print("4 invoices, 6 prices, 4 products, 3 coupons, a meter and a meter event. No payment")
-            print("method is added, so nothing is charged; the customers' addresses end in .example.")
+            print("6 invoices, 6 prices, 4 products, 3 coupons, a meter and a meter event. The one payment")
+            print("method added is the test card that is always refused, so nothing is charged; the")
+            print("customers' addresses end in .example.")
             try:
                 answer = input("Go on? [y/N] ")
             except EOFError:
@@ -297,7 +341,14 @@ def main():
 
     s = Stripe(args.url.rstrip("/"), key, args.dry_run)
     try:
-        seed(s)
+        cus, made = seed(s)
+        if not s.dry and late_there(s, cus):
+            if not made:
+                raise Fail("the made-up business is already in this sandbox, with nothing missing. Nothing was sent. Use a new sandbox to start again.")
+        else:
+            if not made:
+                print("The made-up business is already in this sandbox: adding only the money owed and late.")
+            late(s, cus)
     except Fail as e:
         print(f"seed-sandbox: {e}", file=sys.stderr)
         if s.made:

@@ -157,6 +157,12 @@ pub const Invoice = struct {
     collects_itself: bool = true,
     auto_advance: bool = false,
     attempted: bool = false,
+    /// Payment tries so far, as the provider counts them.
+    attempts: u32 = 0,
+    /// When the provider will try again; null: no further try is planned.
+    next_attempt: ?i64 = null,
+    /// When an invoice sent to be paid by hand is due.
+    due_date: ?i64 = null,
     subscription: []const u8 = "",
     finalized_at: ?i64 = null,
 
@@ -283,6 +289,9 @@ pub fn invoice(v: ?jv.Value) Invoice {
         .collects_itself = !std.mem.eql(u8, strOf(v, "collection_method"), "send_invoice"),
         .auto_advance = jv.boolean(jv.get(v, "auto_advance")) orelse false,
         .attempted = jv.boolean(jv.get(v, "attempted")) orelse false,
+        .attempts = @intCast(@max(0, @min(jv.int(jv.get(v, "attempt_count")) orelse 0, 1 << 20))),
+        .next_attempt = jv.int(jv.get(v, "next_payment_attempt")),
+        .due_date = jv.int(jv.get(v, "due_date")),
         .subscription = idOf(jv.at(v, &.{ "parent", "subscription_details", "subscription" })),
         .finalized_at = jv.int(jv.at(v, &.{ "status_transitions", "finalized_at" })),
     };

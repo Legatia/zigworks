@@ -14,7 +14,10 @@
 //!   unsent_days = 3                 ; an open invoice never charged
 //!   written_off_days = 365          ; how far back written-off invoices count
 //!   written_off_above = 0           ; ...and above which sum a customer, in the currency's smallest unit
+//!   overdue_days = 7                ; an invoice sent to be paid by hand, this long past due
 //!   usage_margin_percent = 1        ; use may exceed reported use by this much
+//!   record = pay.record.jsonl       ; paymcp's own record of readings and decisions (the default:
+//!                                   ; beside this file, named after it); none: keep no record
 //!   current = team_monthly, pro_monthly   ; the price list now (ids or lookup keys); none: every active price
 //!
 //!   [plans]                         ; a plan's name in the business's file = the price it means
@@ -35,6 +38,9 @@ pub const Config = struct {
     mode: Mode = .sandbox,
     page: u8 = 100,
     who_path: []const u8 = "",
+    /// paymcp's own record of readings and decisions; "": none is kept.
+    record_path: []const u8 = "",
+    record_off: bool = false,
     rules: audit.Rules = .{},
 };
 
@@ -46,8 +52,16 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
         return error.BadConfig;
     };
     var c = try parse(a, text, diag);
+    const dir = std.fs.path.dirname(path) orelse ".";
     if (c.who_path.len > 0 and !std.fs.path.isAbsolute(c.who_path))
-        c.who_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(path) orelse ".", c.who_path });
+        c.who_path = try std.fs.path.join(a, &.{ dir, c.who_path });
+    if (c.record_off) {
+        c.record_path = "";
+    } else if (c.record_path.len == 0) {
+        c.record_path = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.record.jsonl", .{std.fs.path.stem(path)}) });
+    } else if (!std.fs.path.isAbsolute(c.record_path)) {
+        c.record_path = try std.fs.path.join(a, &.{ dir, c.record_path });
+    }
     return c;
 }
 
@@ -81,6 +95,10 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "billing")) {
             if (eql(e.key, "who")) {
                 c.who_path = e.value;
+            } else if (eql(e.key, "record")) {
+                if (e.value.len == 0) return bad(diag, e.line, "record is a file's name, or none");
+                c.record_off = eql(e.value, "none");
+                c.record_path = if (c.record_off) "" else e.value;
             } else if (eql(e.key, "old_discount_days")) {
                 c.rules.old_discount_days = try days(a, diag, e);
             } else if (eql(e.key, "free_days")) {
@@ -89,6 +107,8 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 c.rules.draft_days = try days(a, diag, e);
             } else if (eql(e.key, "unsent_days")) {
                 c.rules.unsent_days = try days(a, diag, e);
+            } else if (eql(e.key, "overdue_days")) {
+                c.rules.overdue_days = try days(a, diag, e);
             } else if (eql(e.key, "written_off_days")) {
                 c.rules.written_off_days = try days(a, diag, e);
             } else if (eql(e.key, "written_off_above")) {

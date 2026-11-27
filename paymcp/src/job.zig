@@ -7,6 +7,7 @@ const config = @import("config.zig");
 const stripe = @import("stripe.zig");
 const audit = @import("audit.zig");
 const who = @import("who.zig");
+const record = @import("record.zig");
 
 pub const Reading = struct {
     data: audit.Data = .{},
@@ -18,6 +19,12 @@ pub const Reading = struct {
     /// GETs it took.
     requests: u32 = 0,
 };
+
+/// The reading as paymcp's record takes it: what was found, and what the
+/// reading could not have seen.
+pub fn forRecord(r: Reading) record.Reading {
+    return .{ .findings = r.findings, .now = r.now, .whole = r.data.whole, .who_given = r.who_given, .usage_read = r.data.usage_read };
+}
 
 /// error.Failed with `why` set when the business's file can't be read or
 /// the provider didn't answer; everything lives in `a`.

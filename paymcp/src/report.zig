@@ -8,11 +8,18 @@ const audit = @import("audit.zig");
 const model = @import("model.zig");
 const config = @import("config.zig");
 const job = @import("job.zig");
+const record = @import("record.zig");
 
 pub const Options = struct {
     /// The most findings written out; 0: all.
     limit: usize = 0,
     kind: ?audit.Kind = null,
+    /// paymcp's record, when one is kept: what is new, what a person decided.
+    book: ?*const record.Book = null,
+    /// List what was dismissed as intended too.
+    all: bool = false,
+    /// Why the record couldn't be used.
+    record_problem: ?[]const u8 = null,
 };
 
 /// Control characters (a newline in a customer's name) become spaces.
@@ -54,10 +61,53 @@ fn totalsText(a: Allocator, findings: []const audit.Finding) ![]const u8 {
     return std.mem.join(a, "; ", parts.items);
 }
 
-fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8) !void {
-    try o.print(a, "{s}{s}: {s}\n   {s}\n", .{ head, f.kind.title(), try amountText(a, f), try flat(a, f.what) });
+fn block(a: Allocator, o: *std.ArrayList(u8), f: audit.Finding, head: []const u8, book: ?*const record.Book) !void {
+    var suffix: []const u8 = "";
+    var decided: ?[]const u8 = null;
+    if (book) |b| switch (b.mark(f.key)) {
+        .new => suffix = " (new)",
+        .back => suffix = " (found again)",
+        .open => {},
+        .asked, .intended => |m| {
+            const e = b.entries.get(f.key).?;
+            suffix = if (m == .asked) " (asked)" else " (dismissed as intended)";
+            decided = try std.fmt.allocPrint(a, "{s} on {s}{s}{s}", .{ if (m == .asked) "Asked" else "Dismissed", try model.day(a, e.decided), if (e.reason.len > 0) ": " else ".", e.reason });
+        },
+    };
+    try o.print(a, "{s}{s}: {s}{s}\n   {s}\n", .{ head, f.kind.title(), try amountText(a, f), suffix, try flat(a, f.what) });
     for (f.rows) |row| try o.print(a, "   - {s}: {s}\n", .{ try flat(a, row.source), try flat(a, row.value) });
+    if (decided) |d| try o.print(a, "   {s}\n", .{d});
     try o.print(a, "   Proposed: {s}\n   [{s}]\n", .{ f.proposal, try flat(a, f.key) });
+}
+
+/// What the record adds under the sums: what changed since the reading
+/// before, and what isn't listed because a person dismissed it.
+fn recordLines(a: Allocator, o: *std.ArrayList(u8), cfg: *const config.Config, opts: Options, hidden: *const record.Tally) !void {
+    if (opts.record_problem) |why| try o.print(a, "{s}: what is new since the last reading isn't said.\n", .{why});
+    const b = opts.book orelse return;
+    if (b.readings == 0) return;
+    if (b.readings == 1) {
+        try o.print(a, "This is the first reading in paymcp's record ({s}): the next one says what is new and what is no longer found.\n", .{cfg.record_path});
+    } else {
+        const s = try record.since(a, b);
+        var parts: std.ArrayList([]const u8) = .empty;
+        if (s.new > 0) try parts.append(a, try std.fmt.allocPrint(a, "{d} new", .{s.new}));
+        if (s.back > 0) try parts.append(a, try std.fmt.allocPrint(a, "{d} found again", .{s.back}));
+        if (s.gone.n > 0) {
+            const sums = try s.gone.words(a);
+            try parts.append(a, if (sums.len > 0)
+                try std.fmt.allocPrint(a, "{d} no longer found ({s})", .{ s.gone.n, sums })
+            else
+                try std.fmt.allocPrint(a, "{d} no longer found", .{s.gone.n}));
+        }
+        try o.print(a, "Since the reading of {s}: {s}.\n", .{ try model.day(a, b.before.?), if (parts.items.len == 0) "nothing new, and nothing gone" else try std.mem.join(a, ", ", parts.items) });
+    }
+    if (hidden.n > 0) {
+        const sums = try hidden.words(a);
+        try o.print(a, "{d} dismissed as intended {s} not listed", .{ hidden.n, if (hidden.n == 1) "is" else "are" });
+        if (sums.len > 0) try o.print(a, " ({s})", .{sums});
+        try o.appendSlice(a, ": ask for all to list them.\n");
+    }
 }
 
 /// What was read and what wasn't, in the lines a report opens with.
@@ -85,11 +135,22 @@ pub fn text(a: Allocator, r: job.Reading, cfg: *const config.Config, opts: Optio
     try o.appendSlice(a, try readText(a, r, cfg));
     try o.append(a, '\n');
     var shown: std.ArrayList(audit.Finding) = .empty;
-    for (r.findings) |f| if (opts.kind == null or opts.kind.? == f.kind) try shown.append(a, f);
+    var hidden: record.Tally = .{};
+    for (r.findings) |f| {
+        if (opts.kind != null and opts.kind.? != f.kind) continue;
+        if (opts.book) |b| if (!opts.all and b.mark(f.key) == .intended) {
+            if (b.entries.get(f.key)) |e| try hidden.put(a, e);
+            continue;
+        };
+        try shown.append(a, f);
+    }
     if (shown.items.len == 0) {
         if (opts.kind) |k| {
             try o.print(a, "Nothing of the kind {s} was found ({s} in all).\n", .{ @tagName(k), try count(a, r.findings.len, "finding") });
+        } else if (hidden.n > 0) {
+            try o.appendSlice(a, "Nothing is open: all that these rules found was dismissed as intended.\n");
         } else try o.appendSlice(a, "Nothing was found by these rules.\n");
+        try recordLines(a, &o, cfg, opts, &hidden);
         return o.items;
     }
     var unknown: usize = 0;
@@ -102,19 +163,20 @@ pub fn text(a: Allocator, r: job.Reading, cfg: *const config.Config, opts: Optio
     if (sums.len > 0) try o.print(a, ": {s}", .{sums});
     if (unknown > 0) try o.print(a, "{s}{d} with an amount this audit can't know", .{ if (sums.len > 0) "; " else ": ", unknown });
     try o.appendSlice(a, ".\nEach is a question for a person, not a mistake found: a discount may be meant to last, an old price may be a promise.\n");
+    try recordLines(a, &o, cfg, opts, &hidden);
     const n = if (opts.limit > 0) @min(opts.limit, shown.items.len) else shown.items.len;
     for (shown.items[0..n], 1..) |f, i| {
         try o.append(a, '\n');
-        try block(a, &o, f, try std.fmt.allocPrint(a, "{d}. ", .{i}));
+        try block(a, &o, f, try std.fmt.allocPrint(a, "{d}. ", .{i}), opts.book);
     }
     if (n < shown.items.len) try o.print(a, "\n...and {d} more, smaller: ask with a larger limit, or for one kind.\n", .{shown.items.len - n});
     return o.items;
 }
 
 /// One finding in full.
-pub fn one(a: Allocator, f: audit.Finding) ![]const u8 {
+pub fn one(a: Allocator, f: audit.Finding, book: ?*const record.Book) ![]const u8 {
     var o: std.ArrayList(u8) = .empty;
-    try block(a, &o, f, "");
+    try block(a, &o, f, "", book);
     return o.items;
 }
 
@@ -132,11 +194,18 @@ const JFinding = struct {
     what: []const u8,
     rows: []const JRow,
     proposal: []const u8,
+    /// How it stands in paymcp's record: new, back, open, asked or
+    /// intended; null when no record is kept.
+    state: ?[]const u8,
+    /// The person's reason, for asked and intended.
+    reason: ?[]const u8,
 };
 const JTotal = struct { currency: []const u8, a_month: i64, once: i64 };
+const JGone = struct { key: []const u8, kind: []const u8, title: []const u8, name: []const u8, amount: ?i64, currency: []const u8, per: []const u8 };
+const JSince = struct { previous: []const u8, new: usize, found_again: usize, no_longer_found: []const JGone };
 
 /// The reading as JSON.
-pub fn json(a: Allocator, r: job.Reading, cfg: *const config.Config) ![]const u8 {
+pub fn json(a: Allocator, r: job.Reading, cfg: *const config.Config, book: ?*const record.Book) ![]const u8 {
     var fs: std.ArrayList(JFinding) = .empty;
     for (r.findings) |f| {
         var rows: std.ArrayList(JRow) = .empty;
@@ -153,8 +222,20 @@ pub fn json(a: Allocator, r: job.Reading, cfg: *const config.Config) ![]const u8
             .what = try flat(a, f.what),
             .rows = rows.items,
             .proposal = f.proposal,
+            .state = if (book) |b| @tagName(b.mark(f.key)) else null,
+            .reason = if (book) |b| (if (b.entries.get(f.key)) |e| (if (e.decision != .open) e.reason else null) else null) else null,
         });
     }
+    var since_last: ?JSince = null;
+    if (book) |b| if (b.readings > 1) {
+        const s = try record.since(a, b);
+        var gone: std.ArrayList(JGone) = .empty;
+        for (s.gone_keys) |key| {
+            const e = b.entries.get(key).?;
+            try gone.append(a, .{ .key = key, .kind = e.kind, .title = e.title(), .name = e.name, .amount = e.amount, .currency = e.currency, .per = @tagName(e.per) });
+        }
+        since_last = .{ .previous = try model.day(a, b.before.?), .new = s.new, .found_again = s.back, .no_longer_found = gone.items };
+    };
     var sums: std.ArrayList(JTotal) = .empty;
     for (try audit.totals(a, r.findings)) |tot| try sums.append(a, .{ .currency = tot.currency, .a_month = tot.monthly, .once = tot.once });
     var gaps: std.ArrayList([]const u8) = .empty;
@@ -172,6 +253,7 @@ pub fn json(a: Allocator, r: job.Reading, cfg: *const config.Config) ![]const u8
         },
         .not_read = gaps.items,
         .totals = sums.items,
+        .since_last = since_last,
         .findings = fs.items,
     }, .{});
 }
@@ -218,7 +300,7 @@ test "a_reading_as_data" {
     const a = arena.allocator();
     const jv = @import("jv.zig");
     const cfg: config.Config = .{};
-    const raw = try json(a, .{ .findings = &sample, .now = 1795392000 }, &cfg);
+    const raw = try json(a, .{ .findings = &sample, .now = 1795392000 }, &cfg, null);
     const v = jv.parse(a, raw).?;
     try t.expect(std.mem.indexOf(u8, jv.str(jv.get(v, "note")).?, "not instructions") != null);
     try t.expectEqualStrings("2026-11-23", jv.str(jv.get(v, "day")).?);
@@ -233,4 +315,47 @@ test "a_reading_as_data" {
     try t.expect(std.mem.indexOf(u8, raw, "\"amount\":null") != null);
     try t.expectEqual(@as(?i64, 48000), jv.int(jv.at(v, &.{ "totals", "0", "once" })));
     try t.expect(std.mem.indexOf(u8, raw, "\"business_file_rows\":null") != null);
+    try t.expect(std.mem.indexOf(u8, raw, "\"state\":null") != null);
+}
+
+test "a_reading_with_the_record_beside_it" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg: config.Config = .{ .record_path = "pay.record.jsonl" };
+    const day0: i64 = 1795392000;
+    var b: record.Book = .{};
+    _ = try record.note(a, &b, .{ .findings = sample[0..2], .now = day0 });
+    // the first reading: said once, and nothing is marked
+    const first = try text(a, .{ .findings = sample[0..2], .now = day0 }, &cfg, .{ .book = &b });
+    try t.expect(std.mem.indexOf(u8, first, "This is the first reading in paymcp's record (pay.record.jsonl): the next one says what is new and what is no longer found.\n\n1. More seats than paid for: 48.00 EUR a month\n") != null);
+    // the person dismisses the draft; a week on the seats are gone and Cedar is new
+    _ = try record.decide(a, &b, "draft_invoice:in_1", .intended, "sent by post instead", day0 + 3600);
+    const later = [_]audit.Finding{ sample[1], sample[2] };
+    _ = try record.note(a, &b, .{ .findings = &later, .now = day0 + 7 * 86400 });
+    const r: job.Reading = .{ .findings = &later, .now = day0 + 7 * 86400 };
+    const out = try text(a, r, &cfg, .{ .book = &b });
+    try t.expect(std.mem.indexOf(u8, out, "1 finding: 1 with an amount this audit can't know.") != null);
+    try t.expect(std.mem.indexOf(u8, out, "Since the reading of 2026-11-23: 1 new, 1 no longer found (48.00 EUR a month).\n1 dismissed as intended is not listed (480.00 EUR once): ask for all to list them.\n") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\n1. Free, and has been for a while: amount not known (new)\n") != null);
+    try t.expect(std.mem.indexOf(u8, out, "An invoice never sent") == null);
+    // asked for all: the dismissed one is there, with when and why
+    const all = try text(a, r, &cfg, .{ .book = &b, .all = true });
+    try t.expect(std.mem.indexOf(u8, all, "An invoice never sent: 480.00 EUR, once (dismissed as intended)\n") != null);
+    try t.expect(std.mem.indexOf(u8, all, "   Dismissed on 2026-11-23: sent by post instead\n   Proposed: Send it or delete it.\n") != null);
+    // as data: each finding's state, and what is no longer found
+    const jv = @import("jv.zig");
+    const v = jv.parse(a, try json(a, r, &cfg, &b)).?;
+    try t.expectEqualStrings("intended", jv.str(jv.at(v, &.{ "findings", "0", "state" })).?);
+    try t.expectEqualStrings("sent by post instead", jv.str(jv.at(v, &.{ "findings", "0", "reason" })).?);
+    try t.expectEqualStrings("new", jv.str(jv.at(v, &.{ "findings", "1", "state" })).?);
+    try t.expectEqualStrings("more_seats:sub_a:si_a", jv.str(jv.at(v, &.{ "since_last", "no_longer_found", "0", "key" })).?);
+    try t.expectEqual(@as(?i64, 4800), jv.int(jv.at(v, &.{ "since_last", "no_longer_found", "0", "amount" })));
+    // nothing left open
+    _ = try record.decide(a, &b, "free:sub_c", .intended, "a free plan", day0 + 8 * 86400);
+    const none = try text(a, r, &cfg, .{ .book = &b });
+    try t.expect(std.mem.indexOf(u8, none, "Nothing is open: all that these rules found was dismissed as intended.") != null);
+    // a record that couldn't be used is said, and the audit still stands
+    const broken = try text(a, r, &cfg, .{ .record_problem = "paymcp's record pay.record.jsonl line 3 isn't a line paymcp wrote" });
+    try t.expect(std.mem.indexOf(u8, broken, "isn't a line paymcp wrote: what is new since the last reading isn't said.") != null);
 }

@@ -222,7 +222,7 @@ fn seed(s: *Sim) !void {
         });
     }
 
-    const Inv = struct { id: []const u8, number: []const u8, customer: []const u8, status: []const u8, age_days: i64, total: i64, finalized: bool, attempted: bool = false, sub: []const u8 = "" };
+    const Inv = struct { id: []const u8, number: []const u8, customer: []const u8, status: []const u8, age_days: i64, total: i64, finalized: bool, attempted: bool = false, sub: []const u8 = "", tries: u8 = 0, due_days_ago: ?i64 = null };
     const invoices = [_]Inv{
         .{ .id = "in_gorse_draft", .number = "", .customer = "cus_gorse", .status = "draft", .age_days = 20, .total = 48000, .finalized = false },
         .{ .id = "in_hazel_open", .number = "FH-0412", .customer = "cus_hazel", .status = "open", .age_days = 9, .total = 2900, .finalized = true, .sub = "sub_hazel" },
@@ -230,20 +230,32 @@ fn seed(s: *Sim) !void {
         .{ .id = "in_ivy_void", .number = "FH-0398", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 6000, .finalized = true, .attempted = true, .sub = "sub_ivy" },
         // voided while still a draft: never sent, nothing given up
         .{ .id = "in_ivy_never", .number = "", .customer = "cus_ivy", .status = "void", .age_days = 40, .total = 9900, .finalized = false },
+        // sent to be paid by hand, three weeks past due
+        .{ .id = "in_dogwood_late", .number = "FH-0405", .customer = "cus_dogwood", .status = "open", .age_days = 51, .total = 34000, .finalized = true, .due_days_ago = 21 },
+        // the card refused four times; no further try planned
+        .{ .id = "in_birch_failed", .number = "FH-0415", .customer = "cus_birch", .status = "open", .age_days = 16, .total = 4800, .finalized = true, .attempted = true, .tries = 4, .sub = "sub_birch" },
         .{ .id = "in_alder_paid", .number = "FH-0420", .customer = "cus_alder", .status = "paid", .age_days = 12, .total = 4500, .finalized = true, .attempted = true, .sub = "sub_alder" },
     };
     for (invoices) |inv| {
         const created = now - inv.age_days * day;
         const open = std.mem.eql(u8, inv.status, "open") or std.mem.eql(u8, inv.status, "draft");
         try s.invoices.append(a, .{ .id = inv.id, .status = inv.status, .created = created, .json = try std.fmt.allocPrint(a,
-            \\{{"id":"{s}","object":"invoice","amount_due":{d},"amount_paid":{d},"amount_remaining":{d},"attempt_count":{d},"attempted":{},"auto_advance":false,"collection_method":"charge_automatically","created":{d},"currency":"eur","customer":"{s}","due_date":null,"livemode":false,"number":{s},"parent":{s},"status":"{s}","status_transitions":{{"finalized_at":{s},"marked_uncollectible_at":null,"paid_at":null,"voided_at":null}},"total":{d}}}
+            \\{{"id":"{s}","object":"invoice","amount_due":{d},"amount_paid":{d},"amount_remaining":{d},"attempt_count":{d},"attempted":{},"auto_advance":false,"collection_method":"{s}","created":{d},"currency":"eur","customer":"{s}","due_date":{s},"livemode":false,"next_payment_attempt":null,"number":{s},"parent":{s},"status":"{s}","status_transitions":{{"finalized_at":{s},"marked_uncollectible_at":null,"paid_at":null,"voided_at":null}},"total":{d}}}
         , .{
-            inv.id,                                                                                                                                                                                                         inv.total,
-            if (std.mem.eql(u8, inv.status, "paid")) inv.total else 0,                                                                                                                                                       if (open) inv.total else 0,
-            @as(u8, if (inv.attempted) 1 else 0),                                                                                                                                                                            inv.attempted,
-            created,                                                                                                                                                                                                         inv.customer,
-            try q(a, inv.number),                                                                                                                                                                                            if (inv.sub.len > 0) try std.fmt.allocPrint(a, "{{\"type\":\"subscription_details\",\"quote_details\":null,\"subscription_details\":{{\"metadata\":{{}},\"subscription\":\"{s}\"}}}}", .{inv.sub}) else "null",
-            inv.status,                                                                                                                                                                                                      if (inv.finalized) try std.fmt.allocPrint(a, "{d}", .{created}) else "null",
+            inv.id,
+            inv.total,
+            if (std.mem.eql(u8, inv.status, "paid")) inv.total else 0,
+            if (open) inv.total else 0,
+            if (inv.tries > 0) inv.tries else @as(u8, if (inv.attempted) 1 else 0),
+            inv.attempted,
+            if (inv.due_days_ago != null) "send_invoice" else "charge_automatically",
+            created,
+            inv.customer,
+            if (inv.due_days_ago) |n| try std.fmt.allocPrint(a, "{d}", .{now - n * day}) else "null",
+            try q(a, inv.number),
+            if (inv.sub.len > 0) try std.fmt.allocPrint(a, "{{\"type\":\"subscription_details\",\"quote_details\":null,\"subscription_details\":{{\"metadata\":{{}},\"subscription\":\"{s}\"}}}}", .{inv.sub}) else "null",
+            inv.status,
+            if (inv.finalized) try std.fmt.allocPrint(a, "{d}", .{created}) else "null",
             inv.total,
         }) });
     }

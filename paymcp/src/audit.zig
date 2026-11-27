@@ -24,6 +24,8 @@ pub const Rules = struct {
     draft_days: u32 = 7,
     /// An invoice the provider should have charged, not tried for this long.
     unsent_days: u32 = 3,
+    /// An invoice sent to be paid by hand, this long past its due date.
+    overdue_days: u32 = 7,
     /// How far back written-off invoices are counted.
     written_off_days: u32 = 365,
     /// Written-off invoices below this sum (a customer, smallest unit) are left out.
@@ -50,6 +52,10 @@ pub const Data = struct {
     /// Something could not be read whole (a page limit, a permission): said
     /// with the findings, since what wasn't read can't be found.
     gaps: []const []const u8 = &.{},
+    /// No list was cut at the page limit.
+    whole: bool = true,
+    /// Use reported to the meters could be read.
+    usage_read: bool = true,
 };
 
 pub const Kind = enum {
@@ -58,6 +64,8 @@ pub const Kind = enum {
     draft_invoice,
     unsent_invoice,
     written_off,
+    overdue,
+    failed_payment,
     old_price,
     paused,
     more_seats,
@@ -73,6 +81,8 @@ pub const Kind = enum {
             .draft_invoice => "An invoice never sent",
             .unsent_invoice => "An invoice never charged",
             .written_off => "Invoices written off",
+            .overdue => "Invoices past due",
+            .failed_payment => "Payments that failed",
             .old_price => "A price no longer sold",
             .paused => "Collection paused",
             .more_seats => "More seats than paid for",
@@ -153,6 +163,7 @@ pub fn run(a: Allocator, d: Data, r: Rules, now: i64) ![]Finding {
     }
     try invoices(&c);
     try writtenOff(&c);
+    try late(&c);
     try whoRows(&c);
     std.mem.sort(Finding, c.out.items, {}, lessThan);
     return c.out.items;
@@ -410,6 +421,86 @@ fn writtenOff(c: *Ctx) !void {
             .rows = list.items,
             .proposal = "Check each was given up on purpose. One written off by a rule (after failed payments, or on a pause) can still be asked for.",
         });
+    }
+}
+
+fn isLate(c: *Ctx, inv: model.Invoice, kind: Kind) bool {
+    if (inv.status != .open or inv.amount_remaining <= 0) return false;
+    if (kind == .overdue) {
+        const due = inv.due_date orelse return false;
+        return !inv.collects_itself and c.now - due >= @as(i64, c.r.overdue_days) * day_s;
+    }
+    return inv.collects_itself and inv.attempted;
+}
+
+/// Money owed now and late: invoices sent to be paid by hand and past
+/// their due date, and invoices the provider tried to charge and couldn't.
+/// One sum for each customer, as a person would ask for it.
+fn late(c: *Ctx) !void {
+    for ([_]Kind{ .overdue, .failed_payment }) |kind| {
+        var done: std.StringHashMapUnmanaged(void) = .empty;
+        for (c.d.invoices) |first| {
+            if (!isLate(c, first, kind)) continue;
+            const gop = try done.getOrPut(c.a, try c.p("{s}/{s}", .{ first.customer, first.currency }));
+            if (gop.found_existing) continue;
+            var sum: i64 = 0;
+            var oldest: i64 = std.math.maxInt(i64);
+            var stopped: usize = 0;
+            var list: std.ArrayList(Row) = .empty;
+            for (c.d.invoices) |inv| {
+                if (!isLate(c, inv, kind)) continue;
+                if (!std.mem.eql(u8, inv.customer, first.customer) or !std.mem.eql(u8, inv.currency, first.currency)) continue;
+                sum += inv.amount_remaining;
+                const left = try c.money(inv.amount_remaining, inv.currency);
+                if (kind == .overdue) {
+                    const due = inv.due_date.?;
+                    oldest = @min(oldest, due);
+                    try list.append(c.a, .{ .source = try c.p("invoice {s}", .{inv.label()}), .value = try c.p("due {s}, {d} days ago, remaining {s}", .{ try c.date(due), @divFloor(c.now - due, day_s), left }) });
+                } else {
+                    if (inv.next_attempt == null) stopped += 1;
+                    try list.append(c.a, .{ .source = try c.p("invoice {s}", .{inv.label()}), .value = try c.p("remaining {s}, tried {d} time{s}, {s}", .{
+                        left,
+                        inv.attempts,
+                        if (inv.attempts == 1) "" else "s",
+                        if (inv.next_attempt) |at| try c.p("next try {s}", .{try c.date(at)}) else "no further try planned",
+                    }) });
+                }
+            }
+            const n = list.items.len;
+            const name = c.nameOf(first.customer);
+            const total = try c.money(sum, first.currency);
+            const what = if (kind == .overdue)
+                (if (n == 1)
+                    try c.p("An invoice to {s} for {s} has been past due since {s}.", .{ name, total, try c.date(oldest) })
+                else
+                    try c.p("{d} invoices to {s}, {s} together, are past due; the oldest was due {s}.", .{ n, name, total, try c.date(oldest) }))
+            else blk: {
+                const head = if (n == 1)
+                    try c.p("A payment of {s} from {s} failed, and the invoice is still open.", .{ total, name })
+                else
+                    try c.p("{d} payments from {s} failed: {s} is still owed.", .{ n, name, total });
+                if (stopped == 0) break :blk head;
+                break :blk if (n == 1)
+                    try c.p("{s} No further try is planned.", .{head})
+                else
+                    try c.p("{s} No further try is planned for {d} of them.", .{ head, stopped });
+            };
+            try c.add(.{
+                .kind = kind,
+                .key = try c.p("{s}:{s}:{s}", .{ @tagName(kind), first.customer, first.currency }),
+                .customer = first.customer,
+                .name = name,
+                .amount = sum,
+                .currency = first.currency,
+                .per = .once,
+                .what = what,
+                .rows = list.items,
+                .proposal = if (kind == .overdue)
+                    "Remind the customer, with the invoice's own link to pay. If they dispute it or can't pay, settle that on purpose: an invoice left open is neither collected nor written off."
+                else
+                    "The payment method on file was refused. Ask the customer for a new one (the invoice's own page takes it). Where no further try is planned, nothing more will be collected unless someone acts.",
+            });
+        }
     }
 }
 
@@ -753,7 +844,7 @@ test "invoices_never_sent_never_charged_and_written_off" {
         .{ .id = "in_fresh", .customer = "cus_a", .status = .draft, .created = daysAgo(1), .total = 1000, .currency = "eur" },
         .{ .id = "in_zero", .customer = "cus_a", .status = .draft, .created = daysAgo(50), .total = 0, .currency = "eur" },
         .{ .id = "in_open", .number = "A-0042", .customer = "cus_b", .status = .open, .created = daysAgo(9), .total = 2900, .amount_remaining = 2900, .currency = "eur", .finalized_at = daysAgo(9) },
-        // sent to be paid by hand: an overdue invoice is another job's
+        // sent to be paid by hand, with no due date read: nothing to say
         .{ .id = "in_byhand", .customer = "cus_b", .status = .open, .created = daysAgo(9), .total = 2900, .amount_remaining = 2900, .currency = "eur", .collects_itself = false },
         .{ .id = "in_tried", .customer = "cus_b", .status = .open, .created = daysAgo(9), .total = 2900, .amount_remaining = 2900, .currency = "eur", .attempted = true },
         .{ .id = "in_bad1", .customer = "cus_c", .status = .uncollectible, .created = daysAgo(100), .total = 6000, .currency = "eur", .finalized_at = daysAgo(100) },
@@ -764,7 +855,8 @@ test "invoices_never_sent_never_charged_and_written_off" {
         .{ .id = "in_ancient", .customer = "cus_c", .status = .uncollectible, .created = daysAgo(900), .total = 6000, .currency = "eur", .finalized_at = daysAgo(900) },
     };
     const fs = try run(a, .{ .invoices = &invs }, .{}, now_t);
-    try t.expectEqual(@as(usize, 3), fs.len);
+    // (the fourth: in_tried, a payment that failed)
+    try t.expectEqual(@as(usize, 4), fs.len);
     const d = find(fs, .draft_invoice, "cus_a").?;
     try t.expectEqual(@as(i64, 48000), d.amount);
     try t.expect(d.per == .once);
@@ -779,6 +871,43 @@ test "invoices_never_sent_never_charged_and_written_off" {
     // a sum below the owner's line is left out
     const fewer = try run(a, .{ .invoices = &invs }, .{ .written_off_above = 12000 }, now_t);
     try t.expect(find(fewer, .written_off, "cus_c") == null);
+}
+
+test "money_owed_and_late_is_summed_for_each_customer" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cs = [_]model.Customer{.{ .id = "cus_a", .name = "Alder Works" }};
+    const invs = [_]model.Invoice{
+        // sent to be paid by hand: two past due, one not yet, one only just
+        .{ .id = "in_1", .number = "A-1", .customer = "cus_a", .status = .open, .created = daysAgo(60), .total = 30000, .amount_remaining = 30000, .currency = "eur", .collects_itself = false, .due_date = daysAgo(30) },
+        .{ .id = "in_2", .number = "A-2", .customer = "cus_a", .status = .open, .created = daysAgo(40), .total = 5000, .amount_remaining = 4000, .currency = "eur", .collects_itself = false, .due_date = daysAgo(10) },
+        .{ .id = "in_3", .customer = "cus_a", .status = .open, .created = daysAgo(5), .total = 9900, .amount_remaining = 9900, .currency = "eur", .collects_itself = false, .due_date = now_t + 25 * day_s },
+        .{ .id = "in_4", .customer = "cus_a", .status = .open, .created = daysAgo(33), .total = 700, .amount_remaining = 700, .currency = "eur", .collects_itself = false, .due_date = daysAgo(3) },
+        // paid late is paid
+        .{ .id = "in_5", .customer = "cus_a", .status = .paid, .created = daysAgo(90), .total = 30000, .currency = "eur", .collects_itself = false, .due_date = daysAgo(60) },
+        // charged by the provider, and the card refused: one still being tried, one given up on
+        .{ .id = "in_6", .number = "B-6", .customer = "cus_b", .status = .open, .created = daysAgo(4), .total = 2900, .amount_remaining = 2900, .currency = "eur", .attempted = true, .attempts = 2, .next_attempt = now_t + 3 * day_s },
+        .{ .id = "in_7", .number = "B-7", .customer = "cus_b", .status = .open, .created = daysAgo(34), .total = 2900, .amount_remaining = 2900, .currency = "eur", .attempted = true, .attempts = 4 },
+    };
+    const fs = try run(a, .{ .customers = &cs, .invoices = &invs }, .{}, now_t);
+    try t.expectEqual(@as(usize, 2), fs.len);
+    const o = find(fs, .overdue, "cus_a").?;
+    try t.expectEqual(@as(i64, 34000), o.amount);
+    try t.expect(o.per == .once);
+    try t.expectEqualStrings("overdue:cus_a:eur", o.key);
+    try t.expectEqualStrings("2 invoices to Alder Works, 340.00 EUR together, are past due; the oldest was due 2026-10-24.", o.what);
+    try t.expectEqualStrings("due 2026-11-13, 10 days ago, remaining 40.00 EUR", o.rows[1].value);
+    const f = find(fs, .failed_payment, "cus_b").?;
+    try t.expectEqual(@as(i64, 5800), f.amount);
+    try t.expectEqualStrings("2 payments from cus_b failed: 58.00 EUR is still owed. No further try is planned for 1 of them.", f.what);
+    try t.expectEqualStrings("remaining 29.00 EUR, tried 2 times, next try 2026-11-26", f.rows[0].value);
+    try t.expectEqualStrings("remaining 29.00 EUR, tried 4 times, no further try planned", f.rows[1].value);
+    // the owner's own patience
+    const strict = try run(a, .{ .customers = &cs, .invoices = &invs }, .{ .overdue_days = 0 }, now_t);
+    try t.expectEqual(@as(i64, 34700), find(strict, .overdue, "cus_a").?.amount);
+    const one = try run(a, .{ .customers = &cs, .invoices = invs[0..1] }, .{}, now_t);
+    try t.expectEqualStrings("An invoice to Alder Works for 300.00 EUR has been past due since 2026-10-24.", one[0].what);
 }
 
 test "a_draft_the_provider_will_send_itself_is_given_a_day" {

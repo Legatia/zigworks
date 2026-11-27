@@ -122,9 +122,12 @@ pub const Client = struct {
     pub fn load(c: *Client, a: Allocator, cfg: *const config.Config, rows: []const who.Row, now: i64) Error!audit.Data {
         var gaps: std.ArrayList([]const u8) = .empty;
         var complete = true;
+        // (`complete` is one list's; `whole` is the reading's)
+        var whole = true;
 
         var raw: std.ArrayList(jv.Value) = .empty;
         try c.list(a, "/v1/customers", &raw, &complete);
+        if (!complete) whole = false;
         if (!complete) try gaps.append(a, "the customer list was cut at the page limit");
         var customers: std.ArrayList(model.Customer) = .empty;
         for (raw.items) |v| try customers.append(a, model.customer(v));
@@ -135,12 +138,14 @@ pub const Client = struct {
         for ([_][]const u8{ "/v1/prices?active=true", "/v1/prices?active=false" }) |path| {
             raw = .empty;
             try c.list(a, path, &raw, &complete);
+            if (!complete) whole = false;
             if (!complete) try gaps.append(a, "the price list was cut at the page limit");
             for (raw.items) |v| try prices.append(a, model.price(v));
         }
 
         raw = .empty;
         try c.list(a, "/v1/subscriptions?status=all&expand%5B%5D=data.discounts.source.coupon", &raw, &complete);
+        if (!complete) whole = false;
         if (!complete) try gaps.append(a, "the subscription list was cut at the page limit");
         var subs: std.ArrayList(model.Subscription) = .empty;
         for (raw.items) |v| try subs.append(a, try model.subscription(a, v));
@@ -156,6 +161,7 @@ pub const Client = struct {
         for (invoice_lists) |path| {
             raw = .empty;
             try c.list(a, path, &raw, &complete);
+            if (!complete) whole = false;
             if (!complete) try gaps.append(a, "an invoice list was cut at the page limit");
             for (raw.items) |v| try invoices.append(a, model.invoice(v));
         }
@@ -193,6 +199,8 @@ pub const Client = struct {
         }
         data.usage = usage.items;
         data.gaps = gaps.items;
+        data.whole = whole;
+        data.usage_read = !meters_refused;
         return data;
     }
 };
