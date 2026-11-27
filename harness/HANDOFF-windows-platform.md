@@ -5,6 +5,14 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: the browser tests are a CI job of their own (2026-11-27, late night)
+
+- `zig build test` on your machine is as it was: the browser tests run with the rest.
+- New: `zig build test -Dbrowser-tests=false` skips every test that starts a browser, and `zig build browser-test` runs only those (52 tests: all of `web.zig`, four of `cdp.zig`, three of `page.zig`, one of `agent.zig`). CI's `test` job does the first for harness; the new job `harness-browser` does the second on Linux, macOS and Windows, in Debug and ReleaseSafe. A failed browser test now fails that job alone and is run again in minutes.
+- A new test of yours that starts a browser: get the browser from `cdp.testBrowser(a)` (null: `return error.SkipZigTest`), and add the test's name to `browser_filters` in `build.zig` (`FILE.test.NAME`; a test in `web.zig` is already covered). `scripts/check-browser-tests.sh` runs before the browser tests and fails the step, naming the file and line, when a test that calls `testBrowser` is not in the list.
+- The script runs through `sh` with `awk`, as the smoke does; on Windows it has only run in CI. If it fails there for a reason of the shell's, that is where to look.
+- `release.yml` builds without the browser tests now; a tag goes on a commit CI has passed.
+
 ## For you: harness is an MCP server for other agents (2026-11-27, night)
 
 - Built and on `main`: the gate as an MCP proxy (README, "MCP", "For other agents (the proxy)"; spec `docs/superpowers/specs/2026-11-27-harness-mcp-proxy-design.md`). `harness run` serves MCP over HTTP on `[proxy] listen` (127.0.0.1:8766) to the agents named in `[client NAME]` sections; each of their calls passes the gate as `client:NAME` and is asked in `main` like any approval, its text starting `[client:NAME] `.

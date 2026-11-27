@@ -4493,7 +4493,13 @@ desktop's to choose.
 ```
 zig build                     # zig-out/bin/harness, and harness-fake (the stand-ins)
 zig build test --summary all  # unit tests, then scripts/smoke.sh end to end
+zig build browser-test        # only the unit tests that start a browser
 ```
+
+The tests that start a browser (headless Chrome; Chrome or Edge on
+Windows) run with the rest, and are skipped where there is none.
+`zig build test -Dbrowser-tests=false` leaves them out; CI does, and runs
+`zig build browser-test` as a job of its own.
 
 The end-to-end script's home and butler checks run when homemcp and
 carcloud are built next to harness (`zig build` in `../homemcp` and

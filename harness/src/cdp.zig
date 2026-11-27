@@ -824,8 +824,12 @@ test "messages_are_split_at_nul_and_events_skipped" {
     try t.expectEqual(0, b.partial.items.len);
 }
 
-/// Chrome, for the tests that need one; null skips them.
+/// Chrome, for the tests that need one; null skips them. Every test that
+/// starts a browser asks here, and is named in build.zig's browser_filters:
+/// built with -Dbrowser-tests=false they are all skipped (the browser-test
+/// step runs them).
 pub fn testBrowser(a: Allocator) !?[]const u8 {
+    if (!@import("build_options").browser_tests) return null;
     // Windows: where Chrome or Edge is installed (page.findBrowser)
     if (is_windows) return page.findBrowser(a, t.io, "", "", "");
     const env_chrome: []const u8 = if (t.environ.getPosix("HARNESS_CHROME")) |v| v else "";
