@@ -1,0 +1,8 @@
+customer,email,plan,seats,usage,active
+cus_alder,,team,9,,yes
+,ola@birch.example,pro,4,,yes
+cus_cedar,,pro,2,,yes
+cus_fir,,team,5,15300,yes
+cus_juniper,,pro,1,,yes
+,nobody@maple.example,team,3,,yes
+cus_old,,team,2,,no
