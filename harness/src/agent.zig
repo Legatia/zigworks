@@ -258,6 +258,9 @@ pub const Conversation = struct {
         bytes: usize = 0,
         /// Said while private mode was on: never written to memory.
         private: bool = false,
+        /// Asked of the model of private conversations: never sent to
+        /// another model, whatever the settings are later.
+        on_private: bool = false,
         /// The outside text's sources this turn read (outside.zig), in
         /// the turn's arena.
         outside: std.ArrayList([]const u8) = .empty,
@@ -407,17 +410,18 @@ pub const Conversation = struct {
     }
 
     /// `messages`, and with `leave_private` (a request that goes to another
-    /// model than the one of private conversations) without the turns
-    /// said while private: one line (`private_gap`) stands where each
-    /// stretch of them was, in a user message. The newest turn is the one
-    /// being asked and is always sent.
+    /// model than the one of private conversations) without the turns that
+    /// model answered: one line (`private_gap`) stands where each stretch
+    /// of them was, in a user message. A turn marked private that the
+    /// usual model answered (made private while it ran, or said before a
+    /// private model was set) was sent there already and stays.
     pub fn messagesFor(c: *const Conversation, arena: std.mem.Allocator, leave_private: bool) ![]model.Message {
         var out: std.ArrayList(model.Message) = .empty;
         // turns were left out since the last message taken
         var gap = false;
         for (c.turns.items, 0..) |tn, ti| {
             const newest = ti + 1 == c.turns.items.len;
-            if (leave_private and tn.private and !newest) {
+            if (leave_private and tn.on_private) {
                 gap = true;
                 continue;
             }
@@ -2122,8 +2126,9 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
         r.on_private = false;
         private_client.deinit();
     };
-    // what was said while private stays with that model
-    const leave_private = !r.helper and private_model.len > 0 and !r.on_private;
+    // what the private model was asked stays with it, also when the
+    // setting is taken away later
+    const leave_private = !r.helper and !r.on_private;
     // the folders it changes are snapshotted before their first change and
     // when it ends; its helpers share this
     // a run in a `workspace = copy` environment works in its own copy,
@@ -2150,6 +2155,7 @@ fn turnRun(r: *Run, conv: *Conversation, user_text: []const u8, from_owner: bool
     var tn_kept = true;
     errdefer if (tn_kept) conv.dropLast();
     tn.private = private_now;
+    tn.on_private = r.on_private;
     // where its calls mark what they read; what it starts with
     r.conv = conv;
     {
@@ -8346,6 +8352,53 @@ test "a_turn_made_private_while_it_runs_stays_on_its_model_and_is_sent_whole" {
     try t.expectEqual(0, std.mem.count(u8, last, private_gap));
 }
 
+test "privately_answered_turns_stay_with_that_model_when_the_setting_is_taken_away" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.oaTextReply("Bravo kept."));
+    try f.e.script(2, model.textReply("Delta answer."));
+    try f.e.script(3, model.textReply("Echo answer."));
+    try sayAs(&f, true, "bravo secret");
+    // harness config set model.private_model "", then /reload
+    f.run.model_cfg.?.private = "";
+    try sayAs(&f, false, "delta question");
+    // private with no model of its own now: the usual model's, like the rest
+    try sayAs(&f, true, "echo words");
+    for ([_]u32{ 2, 3 }) |n| {
+        const sent = try f.e.request(n);
+        try t.expectEqualStrings(at_usual, try targetOf(&f, n));
+        for ([_][]const u8{ "bravo secret", "Bravo kept." }) |word| {
+            if (std.mem.indexOf(u8, sent, word) != null) {
+                std.debug.print("request {d} to the usual model holds: {s}\n", .{ n, word });
+                return error.TestUnexpectedResult;
+            }
+        }
+        try t.expectEqual(1, std.mem.count(u8, sent, private_gap));
+    }
+    try t.expect(std.mem.indexOf(u8, try f.e.request(3), "delta question") != null);
+}
+
+test "a_turn_the_usual_model_answered_is_sent_to_it_again_though_marked_private" {
+    var f: Fix = undefined;
+    try f.init("");
+    defer f.deinit();
+    try withPrivateModel(&f);
+    try f.e.script(1, model.textReply("Alpha answer."));
+    try f.e.script(2, model.textReply("Delta answer."));
+    try sayAs(&f, false, "alpha question");
+    // /private on arrived while it ran, /private off after it: the core
+    // marks such a turn private (out of memory), on the model it started with
+    f.conv.turns.items[0].private = true;
+    try sayAs(&f, false, "delta question");
+    const second = try f.e.request(2);
+    try t.expectEqualStrings(at_usual, try targetOf(&f, 2));
+    try t.expect(std.mem.indexOf(u8, second, "alpha question") != null);
+    try t.expect(std.mem.indexOf(u8, second, "Alpha answer.") != null);
+    try t.expectEqual(0, std.mem.count(u8, second, private_gap));
+}
+
 test "the_newest_turn_is_sent_though_marked_private" {
     var conv: Conversation = .init(t.allocator);
     defer conv.deinit();
@@ -8355,11 +8408,14 @@ test "the_newest_turn_is_sent_though_marked_private" {
     const words = [_][]const u8{ "one", "two", "three" };
     for (words, 0..) |w, i| {
         const tn = try conv.begin();
+        // the second was asked of the private model; the third is on the
+        // usual one, private since /private on arrived
         tn.private = i > 0;
+        tn.on_private = i == 1;
         try keep(tn, .{ .role = .user, .blocks = &.{.{ .text = w }} });
         if (i < 2) try keep(tn, .{ .role = .assistant, .blocks = &.{.{ .text = "answer" }} });
     }
-    // to another model: the earlier private turn is left out, the newest is not
+    // to another model: the private model's turn is left out, the newest is not
     const msgs = try conv.messagesFor(a, true);
     try t.expectEqual(3, msgs.len);
     try t.expectEqualStrings("one", msgs[0].blocks[0].text);
@@ -8371,6 +8427,7 @@ test "the_newest_turn_is_sent_though_marked_private" {
     try t.expectEqual(5, (try conv.messagesFor(a, false)).len);
     try t.expectEqual(5, (try conv.messages(a)).len);
     // a stretch whose next kept message is the agent's: the line is a user message of its own
+    conv.turns.items[2].on_private = true;
     const tn = try conv.begin();
     try keep(tn, .{ .role = .assistant, .blocks = &.{.{ .text = "said by itself" }} });
     const more = try conv.messagesFor(a, true);

@@ -243,16 +243,23 @@ While a conversation is private, every model call of a run in it is made
 to `private_model`: the turns of your messages, the helpers they delegate
 to (`strong` ones and ones whose definition names a model too), the
 summary made when the conversation grows long, and the briefs, tasks,
-triggers and workflow steps that report there. When its provider can't be
-reached or refuses, the turn ends with that provider's error; no other
-model is tried. A 404 from it names the setting to change. The switch
-applies from the next message: a turn already running finishes on the
-model it started with.
+triggers' `do` runs and workflow steps that report there. A trigger's
+`check` reads its events, nothing of the conversation, and stays on
+`check_model` (else `worker_model`). When the private model's provider
+can't be reached or refuses, the turn ends with that provider's error; no
+other model is tried (a brief then lists its new items unwritten). A 404
+from it names the setting to change. The switch applies from the next
+message: a turn already running finishes on the model it started with,
+and a message that was waiting in the queue when `/private off` came is
+still answered as private.
 
 After `/private off` the turns said while it was on are left out of what
 the other models are sent, with one line in their place: "(a private part
 of this conversation is left out here)". They are sent again, whole, when
-the conversation is private again.
+the conversation is private again. This holds for the turns
+`private_model` answered, also if the setting is cleared later. Private
+turns from before the setting existed were answered by the usual model
+and stay in what it is sent.
 
 The provider's name is required (`private_model = llama3.1:8b` is refused
 when the file is read), so a mistyped name is never read as a model of the

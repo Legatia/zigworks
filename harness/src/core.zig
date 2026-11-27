@@ -673,6 +673,9 @@ const Queued = struct {
     mail: ?[]u8 = null,
     /// The owner forwarded it: someone else's words, outside text.
     forwarded: bool = false,
+    /// Its conversation was private when it came: its turn is private,
+    /// also when the conversation isn't any more by then.
+    private: bool = false,
 
     fn deinit(q: Queued, gpa: std.mem.Allocator) void {
         gpa.free(q.conv);
@@ -2610,10 +2613,11 @@ pub const Core = struct {
         errdefer c.gpa.free(text_owned);
         const name_owned = try c.gpa.dupe(u8, name);
         errdefer c.gpa.free(name_owned);
+        const private = c.convPrivate(conv);
         const behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
-            try c.queue.append(c.gpa, .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .member = name_owned });
+            try c.queue.append(c.gpa, .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .member = name_owned, .private = private });
             break :blk c.busy.load(.acquire) or c.queue.items.len > 1;
         };
         c.touch(conv);
@@ -2624,7 +2628,7 @@ pub const Core = struct {
     /// definition with harness's household instructions (Ruling 7), an
     /// empty memory, no history or summaries, and only its own conversation
     /// to post to. Its turns are never read for the owner's memory.
-    fn memberTurn(c: *Core, conv: []const u8, name: []const u8, text: []const u8) void {
+    fn memberTurn(c: *Core, conv: []const u8, name: []const u8, text: []const u8, said_private: bool) void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -2656,6 +2660,7 @@ pub const Core = struct {
         defer if (def_client) |*dc| dc.deinit();
         const by = std.fmt.allocPrint(a, "member:{s}", .{name}) catch return;
         var run = c.runIn(if (def_client) |*dc| dc else &c.chat_client, "chat", .{ .agent = def.name, .by = by }, conv, &flag);
+        run.private = run.private or said_private;
         run.useDefinition(def);
         run.holds_place = true;
         // nothing of the owner's: no memory, no history, no summaries
@@ -3538,7 +3543,7 @@ pub const Core = struct {
         errdefer if (note_owned) |n| c.gpa.free(n);
         const voice_owned = if (voice) |v| try v.clone(c.gpa) else null;
         errdefer if (voice_owned) |v| v.deinit(c.gpa);
-        const item: Queued = .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .note = note_owned, .voice = voice_owned, .forwarded = forwarded };
+        const item: Queued = .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .note = note_owned, .voice = voice_owned, .forwarded = forwarded, .private = c.convPrivate(conv) };
         const queued_behind = blk: {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
@@ -3596,7 +3601,7 @@ pub const Core = struct {
     /// A voice note's turn (the chat worker's): fetched and transcribed
     /// under a stop flag of its own (/stop ends it there), its transcript
     /// shown, then the turn runs on it.
-    fn voiceTurn(c: *Core, conv: []const u8, agent_name: []const u8, note: voice_mod.Note, forwarded: bool) void {
+    fn voiceTurn(c: *Core, conv: []const u8, agent_name: []const u8, note: voice_mod.Note, forwarded: bool, said_private: bool) void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         var flag: std.atomic.Value(bool) = .init(false);
@@ -3606,13 +3611,13 @@ pub const Core = struct {
         const text = heard orelse return;
         if (flag.load(.acquire)) return;
         // someone else's voice the owner forwarded: their words, a turn
-        if (forwarded) return c.chatTurnWith(conv, agent_name, text, voice_context, true);
+        if (forwarded) return c.chatTurnWith(conv, agent_name, text, voice_context, true, said_private);
         // a phrase said aloud starts its workflow, as typed (Ruling 2)
         if (c.phraseStart(conv, text)) return;
         if (Errands.words(c, conv, "", text)) return;
         if (Errands.parcelWords(c, conv, text)) return;
         if (Errands.upkeepWords(c, conv, text)) return;
-        c.chatTurnAs(conv, agent_name, text, voice_context);
+        c.chatTurnWith(conv, agent_name, text, voice_context, false, said_private);
     }
 
     /// Fetches voice note `note` and transcribes it for `conv`: the
@@ -5512,7 +5517,7 @@ pub const Core = struct {
         while (!c.quitting.load(.acquire)) {
             if (c.popQueue()) |item| {
                 defer item.deinit(c.gpa);
-                if (item.mail != null) c.mailTurn(item) else if (item.member) |name| c.memberTurn(item.conv, name, item.text) else if (item.voice) |note| c.voiceTurn(item.conv, item.agent, note, item.forwarded) else c.chatTurnWith(item.conv, item.agent, item.text, item.note, item.forwarded);
+                if (item.mail != null) c.mailTurn(item) else if (item.member) |name| c.memberTurn(item.conv, name, item.text, item.private) else if (item.voice) |note| c.voiceTurn(item.conv, item.agent, note, item.forwarded, item.private) else c.chatTurnWith(item.conv, item.agent, item.text, item.note, item.forwarded, item.private);
                 c.busy.store(false, .release);
                 continue;
             }
@@ -6034,13 +6039,14 @@ pub const Core = struct {
     /// block. Its posts carry `[NAME]` when another definition answers in
     /// that conversation (`/ask NAME`).
     fn chatTurnAs(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8) void {
-        c.chatTurnWith(conv, agent_name, text, note, false);
+        c.chatTurnWith(conv, agent_name, text, note, false, false);
     }
 
     /// `chatTurnAs`; `forwarded`: the message is someone else's words the
     /// owner forwarded (outside text: the turn is marked, none of it is
-    /// the owner's own).
-    fn chatTurnWith(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8, forwarded: bool) void {
+    /// the owner's own). `said_private`: its conversation was private
+    /// when the message came, so its turn is, whatever the switch says now.
+    fn chatTurnWith(c: *Core, conv: []const u8, agent_name: []const u8, text: []const u8, note: ?[]const u8, forwarded: bool, said_private: bool) void {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         // the definition as it is now: a change saved later applies to the next message
@@ -6078,6 +6084,7 @@ pub const Core = struct {
         };
         defer if (def_client) |*dc| dc.deinit();
         var run = c.runIn(if (def_client) |*dc| dc else &c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
+        run.private = run.private or said_private;
         run.useDefinition(def);
         run.holds_place = true;
         run.context_note = c.contextNote(arena.allocator(), conv) catch "";
@@ -7343,13 +7350,19 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var client = try c.modelClient(c.cfg.model.model, c.cfg.model.max_tokens);
+        // a brief for a private conversation is written by that
+        // conversation's model (it is sent the owner's memory of its
+        // topics); no other is asked when that one fails
+        const private_model = c.cfg.model.private_model;
+        const on_private = private_model.len > 0 and c.convPrivate(b.to);
+        var client = try c.modelClient(if (on_private) private_model else c.cfg.model.model, c.cfg.model.max_tokens);
         defer client.deinit();
         const label = try std.fmt.allocPrint(a, "brief {s}", .{b.name});
         var flag: std.atomic.Value(bool) = .init(false);
         c.register(&flag, "main");
         defer c.unregister(&flag);
         var run = c.runIn(&client, label, .{ .by = try std.fmt.allocPrint(a, "schedule:{s}", .{b.name}) }, b.to, &flag);
+        run.on_private = on_private;
         // what it collects is outside text
         {
             var marks: std.ArrayList([]const u8) = .empty;
@@ -10433,12 +10446,13 @@ pub const Core = struct {
         errdefer c.gpa.free(text_owned);
         const mail_owned = try c.gpa.dupe(u8, got.text);
         errdefer c.gpa.free(mail_owned);
+        const private = c.convPrivate(mail_mod.conversation);
         {
             c.queue_mutex.lockUncancelable(c.io);
             defer c.queue_mutex.unlock(c.io);
-            try c.queue.append(c.gpa, .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .mail = mail_owned });
+            try c.queue.append(c.gpa, .{ .conv = conv_owned, .agent = agent_owned, .text = text_owned, .mail = mail_owned, .private = private });
         }
-        c.log.write(.chat, c.convPrivate(mail_mod.conversation), .{ .event = "mail in", .conversation = mail_mod.conversation, .thread = thread, .uid = it.uid, .bytes = text.len }) catch {};
+        c.log.write(.chat, private, .{ .event = "mail in", .conversation = mail_mod.conversation, .thread = thread, .uid = it.uid, .bytes = text.len }) catch {};
     }
 
     /// One turn for a mail of the owner's, in its thread's own context; the
@@ -10471,6 +10485,7 @@ pub const Core = struct {
         if (def.model.len > 0) def_client = c.modelClient(def.model, c.cfg.model.max_tokens) catch return;
         defer if (def_client) |*dc| dc.deinit();
         var run = c.runIn(if (def_client) |*dc| dc else &c.chat_client, "chat", .{ .agent = def.name }, conv, &flag);
+        run.private = run.private or item.private;
         run.useDefinition(def);
         run.holds_place = true;
         run.context_note = mail_mod.contextNote(a, r) catch "";
@@ -17256,8 +17271,9 @@ pub fn parseProblem(a: std.mem.Allocator, name: []const u8, text: []const u8, co
     return try std.fmt.allocPrint(a, "{s} line {d} has an error: {s}{s}{s}{s}", .{ name, n, util.cut(shown, 80), if (why != null) " (" else "", why orelse "", if (why != null) ")" else "" });
 }
 
-/// Where config.ini's checks of the file as a whole come in its reading
-/// (0: an error of one line). A start of the file that fails a later check
+/// Where config.ini's checks of the file as a whole come in its reading,
+/// in `config.parse`'s order: every one from the providers' on is here
+/// (0: an error of one line, or a check before them). A start of the file that fails a later check
 /// than the whole file does has passed the one the file fails: it is cut
 /// before the section a name of its points at, not wrong.
 fn wholeFileCheck(e: anyerror) u8 {
@@ -17266,6 +17282,9 @@ fn wholeFileCheck(e: anyerror) u8 {
         error.UnknownProvider => 2,
         error.SpeechOnlyModel => 3,
         error.BadPrivateModel => 4,
+        error.BadVoiceAgent => 5,
+        error.BadVoice => 6,
+        error.BadDesk => 7,
         else => 0,
     };
 }
@@ -20696,6 +20715,64 @@ test "a_task_in_a_private_conversation_runs_on_the_private_model" {
     try expectAskedOf(&f, 3, "/v1/messages", "other-model");
 }
 
+test "a_message_queued_while_private_has_its_turn_as_private_after_private_off" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try privateModelFix(&f, "");
+    try f.core.handleText("/private on");
+    const slow = comptime "{\"delay_ms\":600," ++ model.oaTextReply("first answer")[1..];
+    try f.e.script(1, slow);
+    try f.e.script(2, model.oaTextReply("second kept"));
+    try f.core.startWorker();
+    try f.core.handleText("first");
+    t.io.sleep(.fromMilliseconds(150), .awake) catch {};
+    try f.core.handleText("my diagnosis is xyzzy");
+    try f.rec.waitFor("Queued; /stop cancels the current turn.");
+    // a command runs at once: before the queued message's turn
+    try f.core.handleText("/private off");
+    try f.rec.waitFor("second kept");
+    // said while private: asked of the private model, kept out of the log
+    try expectAskedOf(&f, 2, "/v1/chat/completions", "gpt-private");
+    try t.expect(std.mem.indexOf(u8, try logText(&f), "xyzzy") == null);
+    // and out of what the usual model is sent afterwards
+    try f.e.script(3, model.textReply("fine"));
+    try f.core.handleText("ok then");
+    try f.rec.waitFor("fine");
+    try expectAskedOf(&f, 3, "/v1/messages", f.core.cfg.model.model);
+    const usual = try f.e.request(3);
+    try t.expect(std.mem.indexOf(u8, usual, "xyzzy") == null);
+    try t.expect(std.mem.indexOf(u8, usual, "second kept") == null);
+    try t.expectEqual(1, countOf(usual, agent.private_gap));
+}
+
+test "a_brief_for_a_private_conversation_is_written_by_the_private_model" {
+    var f: Fix = undefined;
+    try f.init("", "", "");
+    defer f.deinit();
+    try privateModelFix(&f, "");
+    try dueBrief(&f, "<item><title>New thing</title><link>https://z.org/1</link></item>");
+    try f.core.handleText("/private on");
+    try f.e.script(1, model.oaTextReply("Zig: New thing (https://z.org/1)"));
+    _ = try f.core.runBrief(f.core.briefs[0]);
+    try f.rec.waitFor("[morning] Zig: New thing (https://z.org/1)");
+    try expectAskedOf(&f, 1, "/v1/chat/completions", "gpt-private");
+    // that model refusing: the items are said, no other model is asked
+    try dueBrief(&f, "<item><title>Second thing</title><link>https://z.org/2</link></item>");
+    try f.e.script(2, "{\"status\":500}");
+    _ = try f.core.runBrief(f.core.briefs[0]);
+    try f.rec.waitFor("[morning] The model could not write the brief. The new items:\n- Second thing (https://z.org/2)");
+    const asked = f.e.server.modelRequests();
+    for (2..asked + 1) |n| try expectAskedOf(&f, @intCast(n), "/v1/chat/completions", "gpt-private");
+    // the conversation not private: the usual model
+    try f.core.handleText("/private off");
+    try dueBrief(&f, "<item><title>Third thing</title><link>https://z.org/3</link></item>");
+    try f.e.script(asked + 1, model.textReply("Zig: Third thing (https://z.org/3)"));
+    _ = try f.core.runBrief(f.core.briefs[0]);
+    try f.rec.waitFor("[morning] Zig: Third thing (https://z.org/3)");
+    try expectAskedOf(&f, @intCast(asked + 1), "/v1/messages", "claude-sonnet");
+}
+
 test "private_on_says_where_its_words_go" {
     var f: Fix = undefined;
     try f.init("", "", "");
@@ -20777,6 +20854,17 @@ test "a_settings_error_is_named_at_its_own_line_when_an_earlier_line_names_what_
     try expectHas((try parseProblem(a, "config.ini", "[model]\nprovider = local\n[search]\nurl = http://127.0.0.1:1\n", config.parse)).?, "config.ini line 2 has an error: provider = local (no provider has that name");
     // a section left without its url: its header, as before
     try expectHas((try parseProblem(a, "config.ini", "[model]\nprivate_model = local:x\n[provider local]\napi = openai\n", config.parse)).?, "config.ini line 3 has an error: [provider local] (a provider that is not a preset needs api");
+}
+
+test "a_settings_error_above_a_provider_section_is_named_at_its_own_line" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const section = "[provider local]\napi = openai\nurl = http://127.0.0.1:11434/v1\n";
+    // the checks that come after the providers' in the file's reading
+    try expectHas((try parseProblem(a, "config.ini", "[desk]\nspeak = bogus\n" ++ section, config.parse)).?, "config.ini line 2 has an error: speak = bogus ([desk] avatar =");
+    try expectHas((try parseProblem(a, "config.ini", "[voice]\nprovider = openai\nmodel = whisper-1\nlanguage = ENGLISH\n" ++ section, config.parse)).?, "config.ini line 4 has an error: language = ENGLISH ([voice] provider =");
+    try expectHas((try parseProblem(a, "config.ini", "[voice_agent]\nseconds = 99\n" ++ section, config.parse)).?, "config.ini line 2 has an error: seconds = 99 ([voice_agent] listen =");
 }
 
 test "status_lists_the_private_models_provider" {
