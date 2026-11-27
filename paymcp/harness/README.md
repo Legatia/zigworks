@@ -30,6 +30,11 @@ and why, and what a later reading no longer found.
   paying; or search past payments for ones made twice. The answer is the
   tool's own text. A decision about one of its findings is made in the
   chat or with `paymcp decide`.
+- **The books, and the bills that grow.** Under "Other readings" are two
+  buttons: the payment-run check from your accounting program (the pay
+  file's `[ledger]`), and the bill watch (`[bills]`). Each reads only
+  when you press it, and shows the tool's own text; where the section or
+  the key is missing, the text says so.
 - The page holds no key and reaches nothing but harness. Each thing it
   reads or writes is a call of one of paymcp's tools through harness's
   gate, as `app:money`, and is in harness's log.
@@ -77,6 +82,9 @@ The Money page: http://127.0.0.1:8744/  (no gate here: this is for looking at th
   each decision is asked once more in the bar above the page.
 - **The agent in the chat** has no rule here: when you ask it about your
   billing, harness asks you before the first call, as for any MCP tool.
+- **The daily readings** of the books and of the bills
+  (`[schedule:books]`, `[schedule:bill-watch]`; their triggers are in
+  `triggers.ini`, commented out) may read and nothing else.
 - **Nothing here changes the billing account**, with or without rules.
 
 ## Changing things, asked every time
@@ -119,4 +127,7 @@ harness of the owner's with a real account behind it (approving an app is
 the owner's to do), a change asked for in the chat and answered at the
 gate (the changes themselves were made from the command line, against
 Stripe's test mode), macOS and Linux by hand, a pay file with more than a
-few dozen findings.
+few dozen findings. What 0.5.0 adds to the pack (the two buttons under
+"Other readings", their rules and triggers, the keys' line in `mcp.ini`)
+was tried through `try-page.py` against the stand-in only, not inside a
+harness.

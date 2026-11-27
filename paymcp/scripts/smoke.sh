@@ -56,7 +56,13 @@ WKEY=rk_test_smoke_second_key_not_real
 WPORT=$(free_port)
 "$S" "$WPORT" "$KEY" --disputes --write-key "$WKEY" >"$T/sim4.out" 2>&1 &
 PIDS="$PIDS $!"
+# ...and one that also stands in for what 0.5.0 reads: the cloud bills, the books
+CKEY=admin_smoke_not_a_real_key
+XPORT=$(free_port)
+"$S" "$XPORT" "$KEY" --cloud "$CKEY" --books "$CKEY" >"$T/sim5.out" 2>&1 &
+PIDS="$PIDS $!"
 wait_port "$PORT"
+wait_port "$XPORT"
 wait_port "$MPORT"
 wait_port "$DPORT"
 wait_port "$WPORT"
@@ -175,12 +181,39 @@ for bad in ("../payrun.ini", "/etc/passwd", "C:\\Windows\\win.ini", "payrun/../.
 text, err = call("payrun_lookback", {})
 check("payrun_lookback", not err and "Paid twice: 149.00 EUR, once" in text, text)
 text, err = call("billing_audit", {})
-check("the billing account isn't read without its key, and it is said", err and "only the payment-run check is here" in text, text)
+check("the billing account isn't read without its key, and it is said", err and "only the payment-run check and the bill watch are here" in text, text)
 p.stdin.close()
 p.wait(timeout=10)
 sys.exit(1 if failed else 0)
 EOF
 python3 -I "$T/prmcp.py" "$B" "$T/pr/payrun.ini" || fail=1
+
+# Poland: a batch beside its KSeF invoices, and the tax office's list asked (the stand-in's)
+mkdir "$T/pl"
+cp -r examples/payrun-pl "$T/pl/payrun-pl"
+sed -e "s|127.0.0.1:8743|127.0.0.1:$XPORT|" examples/payrun-pl.ini >"$T/pl/payrun-pl.ini"
+check "poland: the batch beside its invoices and the tax office's list, the account first" 'env -u STRIPE_KEY "$B" payrun "$T/pl/payrun-pl.ini" check "$T/pl/payrun-pl/run-2026-12-01.csv" >"$T/pl1" && grep -qx "4 things to look at before paying. Each is a question, not a mistake found." "$T/pl1" && grep -qx "1. Bank details changed: 1230.50 PLN, once" "$T/pl1" && grep -qx "2. An account the tax office.s list doesn.t have: 1230.50 PLN, once" "$T/pl1" && grep -qx "3. The invoice names another account: 1230.50 PLN, once" "$T/pl1" && grep -qx "4. The invoice is for another amount: 984.00 PLN, once" "$T/pl1" && grep -q "invoice NP/2026/140 as issued through KSeF names 61109010140000071219812874\.$" "$T/pl1"'
+check "poland: what was read is said, and every answer of the list is kept with its confirmation number" 'grep -qx "KSeF invoices: 3 invoices in the folder ksef; 3 of the 3 payments have their invoice among them." "$T/pl1" && grep -q "^The tax office.s list of VAT payers, asked ....-..-..: 3 accounts, 2 registered to the supplier.s tax number and 1 not\. Each answer.s confirmation number is kept in paymcp.s list\.$" "$T/pl1" && [ "$(grep -c "\"event\":\"whitelist\"" "$T/pl/payrun-pl.payments.jsonl")" = 3 ] && grep -q "\"assigned\":false,\"id\":\"32451-6543210\"" "$T/pl/payrun-pl.payments.jsonl" && grep -q "asked the tax office.s list, and asked no bank" "$T/pl1"'
+check "poland: the list read back with those answers in it; a tax number with and without its country.s letters is one supplier" '"$B" payrun "$T/pl/payrun-pl.ini" check "$T/pl/payrun-pl/run-2026-12-01.csv" >"$T/pl2" && grep -qx "4 things to look at before paying. Each is a question, not a mistake found." "$T/pl2" && ! grep -q "Two suppliers, one account" "$T/pl2"'
+
+# the books: read twice; from the second reading on, one supplier's bank details are different
+mkdir "$T/bk"
+sed -e "s|127.0.0.1:8743|127.0.0.1:$XPORT|" examples/books.ini >"$T/bk/books.ini"
+check "the books: nothing is read without the app.s id and secret" '! env -u XERO_CLIENT_ID -u XERO_CLIENT_SECRET "$B" payrun "$T/bk/books.ini" books 2>"$T/err" && grep -q "The books weren.t read: XERO_CLIENT_ID and XERO_CLIENT_SECRET aren.t set" "$T/err" && ! XERO_CLIENT_ID=xero_sim_app XERO_CLIENT_SECRET=wrong "$B" payrun "$T/bk/books.ini" books 2>"$T/err" && grep -q "Xero refused the app.s id and secret" "$T/err"'
+check "the books: the bills awaiting payment checked, the payments on bills taken into the list" 'XERO_CLIENT_ID=xero_sim_app XERO_CLIENT_SECRET=$CKEY "$B" payrun "$T/bk/books.ini" books >"$T/bk1" && grep -q "^Read: 6 contacts, 4 of them suppliers (3 with bank details); 4 bills awaiting payment, 3169.00 EUR; 8 payments on bills since ....-..-.., 8 new to paymcp.s list\.$" "$T/bk1" && grep -qx "2 things to look at before paying. Each is a question, not a mistake found." "$T/bk1" && grep -qx "1. An amount out of line: 1490.00 EUR, once" "$T/bk1" && grep -qx "2. A likely duplicate: 149.00 EUR, once" "$T/bk1" && ! grep -q "Bank details changed" "$T/bk1"'
+check "the books: bank details that changed since the reading before, with the money waiting to go there" 'XERO_CLIENT_ID=xero_sim_app XERO_CLIENT_SECRET=$CKEY "$B" payrun "$T/bk/books.ini" books >"$T/bk2" && grep -q "0 new to paymcp.s list" "$T/bk2" && grep -qx "1. Bank details changed in the books: 1230.00 EUR, once" "$T/bk2" && grep -q "^   Nordlys Print.s bank details in the books changed from 61109010140000071219812874 to 44114020040000310276543210: " "$T/bk2" && grep -q "^   - bills awaiting payment: 1 to this supplier, 1230.00 EUR$" "$T/bk2"'
+check "the books: a decision is kept, and the next reading leaves the finding out" 'env -u STRIPE_KEY "$B" decide "$T/bk/books.ini" "details_changed:5260001246:44114020040000310276543210" intended called Anna on the old number, they moved banks >/dev/null && XERO_CLIENT_ID=xero_sim_app XERO_CLIENT_SECRET=$CKEY "$B" payrun "$T/bk/books.ini" books | grep -qx "1 dismissed as intended is not listed."'
+
+# the bill watch: three providers, each in its own shape
+mkdir "$T/bw"
+sed -e "s|127.0.0.1:8743|127.0.0.1:$XPORT|" examples/bills.ini >"$T/bw/bills.ini"
+check "the bill watch: three providers read, and what moved is found" 'ANTHROPIC_ADMIN_KEY=$CKEY OPENAI_ADMIN_KEY=$CKEY AWS_ACCESS_KEY_ID=AKIASIMSIMSIMSIMSIM0 AWS_SECRET_ACCESS_KEY=$CKEY "$B" bills "$T/bw/bills.ini" >"$T/bw1" && grep -q "^Bill watch, read ....-..-..: Anthropic, OpenAI and AWS, the 35 days from ....-..-..\. Nothing was changed: paymcp only read what was spent (5 requests)\.$" "$T/bw1" && grep -q "^   Amazon Elastic Compute Cloud - Compute at AWS cost 420.00 USD in the last 7 days and 140.00 USD in the 7 before\.$" "$T/bw1" && grep -q "^   text-embedding-3-small at OpenAI cost 63.00 USD in the last 7 days and nothing in the 7 before\.$" "$T/bw1" && grep -q "^   Anthropic cost 85.21 USD on [A-Z][a-z]*day ....-..-..; a [A-Z][a-z]*day usually costs 13.21 USD (the middle of the 4 before)\.$" "$T/bw1" && ! grep -q "cost_jump:aws" "$T/bw1"'
+check "the bill watch: a provider with no key is said and the rest is read; with no key at all, nothing" 'env -u OPENAI_ADMIN_KEY -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY ANTHROPIC_ADMIN_KEY=$CKEY "$B" bills "$T/bw/bills.ini" >"$T/bw2" && grep -q "^Bill watch, read ....-..-..: Anthropic, the 35 days" "$T/bw2" && grep -qx "OpenAI wasn.t read: OPENAI_ADMIN_KEY isn.t set." "$T/bw2" && grep -qx "AWS wasn.t read: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY aren.t set." "$T/bw2" && ! env -u ANTHROPIC_ADMIN_KEY -u OPENAI_ADMIN_KEY -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY "$B" bills "$T/bw/bills.ini" 2>"$T/err" && grep -q "The bill watch read nothing" "$T/err"'
+check "the bill watch: a request signed with the wrong secret is refused by its signature" 'AWS_ACCESS_KEY_ID=AKIASIMSIMSIMSIMSIM0 AWS_SECRET_ACCESS_KEY=another env -u ANTHROPIC_ADMIN_KEY -u OPENAI_ADMIN_KEY "$B" bills "$T/bw/bills.ini" 2>"$T/err"; grep -q "AWS wasn.t read: the key may not read AWS.s costs (403): The request signature we calculated does not match" "$T/err"'
+check "the bill watch: a decision is kept, and the next reading leaves the finding out" 'env -u STRIPE_KEY "$B" decide "$T/bw/bills.ini" "cost_doubled:openai:text-embedding-3-small" intended the new search index >/dev/null && ANTHROPIC_ADMIN_KEY=$CKEY OPENAI_ADMIN_KEY=$CKEY AWS_ACCESS_KEY_ID=AKIASIMSIMSIMSIMSIM0 AWS_SECRET_ACCESS_KEY=$CKEY "$B" bills "$T/bw/bills.ini" | grep -qx "1 dismissed as intended is not listed."'
+cat "$T/bk/books.ini" "$T/bw/bills.ini" >"$T/both.ini"
+check "with no Stripe key, a pay file for the books and the bill watch serves their tools and the decision" 'printf "%s\n" "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}" | env -u STRIPE_KEY "$B" "$T/both.ini" >"$T/tl" && grep -q "\"name\":\"payrun_books\".*\"name\":\"bills_watch\".*\"name\":\"billing_decide\"" "$T/tl" && ! grep -q "\"name\":\"billing_audit\"" "$T/tl"'
+check "the other keys are in nothing paymcp wrote" '! grep -rq "$CKEY" "$T/bw1" "$T/bw2" "$T/bk1" "$T/bk2" "$T/pl1" "$T/tl" "$T/err" "$T/bw" "$T/bk" "$T/pl"'
 check "an unknown command line is the usage" '! "$B" audit "$T/pay.ini" --fix 2>"$T/err" && grep -q "^usage: paymcp PAY.ini" "$T/err"'
 
 # the files for a Stripe sandbox (customers found by address, every "how
@@ -349,6 +382,10 @@ try:
     check("the page can't ask for a change: the tool is not in its manifest", status == 403, out)
     status, out = act("billing/payrun_check", {"file": "payrun/run-2025-11-17.csv"})
     check("the page checks a payment run, in the tool's own sentences", status == 200 and "1. Bank details changed: 1230.00 EUR, once" in out and "asked no bank" in out, out)
+    status, out = act("billing/payrun_books", {})
+    check("the page checks the bills awaiting payment in the books", status == 200 and out.startswith("The books (Xero), read ") and "to look at before paying" in out, out)
+    status, out = act("billing/bills_watch", {})
+    check("the page reads what cloud services and AI models cost", status == 200 and out.startswith("Bill watch, read ") and "Amazon Elastic Compute Cloud - Compute at AWS cost 420.00 USD" in out, out)
     status, out = act("billing/billing_refund", {})
     check("a tool the app's manifest doesn't list is refused", status == 403 and "not in the app's acts" in out, out)
 finally:

@@ -319,18 +319,30 @@
   var payrun = document.getElementById("payrun");
   var payrunOut = document.getElementById("payrun-out");
   var batch = document.getElementById("batch");
-  function payrunAsk(tool, input, busy) {
-    payrunOut.textContent = busy;
+  function askInto(out, tool, input, busy) {
+    out.textContent = busy;
     act(tool, input, function () {
-      payrunOut.textContent = "harness is asking you whether this may run: answer in the bar above this page.";
+      out.textContent = "harness is asking you whether this may run: answer in the bar above this page.";
     })
       .then(function (text) {
-        payrunOut.textContent = text;
+        out.textContent = text;
       })
       .catch(function (e) {
-        payrunOut.textContent = e.message;
+        out.textContent = e.message;
       });
   }
+  function payrunAsk(tool, input, busy) {
+    askInto(payrunOut, tool, input, busy);
+  }
+  // The books and the bill watch: read only when asked for (a reading of
+  // AWS's costs is charged for), and shown as the tools say it.
+  var othersOut = document.getElementById("others-out");
+  document.getElementById("books").addEventListener("click", function () {
+    askInto(othersOut, "payrun_books", {}, "Reading the books…");
+  });
+  document.getElementById("bills").addEventListener("click", function () {
+    askInto(othersOut, "bills_watch", {}, "Reading what was spent…");
+  });
   document.getElementById("check").addEventListener("click", function () {
     var name = batch.value.trim();
     if (!name) {

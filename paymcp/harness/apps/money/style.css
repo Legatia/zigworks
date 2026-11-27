@@ -92,4 +92,6 @@ textarea { min-height: 220px; resize: vertical; }
 .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
 .row input[type="text"] { flex: 1; min-width: 180px; }
 label { font-size: 13px; }
+details { margin: 16px 0; }
+summary { cursor: pointer; font-size: 14px; }
 pre { font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0; }

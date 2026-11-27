@@ -1,6 +1,6 @@
 .{
     .name = .paymcp,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .fingerprint = 0x565f0ca21bfa3e10,
     .minimum_zig_version = "0.17.1",
     .paths = .{

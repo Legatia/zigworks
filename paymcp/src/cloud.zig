@@ -231,11 +231,11 @@ pub fn read(gpa: Allocator, a: Allocator, io: Io, cfg: *const config.Config, key
     for (cfg.bills_read) |p| {
         const who = bills.label(p);
         const got: anyerror!void = if (std.mem.eql(u8, p, "anthropic"))
-            (if (keys.anthropic.len == 0) missing(&c, "ANTHROPIC_ADMIN_KEY") else anthropic(&c, cfg.anthropic_url, keys.anthropic, first, today))
+            (if (keys.anthropic.len == 0) missing(&c, "ANTHROPIC_ADMIN_KEY isn't set") else anthropic(&c, cfg.anthropic_url, keys.anthropic, first, today))
         else if (std.mem.eql(u8, p, "openai"))
-            (if (keys.openai.len == 0) missing(&c, "OPENAI_ADMIN_KEY") else openai(&c, cfg.openai_url, keys.openai, first, today))
+            (if (keys.openai.len == 0) missing(&c, "OPENAI_ADMIN_KEY isn't set") else openai(&c, cfg.openai_url, keys.openai, first, today))
         else
-            (if (keys.aws_id.len == 0 or keys.aws_secret.len == 0) missing(&c, "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY") else aws(&c, cfg.aws_url, keys, first, today, now));
+            (if (keys.aws_id.len == 0 or keys.aws_secret.len == 0) missing(&c, "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY aren't set") else aws(&c, cfg.aws_url, keys, first, today, now));
         if (got) |_| {
             try done.append(a, p);
         } else |e| {
@@ -254,8 +254,8 @@ pub fn read(gpa: Allocator, a: Allocator, io: Io, cfg: *const config.Config, key
     return .{ .costs = c.out.items, .first = first, .now = now, .read = done.items, .gaps = gaps.items, .requests = c.requests };
 }
 
-fn missing(c: *Ctx, name: []const u8) !void {
-    c.why = try std.fmt.allocPrint(c.a, "{s} isn't set", .{name});
+fn missing(c: *Ctx, what: []const u8) !void {
+    c.why = what;
     return error.Provider;
 }
 

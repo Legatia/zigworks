@@ -7,8 +7,8 @@
 Serves harness/apps/money on 127.0.0.1 and answers the page's calls
 (api/act) by asking a paymcp it starts, over MCP on stdio, as harness
 would. With --sim it starts the stand-in billing provider too, with its
-made-up business (with its four card disputes), and keeps the record in
-a temporary folder.
+made-up business (with its four card disputes, its books and its cloud
+bills), and keeps the record in a temporary folder.
 
 This is not harness: there is no gate, nobody is asked, and nothing is
 logged. It is for looking at the page. With a real pay file it reads the
@@ -107,13 +107,19 @@ def main():
         sim_port = free_port()
         key = "rk_test_not_a_real_key"
         # (--with-stdin: the stand-in ends with this program, however this one ends)
-        procs.append(subprocess.Popen([args[2], str(sim_port), key, "--disputes", "--with-stdin"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        other = "admin_not_a_real_key"
+        procs.append(subprocess.Popen([args[2], str(sim_port), key, "--disputes", "--cloud", other, "--books", other, "--with-stdin"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         tmp = tempfile.mkdtemp(prefix="paymcp-page-")
         examples = os.path.join(HERE, "..", "examples")
         shutil.copy(os.path.join(examples, "who.csv"), tmp)
         shutil.copytree(os.path.join(examples, "payrun"), os.path.join(tmp, "payrun"))
         text = open(os.path.join(examples, "sim.ini"), encoding="utf-8").read().replace("8743", str(sim_port))
         text += "\n[payrun]\nsuppliers = payrun/suppliers.csv\n"
+        # the books and the bill watch, against the same stand-in
+        here = "http://127.0.0.1:%d" % sim_port
+        text += "\n[ledger]\nprovider = xero\nurl = %s\ntoken_url = %s\n" % (here, here)
+        text += "\n[bills]\nbudget = 150000\nanthropic_url = %s\nopenai_url = %s\naws_url = %s\n" % (here, here, here)
+        env.update({"XERO_CLIENT_ID": "xero_sim_app", "XERO_CLIENT_SECRET": other, "ANTHROPIC_ADMIN_KEY": other, "OPENAI_ADMIN_KEY": other, "AWS_ACCESS_KEY_ID": "AKIASIMSIMSIMSIMSIM0", "AWS_SECRET_ACCESS_KEY": other})
         pay = os.path.join(tmp, "pay.ini")
         open(pay, "w", encoding="utf-8").write(text)
         env["STRIPE_KEY"] = key

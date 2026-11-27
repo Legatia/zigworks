@@ -30,7 +30,12 @@ new and what is no longer found.
   payments to suppliers before you pay it, from the file you export, and
   searches past payments for ones made twice
   ([The payment-run check](#the-payment-run-check)). It needs no key and
-  no account: only files.
+  no account: only files. Three readers go further when you turn them on:
+  Poland's e-invoices and the tax office's list of accounts, and the
+  books themselves (Xero) in place of the export.
+- **And the bills that grow.** The bill watch reads what cloud services
+  and AI models cost, day by day, and says what moved
+  ([The bill watch](#the-bill-watch)).
 - **A page.** With [harness](../harness), the findings are one page: the
   list, each finding's rows and drafts, your decisions
   ([harness/](harness/README.md)).
@@ -39,7 +44,7 @@ Linux and Windows; it builds for macOS (where it links libc, as calmcp
 does) but hasn't been run there. One binary, nothing beyond the Zig
 standard library.
 
-**State: 0.4.0, written from Stripe's public documentation for API version
+**State: 0.5.0, written from Stripe's public documentation for API version
 `2026-11-18.endive`, tested against `paymcp-sim` (a stand-in built from the
 same documentation) and run against Stripe itself,** on 2026-11-27, in a
 test account holding only the made-up business below. There it found what
@@ -49,7 +54,11 @@ seen at Stripe afterwards ([Against a Stripe sandbox](#against-a-stripe-sandbox)
 It has never read a live account, and never an account with real history
 in it. Run it on a sandbox first and read the report against the
 dashboard before trusting a number. The payment-run check has read
-made-up files only: no business's own export yet. See [Limits](#limits).
+made-up files only: no business's own export yet. What 0.5.0 adds (the
+bill watch, the readers for Poland, the books) was written from each
+service's documentation as read on 2026-11-27 and has met stand-ins only:
+no real account of Anthropic, OpenAI, AWS or Xero, and no question to
+the tax office's list from paymcp itself. See [Limits](#limits).
 
 ## Quick start, without an account
 
@@ -348,6 +357,153 @@ Written down: 5 payments of run-2025-11-17.csv, 3681.40 EUR, as paid. The next c
 - **What it can't do,** and says: read the account printed on a bill,
   tell who owns an account, ask a bank, or stop a payment. It is a check
   before paying; the person can still pay what it flagged.
+- **One supplier, one account, however written.** `PL5260001246` and
+  `5260001246` are one tax number; a Polish IBAN (`PL` and 26 digits) and
+  its 26 digits are one account.
+
+### Poland
+
+Two optional inputs, each of its own, for a business that pays Polish
+suppliers. `examples/payrun-pl.ini` tries both on made-up files.
+
+```ini
+[payrun]
+invoices = ksef        ; a folder of KSeF invoice files (XML)
+whitelist = yes        ; ask the tax office's list of VAT payers about each account
+```
+
+| Finding | The rule |
+|---|---|
+| The invoice names another account | The batch pays to an account that is not on the supplier's invoice as issued through KSeF (a factor's account on the invoice counts as on it). |
+| The invoice is for another amount | The batch pays more than the invoice's sum, less the corrections to it that are among the files. Paying less is not asked about. |
+| An account the tax office's list doesn't have | The list answers that the account is not registered to the supplier's tax number on the day of the check. |
+
+- **KSeF invoices** are read as files: the structured invoices (the FA(2)
+  and FA(3) layouts) that the taxpayer's application or your accounting
+  program saves. Put them in a folder; every `*.xml` in it is read, and a
+  file that isn't an invoice is counted and left alone. A payment is set
+  beside the invoice of the same seller (by tax number, else by name)
+  with the same number. KSeF itself is not asked, and needs no key here.
+- **The list of VAT payers** ("the white list",
+  `wykazpodatnikowvat.mf.gov.pl`) is asked one question per supplier and
+  account: is this account registered to this tax number today? It takes
+  no key. **This is the one part of the check that leaves your
+  computer:** each question sends one supplier's tax number and account
+  to the tax office, and nothing else. Every answer's confirmation number
+  is written into paymcp's list of past payments, with the day: it is
+  what shows that the account was looked up. A payment with no Polish tax
+  number or no 26-digit account isn't asked about; at most 300 questions
+  a check; the day's limit used up is said, with what wasn't answered.
+- What the tax rules make of a payment to an account that is not on the
+  list is your accountant's to say. paymcp says what the list answered.
+
+### The books
+
+`paymcp payrun PAY.ini books` (the tool `payrun_books`) makes the check
+with nothing exported: it reads your accounting program. Xero, the one
+there is so far.
+
+```ini
+[ledger]
+provider = xero
+```
+
+```
+$ XERO_CLIENT_ID=... XERO_CLIENT_SECRET=... paymcp payrun pay.ini books
+The books (Xero), read 2026-11-27. Nothing was paid and nothing was changed: paymcp read suppliers, bills and payments (8 requests), and asked no bank.
+Read: 6 contacts, 4 of them suppliers (3 with bank details); 4 bills awaiting payment, 3169.00 EUR; 8 payments on bills since 2024-11-27, 0 new to paymcp's list.
+
+3 things to look at before paying. Each is a question, not a mistake found.
+
+1. Bank details changed in the books: 1230.00 EUR, once
+   Nordlys Print's bank details in the books changed from 61109010140000071219812874 to 44114020040000310276543210: paymcp read the one on 2026-11-20 and the other on 2026-11-27.
+   - the books, as read 2026-11-20: account 61109010140000071219812874, phone +48 22 5550101
+   - the books, as read 2026-11-27: account 44114020040000310276543210, phone +48 22 5550101
+   - bills awaiting payment: 1 to this supplier, 1230.00 EUR
+   ...
+```
+
+- **What is read:** the contacts (a supplier is one with bills entered
+  against it, or with bank details), the bills awaiting payment, and the
+  payments made on bills as far back as `history_days` (730). Every
+  request but the one that asks for the token is a GET.
+- **The bills awaiting payment are the batch,** checked by the rules
+  above. The payments on bills go into paymcp's list of past payments.
+- **A change of bank details is found by remembering.** The books don't
+  say which account a past payment went to, so paymcp writes down each
+  supplier's details at every reading, with the phone number the books
+  had then, and says when they differ, for `changed_days` (90), with the
+  money waiting to go there. So the first reading finds no change; read
+  the books on a schedule, and a change is seen at the next reading and
+  not at the next payment run.
+- **The key** is an app of your own at Xero (a "custom connection"): its
+  client id and secret in `XERO_CLIENT_ID` and `XERO_CLIENT_SECRET`,
+  with the scopes `accounting.contacts.read`, `accounting.invoices.read`
+  and `accounting.payments.read` and no others. Such an app stands for
+  one organisation and needs no browser. **Xero offers them in
+  Australia, New Zealand, the UK and the US only, for a monthly fee, and
+  takes no new ones from 1 December 2026;** it says the way in without a
+  browser stays and has not yet said how. Until that is known, treat
+  this reader as built and waiting.
+- The design called this `ledgermcp`, a server of its own. It is a reader
+  inside paymcp, so that the books, the files and your decisions share
+  one list of past payments and one record.
+
+## The bill watch
+
+For what cloud services and AI models cost. It reads each day's cost
+from the providers and says what moved, by fixed rules.
+
+```
+$ paymcp bills pay.ini
+Bill watch, read 2026-11-23: Anthropic, OpenAI and AWS, the 35 days from 2026-10-19. Nothing was changed: paymcp only read what was spent (5 requests).
+Today is not counted: a day's figures come in late.
+Anthropic: 534.18 USD in those days, 362.51 USD of it in 2026-11.
+OpenAI: 168.00 USD in those days, 129.00 USD of it in 2026-11.
+AWS: 1062.10 USD in those days, 771.60 USD of it in 2026-11.
+2026-11 so far: 1263.11 USD. The last 7 days cost 97.84 USD a day; at that rate the month ends at 2045.80 USD (budget: 1500.00 USD).
+
+4 things to look at. Each is a question, not a mistake found.
+
+1. A cost that doubled: 1200.00 USD a month
+   Amazon Elastic Compute Cloud - Compute at AWS cost 420.00 USD in the last 7 days and 140.00 USD in the 7 before.
+   ...
+4. A day's bill far above the usual: 72.00 USD, once
+   Anthropic cost 85.21 USD on Saturday 2026-11-21; a Saturday usually costs 13.21 USD (the middle of the 4 before).
+   - Anthropic, claude-sonnet-5-5: 84.00 USD that day; 12.00 USD on the Saturdays before
+   ...
+```
+
+| Finding | The rule |
+|---|---|
+| A day's bill far above the usual | One of the last seven days cost `jump` (3) times the middle of the same weekday in the weeks before, by at least `jump_above` (5.00), and as much above the other days of its own week. With the lines that carry it. |
+| A cost that doubled | A line (a model, a line of the bill, a service) cost twice as much in the last seven days as in the seven before, by at least `doubled_above` (10.00). The amount is what the rise is worth a month if it stays. |
+| On the way past the month's budget | The month so far, plus the rest of it at the rate of the last seven days, is above `budget`. |
+
+- **What is read:** Anthropic's cost report by model, OpenAI's costs by
+  line of the bill, and AWS's Cost Explorer by service, for whole days
+  before today, `days` (35) back. Anthropic and OpenAI get GETs; AWS gets
+  one signed POST, which is how its reads are sent, and **charges USD
+  0.01 for each**: once a day is enough.
+- **The keys,** from the environment, each optional: a provider with no
+  key, or one that refuses it, is said and left out, and the rest is read.
+  - `ANTHROPIC_ADMIN_KEY` and `OPENAI_ADMIN_KEY`: an organisation's admin
+    key. **Neither provider lets such a key be made read-only**: it can
+    also manage keys and members. paymcp sends it to the cost report and
+    nowhere else, but the key could do more in other hands. Keep it in a
+    key store.
+  - `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`: make a user whose
+    only permission is `ce:GetCostAndUsage`. That one can only read.
+- **It changes nothing.** No limit is lowered, no key withdrawn, nothing
+  stopped: the report says what to look at.
+- Your answers are kept as for every finding: `paymcp decide PAY.ini
+  cost_jump:anthropic:2026-11-21 intended "the yearly re-index"`.
+- The tool is `bills_watch`. A pay file with a `[bills]` section and no
+  Stripe key serves it and `billing_decide`.
+- **Seeing a bill is free elsewhere**: every provider has its own alerts.
+  What this adds is one place, one set of rules and your decisions kept.
+  If a month beside those alerts shows nothing they did not, that is the
+  answer.
 
 ## The record
 
@@ -390,7 +546,9 @@ thing paymcp writes.
 | `billing_record` | The record: readings since when, what is open, asked, dismissed and why, and no longer found, with the sums. Only reads. |
 | `billing_draft` | The draft of a message to the customer about one finding: to whom, the subject, the text. Nothing is sent. Only reads. |
 | `dispute_evidence` | For one dispute to answer: what the bank wants, what the account already shows, what only you have. Nothing is sent. Only reads. |
-| `payrun_check`, `payrun_lookback` | **With a `[payrun]` section.** A batch of payments to suppliers checked before it is paid; past payments searched for ones made twice. They read files on this computer only. |
+| `payrun_check`, `payrun_lookback` | **With a `[payrun]` section.** A batch of payments to suppliers checked before it is paid; past payments searched for ones made twice. They read files on this computer only, unless the pay file turns on the question to Poland's list of VAT payers. |
+| `payrun_books` | **With a `[ledger]` section.** The same check from the books: the bills awaiting payment, and bank details that changed since the reading before. Only reads the books. |
+| `bills_watch` | **With a `[bills]` section.** What cloud services and AI models cost, and what moved. Only reads. |
 | `billing_change` | **Only with changes on.** Does the one thing paymcp can do about a finding ([Changing things](#changing-things)). |
 | `dispute_stage` | **Only with changes on.** Keeps a dispute's evidence draft at the provider, not sent. |
 
@@ -439,6 +597,10 @@ without.
 Every request paymcp sends with this key is a GET with `Stripe-Version`
 pinned. With a key that can only read, the provider itself refuses
 anything else.
+
+The other readers have keys of their own, each from the environment and
+none in a file: [The bill watch](#the-bill-watch) and
+[The books](#the-books) say which, and what each can do.
 
 ## Changing things
 
@@ -527,6 +689,22 @@ suppliers = suppliers.csv         ; your suppliers: name, tax number, account, p
 ; duplicate_days = 45
 ; out_of_line = 3
 ; currency = eur                  ; of a file with no currency column
+; invoices = ksef                 ; Poland: a folder of KSeF invoice files (XML)
+; whitelist = no                  ; Poland: yes asks the tax office's list of VAT payers about each account
+
+[ledger]                          ; the books, in place of the export
+provider = xero
+; history_days = 730              ; how far back payments on bills are read
+; changed_days = 90               ; how long a change of bank details is asked about
+
+[bills]                           ; the bill watch
+; read = anthropic, openai, aws   ; which are read (one with no key is said, and left out)
+; days = 35                       ; how far back (14 to 90)
+; jump = 3                        ; a day this many times the usual for its weekday (0: not looked for)
+; jump_above = 500                ; ...and this much above it (smallest unit)
+; doubled_above = 1000            ; a line whose week cost twice the week before, by this much (0: not)
+; budget = 0                      ; the month's budget for everything read (0: none)
+; currency = usd                  ; of the budget
 ```
 
 A setting the file doesn't have is refused with its line, a key in the
@@ -605,7 +783,15 @@ file that isn't paymcp's), the drafts, the disputes and their evidence,
 each change (made once, stopped when the record is no longer as found,
 refused without the second key, and never anything sent to a bank), the
 Money page's files and calls, and the whole audit, the decisions and the
-record through the command line and over MCP against `paymcp-sim`.
+record through the command line and over MCP against `paymcp-sim`. And
+for what 0.5.0 adds: the bill watch's rules and its three providers
+(pages, a missing key, a refused key, AWS's signature against the
+example in AWS's documentation and checked by the stand-in), a KSeF
+invoice read and a batch set beside its invoices and corrections, the
+question to the list of VAT payers (registered, not, refused, the day's
+limit), and the books read twice with bank details that changed.
+`paymcp-sim` stands in for all of them: `--cloud KEY`, `--books SECRET`,
+and the list of VAT payers always.
 
 ## Limits
 
@@ -621,6 +807,10 @@ record through the command line and over MCP against `paymcp-sim`.
 - Not looked for yet: payments taken twice or refunded twice, early fraud warnings, taxes, trials that never convert, coupons past their redeem-by date.
 - Without changes turned on it proposes and does not fix: changing a subscription, sending an invoice or reminding a customer is done in the dashboard, or from your own mail, by a person.
 - The payment-run check has read made-up files only. Real exports name their columns in many ways and languages: where a heading isn't one it knows, rename it; nothing is guessed. It matches a supplier by tax number or by name as written, so one supplier under two spellings is two. It knows only the payments it was given.
+- **The bill watch, the readers for Poland and the books have met stand-ins only.** Each was written from the service's documentation as read on 2026-11-27. Not known until tried on a real account: whether OpenAI's cost figures are in dollars as taken here (its reference shows `0.06` `usd` and doesn't say), how late a day's figures settle at each provider, what the list of VAT payers answers for a supplier's collective (virtual) account, and how Xero names things in an organisation that isn't its demo. The reader of KSeF files does take all 27 example invoices the Ministry publishes for FA(3).
+- The bill watch has no rule for a service that costs and shows no use: the cost reports don't say what was used. It knows lines (models, services), not keys or projects.
+- The books: one accounting program, one way in, and that way closes to new apps on 1 December 2026 ([The books](#the-books)). QuickBooks is not read: it gives only the last four digits of a supplier's account.
+- KSeF invoices are read from files you put there. An invoice that isn't in the folder isn't known; a payment with no bill number, or a supplier matched by neither tax number nor name, is set beside nothing.
 - "No longer found" is not "put right": a finding also goes when a "how old" setting, your price list or your own file changes. The record keeps what it was worth; what happened to it is yours to say.
 - The record is one file on one computer, written whole each time: two readings at the same moment from two programs can lose one's lines.
 

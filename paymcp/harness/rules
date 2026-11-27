@@ -17,5 +17,14 @@ allow mcp billing/billing_draft *
 allow mcp billing/billing_decide *
 allow mcp billing/payrun_check *
 allow mcp billing/payrun_lookback *
+allow mcp billing/payrun_books *
+allow mcp billing/bills_watch *
+
+# The daily readings of the books and of the bills: they may read, and never decide.
+[schedule:books]
+allow mcp billing/payrun_books *
+
+[schedule:bill-watch]
+allow mcp billing/bills_watch *
 
 [all]
