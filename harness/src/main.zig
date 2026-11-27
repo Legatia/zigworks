@@ -318,7 +318,8 @@ const App = struct {
         const sec = app.secrets(cfg);
         // each provider in use without its key or url, said once
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), .{ .ctx = @constCast(&sec), .get = startKey });
-        for (try startNotes(app.arena, &set, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model })) |n| app.note("{s}", .{n});
+        var model_values: [4][]const u8 = undefined;
+        for (try startNotes(app.arena, &set, config.modelValues(cfg, &model_values))) |n| app.note("{s}", .{n});
         if (try voiceStartNote(app.arena, &set, cfg.voice.provider)) |n| app.note("{s}", .{n});
         const c = Core.open(app.gpa, app.io, app.home, sec) catch |e| {
             switch (e) {
@@ -722,7 +723,8 @@ fn secretCmd(app: *App, args: []const []const u8) !Exit {
         }
         // the keys of the other providers in use or with a section
         const set = try model.Providers.resolve(app.arena, config.providerSettings(cfg), model.no_keys);
-        const used = try set.used(app.arena, &.{ cfg.model.model, cfg.model.worker_model, cfg.model.memory_model });
+        var model_values: [4][]const u8 = undefined;
+        const used = try set.used(app.arena, config.modelValues(cfg, &model_values));
         const voice_service = set.find(cfg.voice.provider);
         // the desk's voice too
         const desk_voice = set.find(cfg.desk.speak);
@@ -3547,6 +3549,18 @@ test "start_notes_name_each_provider_in_use_without_its_key" {
     const on = try startNotes(a, &os, &.{ o.model.model, o.model.worker_model, o.model.memory_model });
     try t.expectEqual(1, on.len);
     try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", on[0]);
+}
+
+test "start_notes_name_the_private_models_provider_without_its_key" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try config.parse(a, "[model]\nurl = http://127.0.0.1:9\nprivate_model = openrouter:x/y\n");
+    const ps = try model.Providers.resolve(a, config.providerSettings(p), model.no_keys);
+    var buf: [4][]const u8 = undefined;
+    const pn = try startNotes(a, &ps, config.modelValues(p, &buf));
+    try t.expectEqual(2, pn.len);
+    try t.expectEqualStrings("note: no openrouter key stored under \"openrouter\"; model calls will be refused. Run: harness secret add openrouter", pn[1]);
 }
 
 test "a_voice_service_without_its_key_is_named_at_start" {

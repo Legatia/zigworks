@@ -318,6 +318,23 @@ test "a_change_that_does_not_parse_is_refused" {
     try t.expect((try setText(x, text, parseKey(x, &.{"provider local.key"}).?, "Bearer XYZ")).refused != null);
 }
 
+test "the_private_model_is_set_refused_without_its_provider_and_cleared" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const text = "[provider local]\napi = openai\nurl = http://127.0.0.1:11434/v1\nauth = none\n";
+    const key = parseKey(x, &.{"model.private_model"}).?;
+    const on = try setText(x, text, key, "local:llama3.1:8b");
+    try t.expectEqualStrings("local:llama3.1:8b", (try config.parse(x, on.text.?)).model.private_model);
+    const bad = try setText(x, text, key, "llama3.1:8b");
+    try t.expect(bad.text == null);
+    try t.expect(std.mem.indexOf(u8, bad.refused.?, "private_model = PROVIDER:MODEL") != null);
+    const off = try setText(x, on.text.?, key, "");
+    try t.expectEqualStrings("", (try config.parse(x, off.text.?)).model.private_model);
+    // the provider's own section is still there
+    try t.expect(std.mem.indexOf(u8, off.text.?, "[provider local]") != null);
+}
+
 test "get_prints_the_value_in_use" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
