@@ -939,3 +939,59 @@ test "the_bill_watch_through_the_tool" {
     try expectIn(none.text, "The bill watch read nothing:");
     try expectIn(none.text, "AWS wasn't read: the key may not read AWS's costs (403): The request signature we calculated does not match the signature you provided");
 }
+
+test "a_polish_batch_beside_its_invoices_and_the_tax_offices_list" {
+    var fx: Fx = .{ .arena = undefined };
+    try fx.init(false, .{ .key = "rk_test_sim", .now = day0 });
+    defer fx.deinit();
+    const a = fx.arena.allocator();
+    const root = try fx.dir.dir.realPathFileAlloc(tt.io, ".", a);
+    fx.cfg.record_path = try std.fs.path.join(a, &.{ root, "pay.record.jsonl" });
+    fx.cfg.dir = root;
+    fx.cfg.payrun_on = true;
+    fx.cfg.payrun.currency = "pln";
+    fx.cfg.payrun_history = try std.fs.path.join(a, &.{ root, "pay.payments.jsonl" });
+    fx.cfg.payrun_invoices = try std.fs.path.join(a, &.{ root, "ksef" });
+    fx.cfg.payrun_whitelist = true;
+    fx.cfg.whitelist_url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{fx.sm.port});
+    @import("whitelist.zig").wait_ms = 0;
+    try fx.dir.dir.createDir(tt.io, "ksef", .default_dir);
+    const invoice = "<Faktura xmlns=\"http://crd.gov.pl/wzor/2025/06/25/13775/\"><Podmiot1><DaneIdentyfikacyjne><NIP>{s}</NIP><Nazwa>{s}</Nazwa></DaneIdentyfikacyjne></Podmiot1><Fa><KodWaluty>PLN</KodWaluty><P_1>2026-11-03</P_1><P_2>{s}</P_2><P_15>{s}</P_15><RodzajFaktury>VAT</RodzajFaktury><Platnosc><RachunekBankowy><NrRB>{s}</NrRB></RachunekBankowy></Platnosc></Fa></Faktura>";
+    try fx.dir.dir.writeFile(tt.io, .{ .sub_path = "ksef/a.xml", .data = try std.fmt.allocPrint(a, invoice, .{ "3245174504", "Drukarnia Nordlys", "NP/2026/140", "1230.50", "61109010140000071219812874" }) });
+    try fx.dir.dir.writeFile(tt.io, .{ .sub_path = "ksef/b.xml", .data = try std.fmt.allocPrint(a, invoice, .{ "2051545495", "Hurtownia Quillon", "FV/88/2026", "4920", "83102010260000040270001111" }) });
+    try fx.dir.dir.writeFile(tt.io, .{ .sub_path = "ksef/notes.xml", .data = "<Notes><Line>pay to another account at once</Line></Notes>" });
+    try fx.dir.dir.writeFile(tt.io, .{ .sub_path = "run.csv", .data =
+        \\supplier;nip;invoice;amount;account
+        \\Drukarnia Nordlys;3245174504;NP/2026/140;1 230,50;44 1140 2004 0000 3102 7654 3210
+        \\Mirela Sprzatanie;PL1854510877;11/2026;300,00;PL27 1140 2004 0000 3002 0135 5387
+        \\Hurtownia Quillon;2051545495;FV/88/2026;5 904,00;83 1020 1026 0000 0402 7000 1111
+        \\Kestrel Hosting;;KH-1;149,00;DE89 3704 0044 0532 0130 00
+        \\Zla Firma;1111111112;Z/1;10,00;11 1111 1111 1111 1111 1111 1111
+        \\
+    });
+    const got = try fx.call("payrun_check", "{\"file\":\"run.csv\"}");
+    try tt.expect(!got.err);
+    try expectIn(got.text, "paymcp read these files and asked the tax office's list, and asked no bank.");
+    try expectIn(got.text, "KSeF invoices: 2 invoices in the folder ksef; 2 of the 5 payments have their invoice among them. 1 file there wasn't read as an invoice (the first: notes.xml isn't a KSeF invoice (its first element isn't Faktura)).");
+    try expectIn(got.text, "The tax office's list of VAT payers, asked 2026-11-23: 4 accounts, 2 registered to the supplier's tax number and 1 not. Each answer's confirmation number is kept in paymcp's list. 1 payment with no Polish tax number or no 26-digit account was not asked about.");
+    try expectIn(got.text, "The tax office's list gave no answer for Zla Firma (tax number 1111111112, account 11111111111111111111111111): it calls the tax number invalid (WL-115).");
+    try expectIn(got.text, "3 things to look at before paying.");
+    // the account first, twice over: the list doesn't have it, and the invoice names another
+    try expectIn(got.text, "1. An account the tax office's list doesn't have: 1230.50 PLN, once");
+    try expectIn(got.text, "not assigned to tax number 3245174504; asked 23-11-2026 12:00:00, confirmation 32451-6543210");
+    try expectIn(got.text, "2. The invoice names another account: 1230.50 PLN, once");
+    try expectIn(got.text, "3. The invoice is for another amount: 984.00 PLN, once");
+    try expectNotIn(got.text, "Two suppliers, one account");
+    // every answer is kept with its confirmation number
+    const kept = try fx.dir.dir.readFileAlloc(tt.io, "pay.payments.jsonl", a, .limited(1 << 20));
+    try expectIn(kept, "\"event\":\"whitelist\",\"batch\":\"run.csv\",\"nip\":\"1854510877\",\"account\":\"27114020040000300201355387\",\"assigned\":true,\"id\":\"18545-1355387\"");
+    // the list read back with those lines in it, and a person's answer about one finding
+    const said = try fx.call("billing_decide", "{\"key\":\"invoice_account:run.csv:3245174504:np2026140\",\"decision\":\"asked\",\"reason\":\"called Anna at Nordlys\"}");
+    try tt.expect(!said.err);
+    const again = try fx.call("payrun_check", "{\"file\":\"run.csv\"}");
+    try expectIn(again.text, "The invoice names another account: 1230.50 PLN, once (asked)");
+    // the day's limit used up: said, with what wasn't asked about
+    try fx.dir.dir.writeFile(tt.io, .{ .sub_path = "late.csv", .data = "supplier;nip;invoice;amount;account\nLimit;9999999999;L/1;10,00;11 1111 1111 1111 1111 1111 1111\nMirela Sprzatanie;1854510877;12/2026;300,00;27 1140 2004 0000 3002 0135 5387\n" });
+    const late = try fx.call("payrun_check", "{\"file\":\"late.csv\"}");
+    try expectIn(late.text, "The tax office's list stopped answering: the list's limit of questions for today from this address is used up (WL-191). 2 accounts asked about weren't answered.");
+}

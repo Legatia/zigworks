@@ -42,6 +42,8 @@
 //!   duplicate_days = 45             ; the same supplier and amount again within this many days
 //!   out_of_line = 3                 ; an amount this many times the largest paid to that supplier
 //!   currency = eur                  ; of a file with no currency column
+//!   invoices = ksef                 ; Poland: a folder of KSeF invoice files (XML), to set each payment beside
+//!   whitelist = no                  ; Poland: yes asks the tax office's list of VAT payers about each account
 //!
 //!   [bills]                         ; the bill watch: what cloud services and AI models cost
 //!   read = anthropic, openai, aws   ; which are read (the default: all three; one with no key is said)
@@ -89,6 +91,12 @@ pub const Config = struct {
     payrun_suppliers: []const u8 = "",
     payrun_history: []const u8 = "",
     payrun: payrun.Rules = .{},
+    /// Poland: a folder of KSeF invoice files ("": none), and whether the
+    /// tax office's list of VAT payers is asked about each account (the one
+    /// thing of the payment-run check that leaves this computer).
+    payrun_invoices: []const u8 = "",
+    payrun_whitelist: bool = false,
+    whitelist_url: []const u8 = "https://wykazpodatnikowvat.mf.gov.pl",
     /// The bill watch: the pay file has a [bills] section; which providers
     /// are read, where they are (the stand-in: on this computer), the rules.
     bills_on: bool = false,
@@ -121,6 +129,8 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
     }
     if (c.payrun_suppliers.len > 0 and !std.fs.path.isAbsolute(c.payrun_suppliers))
         c.payrun_suppliers = try std.fs.path.join(a, &.{ dir, c.payrun_suppliers });
+    if (c.payrun_invoices.len > 0 and !std.fs.path.isAbsolute(c.payrun_invoices))
+        c.payrun_invoices = try std.fs.path.join(a, &.{ dir, c.payrun_invoices });
     if (c.payrun_history.len == 0) {
         c.payrun_history = try std.fs.path.join(a, &.{ dir, try std.fmt.allocPrint(a, "{s}.payments.jsonl", .{std.fs.path.stem(path)}) });
     } else if (!std.fs.path.isAbsolute(c.payrun_history)) {
@@ -216,6 +226,15 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
             } else if (eql(e.key, "currency")) {
                 if (e.value.len != 3) return bad(diag, e.line, "currency is three letters, as eur");
                 c.payrun.currency = try std.ascii.allocLowerString(a, e.value);
+            } else if (eql(e.key, "invoices")) {
+                if (e.value.len == 0) return bad(diag, e.line, "invoices is a folder's name");
+                c.payrun_invoices = e.value;
+            } else if (eql(e.key, "whitelist")) {
+                if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "whitelist is yes or no");
+                c.payrun_whitelist = eql(e.value, "yes");
+            } else if (eql(e.key, "whitelist_url")) {
+                if (!safeUrl(e.value)) return bad(diag, e.line, "whitelist_url is https://..., or http:// on this computer only (the stand-in)");
+                c.whitelist_url = e.value;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[payrun] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "bills")) {
             c.bills_on = true;

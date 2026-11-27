@@ -256,6 +256,8 @@ test {
     _ = @import("change.zig");
     _ = @import("payrun.zig");
     _ = @import("payrun_cmd.zig");
+    _ = @import("ksef.zig");
+    _ = @import("whitelist.zig");
     _ = @import("bills.zig");
     _ = @import("cloud.zig");
     _ = @import("bills_cmd.zig");

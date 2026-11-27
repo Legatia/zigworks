@@ -15,6 +15,7 @@ const Io = std.Io;
 const sock = @import("sock.zig");
 const model = @import("model.zig");
 const sim_cloud = @import("sim_cloud.zig");
+const sim_pl = @import("sim_pl.zig");
 
 pub const Options = struct {
     port: u16 = 0,
@@ -502,6 +503,8 @@ fn decode(a: Allocator, v: []const u8) ![]const u8 {
 }
 
 fn handle(s: *Sim, a: Allocator, req: Req) !Res {
+    // Poland's list of VAT payers takes questions without a key
+    if (sim_pl.handles(req)) return sim_pl.handle(a, req);
     // the bill watch's providers, each with its own key and its own errors
     if (s.opts.cloud_key.len > 0 and sim_cloud.handles(req)) return sim_cloud.handle(a, s.opts.cloud_key, s.opts.now, req);
     if (!std.mem.startsWith(u8, req.auth, "Bearer ")) return err(a, 401, "invalid_request_error", "", "Invalid API Key provided.");

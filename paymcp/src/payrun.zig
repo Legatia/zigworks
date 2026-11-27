@@ -79,7 +79,7 @@ fn colOf(name: []const u8) ?Col {
 }
 
 /// A supplier's name as matched: lower case, spaces drawn together.
-fn nameId(a: Allocator, name: []const u8) ![]const u8 {
+pub fn nameId(a: Allocator, name: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var gap = false;
     for (std.mem.trim(u8, name, " \t")) |ch| {
@@ -95,10 +95,39 @@ fn nameId(a: Allocator, name: []const u8) ![]const u8 {
 }
 
 /// Letters and digits only, upper case: an account or a tax number as compared.
-fn compact(a: Allocator, v: []const u8) ![]const u8 {
+pub fn compact(a: Allocator, v: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (v) |ch| if (std.ascii.isAlphanumeric(ch)) try out.append(a, std.ascii.toUpper(ch));
     return out.items;
+}
+
+/// A tax number as compared: letters and digits, upper case, without the
+/// two letters of a country before it ("PL5260001246" and "5260001246"
+/// are one supplier's).
+pub fn taxId(a: Allocator, v: []const u8) ![]const u8 {
+    const c = try compact(a, v);
+    if (c.len > 4 and std.ascii.isAlphabetic(c[0]) and std.ascii.isAlphabetic(c[1]) and std.ascii.isDigit(c[2])) return c[2..];
+    return c;
+}
+
+/// A supplier's id from paymcp's list, as compared now: a tax number
+/// (upper case, no spaces) loses its country letters; a name stays.
+fn idAgain(a: Allocator, id: []const u8) ![]const u8 {
+    for (id) |ch| if (!std.ascii.isDigit(ch) and !std.ascii.isUpper(ch)) return id;
+    return taxId(a, id);
+}
+
+/// An account as compared: letters and digits, upper case; and a Polish
+/// IBAN ("PL" and 26 digits) as its 26 digits, since both are written
+/// for one account.
+pub fn accountId(a: Allocator, v: []const u8) ![]const u8 {
+    const c = try compact(a, v);
+    if (c.len == 28 and std.mem.startsWith(u8, c, "PL")) {
+        for (c[2..]) |ch| {
+            if (!std.ascii.isDigit(ch)) break;
+        } else return c[2..];
+    }
+    return c;
 }
 
 /// A bill's number as compared: letters and digits, lower case, leading zeros off.
@@ -261,12 +290,12 @@ pub fn rows(a: Allocator, text: []const u8, rules: Rules, diag: *Diag) ![]Row {
             if (v.len == 0) continue;
             switch (c) {
                 .supplier => r.supplier = v,
-                .tax_id => tax = try compact(a, v),
+                .tax_id => tax = try taxId(a, v),
                 .bill => r.bill = v,
                 .amount => amount_text = v,
                 .currency => r.currency = try std.ascii.allocLowerString(a, v),
                 .date => r.date = dayOf(v) orelse return fail(diag, line, try std.fmt.allocPrint(a, "the date is \"{s}\": a day is written 2026-11-27 or 27.11.2026", .{v})),
-                .account => r.account = try compact(a, v),
+                .account => r.account = try accountId(a, v),
                 .phone, .email => {},
             }
         }
@@ -298,8 +327,8 @@ pub fn suppliers(a: Allocator, text: []const u8, diag: *Diag) ![]Supplier {
             if (v.len == 0) continue;
             switch (c) {
                 .supplier => s.name = v,
-                .tax_id => tax = try compact(a, v),
-                .account => s.account = try compact(a, v),
+                .tax_id => tax = try taxId(a, v),
+                .account => s.account = try accountId(a, v),
                 .phone => s.phone = v,
                 .email => s.email = v,
                 else => {},
@@ -318,8 +347,12 @@ pub const History = struct {
     paid: []const Row = &.{},
     /// The rows (by fingerprint) of each batch as it was last checked.
     checks: []const Check = &.{},
+    /// Each supplier's bank details as the books had them, whenever a
+    /// reading of the books found them new or changed (ledger.zig).
+    seen: []const Seen = &.{},
 
     pub const Check = struct { batch: []const u8, at: i64, shas: []const []const u8 };
+    pub const Seen = struct { id: []const u8, supplier: []const u8, account: []const u8, at: i64 };
 
     pub fn checkOf(h: History, batch: []const u8) ?Check {
         var found: ?Check = null;
@@ -341,6 +374,7 @@ const jv = @import("jv.zig");
 pub fn history(a: Allocator, text: []const u8, diag: *Diag) !History {
     var paid: std.ArrayList(Row) = .empty;
     var checks: std.ArrayList(History.Check) = .empty;
+    var seen: std.ArrayList(History.Seen) = .empty;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |raw| {
@@ -352,12 +386,13 @@ pub fn history(a: Allocator, text: []const u8, diag: *Diag) !History {
         if (std.mem.eql(u8, event, "paid")) {
             try paid.append(a, .{
                 .supplier = jv.str(jv.get(v, "supplier")) orelse "",
-                .id = jv.str(jv.get(v, "id")) orelse return fail(diag, n, "isn't a line paymcp wrote"),
+                .id = try idAgain(a, jv.str(jv.get(v, "id")) orelse return fail(diag, n, "isn't a line paymcp wrote")),
                 .bill = jv.str(jv.get(v, "bill")) orelse "",
                 .amount = jv.int(jv.get(v, "amount")) orelse return fail(diag, n, "isn't a line paymcp wrote"),
                 .currency = jv.str(jv.get(v, "currency")) orelse "",
                 .date = jv.int(jv.get(v, "date")),
-                .account = jv.str(jv.get(v, "account")) orelse "",
+                // (as compared now: a list from before Polish IBANs were read as their 26 digits)
+                .account = try accountId(a, jv.str(jv.get(v, "account")) orelse ""),
                 .sha = jv.str(jv.get(v, "sha")) orelse "",
                 .batch = jv.str(jv.get(v, "batch")) orelse "",
             });
@@ -365,9 +400,18 @@ pub fn history(a: Allocator, text: []const u8, diag: *Diag) !History {
             var shas: std.ArrayList([]const u8) = .empty;
             for (jv.arr(jv.get(v, "rows")) orelse &.{}) |x| try shas.append(a, jv.str(x) orelse "");
             try checks.append(a, .{ .batch = jv.str(jv.get(v, "batch")) orelse "", .at = jv.int(jv.get(v, "at")) orelse 0, .shas = shas.items });
+        } else if (std.mem.eql(u8, event, "seen")) {
+            try seen.append(a, .{
+                .id = jv.str(jv.get(v, "id")) orelse return fail(diag, n, "isn't a line paymcp wrote"),
+                .supplier = jv.str(jv.get(v, "supplier")) orelse "",
+                .account = jv.str(jv.get(v, "account")) orelse "",
+                .at = jv.int(jv.get(v, "at")) orelse 0,
+            });
+        } else if (std.mem.eql(u8, event, "whitelist")) {
+            // (an answer of the tax office's list, kept for its confirmation number: nothing is read from it)
         } else return fail(diag, n, "isn't a line paymcp wrote");
     }
-    return .{ .paid = paid.items, .checks = checks.items };
+    return .{ .paid = paid.items, .checks = checks.items, .seen = seen.items };
 }
 
 /// The line that says a batch was checked as it is now.
@@ -638,10 +682,14 @@ pub fn check(a: Allocator, list: []const Row, sups: []const Supplier, hist: Hist
     return c.out.items;
 }
 
-fn larger(_: void, x: audit.Finding, y: audit.Finding) bool {
+fn atStake(k: audit.Kind) bool {
+    return k == .account_changed or k == .invoice_account or k == .account_unregistered or k == .details_changed;
+}
+
+pub fn larger(_: void, x: audit.Finding, y: audit.Finding) bool {
     // bank details first: there the whole payment is at stake
-    const xa = x.kind == .account_changed;
-    const ya = y.kind == .account_changed;
+    const xa = atStake(x.kind);
+    const ya = atStake(y.kind);
     if (xa != ya) return xa;
     if (x.amount != y.amount) return x.amount > y.amount;
     return std.mem.lessThan(u8, x.key, y.key);
@@ -760,7 +808,7 @@ test "a_batch_checked_before_it_is_paid" {
     const hist = try load(a);
     const sups = try suppliers(a, sup_csv, &d);
     try t.expectEqual(@as(usize, 3), sups.len);
-    try t.expectEqualStrings("PL5260001246", sups[0].id);
+    try t.expectEqualStrings("5260001246", sups[0].id);
     try t.expectEqualStrings("kestrel hosting", sups[1].id);
     const now: i64 = 1763164800; // 2025-11-15
     const batch = try rows(a,
@@ -786,10 +834,10 @@ test "a_batch_checked_before_it_is_paid" {
         \\
     , kinds.items);
     // bank details first, with the account before and the phone held before the change
-    try t.expectEqualStrings("Nordlys Print is to be paid 1230.00 EUR to account PL44114020040000310276543210; the last payment to them went to PL61109010140000071219812874.", fs[0].what);
-    try t.expectEqualStrings("last paid on 2025-10-02 to account PL61109010140000071219812874; 3 payments went to that account", fs[0].rows[1].value);
+    try t.expectEqualStrings("Nordlys Print is to be paid 1230.00 EUR to account 44114020040000310276543210; the last payment to them went to 61109010140000071219812874.", fs[0].what);
+    try t.expectEqualStrings("last paid on 2025-10-02 to account 61109010140000071219812874; 3 payments went to that account", fs[0].rows[1].value);
     try t.expect(std.mem.indexOf(u8, fs[0].proposal, "(your suppliers file has +48 22 555 01 01)") != null);
-    try t.expectEqualStrings("account_changed:run-2025-11-17.csv:PL5260001246", fs[0].key);
+    try t.expectEqualStrings("account_changed:run-2025-11-17.csv:5260001246", fs[0].key);
     // the bill paid in October, found though the name is spelled with two spaces
     try t.expectEqualStrings("Bill KH-5604 of Kestrel  hosting for 149.00 EUR looks paid already: the same bill number as a payment of 2025-10-10.", fs[5].what);
     try t.expectEqualStrings("Kestrel Hosting is to be paid 1490.00 EUR; the most they were paid before is 149.00 EUR.", fs[1].what);
@@ -799,7 +847,7 @@ test "a_batch_checked_before_it_is_paid" {
     for (bare) |f| try t.expect(f.kind != .new_supplier and f.kind != .duplicate_payment and f.kind != .out_of_line);
     // ...but the suppliers file still shows the changed account
     try t.expectEqual(audit.Kind.account_changed, bare[0].kind);
-    try t.expectEqualStrings("Nordlys Print is to be paid 1230.00 EUR to account PL44114020040000310276543210; your suppliers file has PL61109010140000071219812874.", bare[0].what);
+    try t.expectEqualStrings("Nordlys Print is to be paid 1230.00 EUR to account 44114020040000310276543210; your suppliers file has 61109010140000071219812874.", bare[0].what);
 }
 
 test "what_was_checked_is_what_is_paid_and_the_past_is_searched_once" {
@@ -838,4 +886,28 @@ test "what_was_checked_is_what_is_paid_and_the_past_is_searched_once" {
     try t.expectError(error.BadFile, rows(a, "supplier,vendor,amount\nA,B,1\n", .{}, &d));
     try t.expect(std.mem.indexOf(u8, d.what, "two columns can be read as supplier") != null);
     try t.expectError(error.BadFile, history(a, "not a line\n", &d));
+}
+
+test "a_tax_number_and_an_account_written_two_ways_are_one" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Diag = .{};
+    const sups = try suppliers(a, "supplier,tax_id,account\nMirela Sprzatanie,PL 185-451-08-77,PL27 1140 2004 0000 3002 0135 5387\nKestrel Hosting,DE811907980,DE89 3704 0044 0532 0130 00\n", &d);
+    try t.expectEqualStrings("1854510877", sups[0].id);
+    try t.expectEqualStrings("27114020040000300201355387", sups[0].account);
+    // (only a Polish IBAN is its national number with two letters before it)
+    try t.expectEqualStrings("DE89370400440532013000", sups[1].account);
+    const list = try rows(a, "supplier;nip;invoice;amount;account\nMirela Sprzatanie;1854510877;11/2026;300,00;27 1140 2004 0000 3002 0135 5387\n", .{ .currency = "pln" }, &d);
+    try t.expectEqualStrings("1854510877", list[0].id);
+    // the same supplier on the same account: nothing changed, and nobody shares it
+    const fs = try check(a, list, sups, .{}, .{}, "run.csv", 1795392000);
+    try t.expectEqual(@as(usize, 0), fs.len);
+    // a list written before, with the country's letters, is read as the same supplier
+    const h = try history(a, "{\"at\":1,\"event\":\"paid\",\"batch\":\"b\",\"supplier\":\"Mirela Sprzatanie\",\"id\":\"PL1854510877\",\"bill\":\"10/2026\",\"amount\":30000,\"currency\":\"pln\",\"date\":1793000000,\"account\":\"PL27114020040000300201355387\",\"sha\":\"x\"}\n{\"at\":2,\"event\":\"whitelist\",\"batch\":\"b\",\"nip\":\"1854510877\",\"account\":\"27114020040000300201355387\",\"assigned\":true,\"id\":\"c-1\",\"when\":\"\"}\n", &d);
+    try t.expectEqualStrings("1854510877", h.paid[0].id);
+    try t.expectEqualStrings("27114020040000300201355387", h.paid[0].account);
+    const again = try check(a, list, sups, h, .{}, "run.csv", 1795392000);
+    try t.expectEqual(@as(usize, 0), again.len);
+    try t.expectEqualStrings("a b ltd", try idAgain(a, "a b ltd"));
 }

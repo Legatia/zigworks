@@ -13,6 +13,8 @@ const audit = @import("audit.zig");
 const model = @import("model.zig");
 const record = @import("record.zig");
 const report = @import("report.zig");
+const ksef = @import("ksef.zig");
+const whitelist = @import("whitelist.zig");
 
 pub const Verb = enum { check, paid, history, lookback, draft };
 
@@ -123,6 +125,52 @@ fn blocks(a: Allocator, o: *std.ArrayList(u8), fs: []const audit.Finding, book: 
     }
 }
 
+const Invoices = struct { list: []const ksef.Invoice = &.{}, files: usize = 0, unread: usize = 0, first_problem: []const u8 = "", problem: ?[]const u8 = null };
+
+/// Every KSeF invoice file (*.xml) in `folder`. A file that isn't one is
+/// counted and the first is named: the rest are still read.
+fn loadInvoices(a: Allocator, io: Io, folder: []const u8) !Invoices {
+    var got: Invoices = .{};
+    var dir = Io.Dir.cwd().openDir(io, folder, .{ .iterate = true }) catch |e| {
+        got.problem = try std.fmt.allocPrint(a, "can't open the invoices folder {s} ({s})", .{ folder, @errorName(e) });
+        return got;
+    };
+    defer dir.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.ascii.endsWithIgnoreCase(entry.name, ".xml")) continue;
+        if (names.items.len >= 20_000) break;
+        try names.append(a, try a.dupe(u8, entry.name));
+    }
+    // (in the names' order, so that two readings say the same)
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn f(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.f);
+    var list: std.ArrayList(ksef.Invoice) = .empty;
+    for (names.items) |name| {
+        got.files += 1;
+        var d: ksef.Diag = .{};
+        const text = dir.readFileAlloc(io, name, a, .limited(8 << 20)) catch {
+            d.what = "can't be read (or is larger than 8 MB)";
+            got.unread += 1;
+            if (got.first_problem.len == 0) got.first_problem = try std.fmt.allocPrint(a, "{s} {s}", .{ name, d.what });
+            continue;
+        };
+        const inv = ksef.parse(a, text, name, &d) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            got.unread += 1;
+            if (got.first_problem.len == 0) got.first_problem = try std.fmt.allocPrint(a, "{s} {s}", .{ name, d.what });
+            continue;
+        };
+        try list.append(a, inv);
+    }
+    got.list = list.items;
+    return got;
+}
+
 /// A file a tool names, inside the pay file's folder: a plain path with
 /// no way up or out; null when it isn't.
 pub fn inFolder(a: Allocator, cfg: *const config.Config, name: []const u8) !?[]const u8 {
@@ -214,11 +262,36 @@ pub fn run(a: Allocator, io: Io, cfg: *const config.Config, verb: Verb, file: []
     }
 
     // check
-    const fs = try payrun.check(a, list, l.sups, l.hist, cfg.payrun, batch, now);
+    var all: std.ArrayList(audit.Finding) = .empty;
+    try all.appendSlice(a, try payrun.check(a, list, l.sups, l.hist, cfg.payrun, batch, now));
+    // Poland: each payment beside its KSeF invoice, and each account asked about at the tax office's list
+    var notes: std.ArrayList(u8) = .empty;
+    if (cfg.payrun_invoices.len > 0) {
+        const inv = try loadInvoices(a, io, cfg.payrun_invoices);
+        if (inv.problem) |why| return stop(a, "{s}. Nothing was checked.", .{why});
+        const cmp = try ksef.compare(a, list, inv.list, batch);
+        try all.appendSlice(a, cmp.findings);
+        try notes.print(a, "KSeF invoices: {s} in the folder {s}; {d} of the {s} {s} invoice among them.", .{ try count(a, inv.list.len, "invoice"), std.fs.path.basename(cfg.payrun_invoices), cmp.matched, try count(a, list.len, "payment"), if (cmp.matched == 1) "has its" else "have their" });
+        if (inv.unread > 0) try notes.print(a, " {s} there {s} read as an invoice (the first: {s}).", .{ try count(a, inv.unread, "file"), if (inv.unread == 1) "wasn't" else "weren't", inv.first_problem });
+        try notes.append(a, '\n');
+    }
+    var listed: []const u8 = "";
+    if (cfg.payrun_whitelist) {
+        const wl = try whitelist.check(a, a, io, cfg.whitelist_url, list, batch, now);
+        try all.appendSlice(a, wl.findings);
+        listed = wl.lines;
+        try notes.print(a, "The tax office's list of VAT payers, asked {s}: {s}, {d} registered to the supplier's tax number and {d} not.", .{ day, try count(a, wl.asked, "account"), wl.assigned, wl.findings.len });
+        if (wl.asked > 0) try notes.appendSlice(a, " Each answer's confirmation number is kept in paymcp's list.");
+        if (wl.skipped > 0) try notes.print(a, " {s} with no Polish tax number or no 26-digit account {s} not asked about.", .{ try count(a, wl.skipped, "payment"), if (wl.skipped == 1) "was" else "were" });
+        try notes.append(a, '\n');
+        for (wl.gaps) |g| try notes.print(a, "{s}.\n", .{g});
+    }
+    std.mem.sort(audit.Finding, all.items, {}, payrun.larger);
+    const fs = all.items;
     var kept = try keep(a, io, cfg, fs, now);
     const book: ?*const record.Book = if (kept.book) |*b| b else null;
-    if (try append(a, io, cfg.payrun_history, l.raw, try payrun.checkedLine(a, batch, list, now))) |why| return stop(a, "{s}", .{why});
-    try o.print(a, "Payment run {s}, checked {s}. Nothing was paid and nothing was changed: paymcp read these files, and asked no bank.\n", .{ batch, day });
+    if (try append(a, io, cfg.payrun_history, l.raw, try std.mem.concat(a, u8, &.{ try payrun.checkedLine(a, batch, list, now), listed }))) |why| return stop(a, "{s}", .{why});
+    try o.print(a, "Payment run {s}, checked {s}. Nothing was paid and nothing was changed: paymcp read these files{s}, and asked no bank.\n", .{ batch, day, if (cfg.payrun_whitelist) " and asked the tax office's list" else "" });
     try o.print(a, "Read: {s}, {s}", .{ try count(a, list.len, "payment"), try sums(a, list) });
     if (cfg.payrun_suppliers.len > 0) try o.print(a, "; {s} in your suppliers file", .{try count(a, l.sups.len, "supplier")});
     try o.print(a, "; {s} in paymcp's list", .{try count(a, l.hist.paid.len, "past payment")});
@@ -230,6 +303,7 @@ pub fn run(a: Allocator, io: Io, cfg: *const config.Config, verb: Verb, file: []
     try o.appendSlice(a, ".\n");
     if (l.hist.paid.len == 0) try o.appendSlice(a, "No past payments are known yet, so nothing here can be called new, a duplicate or out of line: give paymcp the last year or two (\"paymcp payrun PAY.ini history FILE.csv\") and mark each run as paid.\n");
     if (cfg.payrun_suppliers.len == 0) try o.appendSlice(a, "Your suppliers file isn't given ([payrun] suppliers): accounts are compared with past payments only, and no phone number can be shown.\n");
+    try o.appendSlice(a, notes.items);
     var hidden: usize = 0;
     var body: std.ArrayList(u8) = .empty;
     try blocks(a, &body, fs, book, &hidden);
@@ -239,6 +313,6 @@ pub fn run(a: Allocator, io: Io, cfg: *const config.Config, verb: Verb, file: []
     } else try o.print(a, "\n{s} to look at before paying. Each is a question, not a mistake found.\n", .{try count(a, open_n, "thing")});
     try o.appendSlice(a, body.items);
     if (hidden > 0) try o.print(a, "\n{d} dismissed as intended {s} not listed.", .{ hidden, if (hidden == 1) "is" else "are" });
-    try o.print(a, "\nThat is no promise the rest is right: paymcp can't read a bill, can't tell who owns an account, and can't stop a payment at the bank.\nWhen you have paid it: paymcp payrun PAY.ini paid {s}\n", .{file});
+    try o.print(a, "\nThat is no promise the rest is right: paymcp can't read a bill on paper or in a PDF, can't tell who owns an account, and can't stop a payment at the bank.\nWhen you have paid it: paymcp payrun PAY.ini paid {s}\n", .{file});
     return .{ .text = o.items };
 }

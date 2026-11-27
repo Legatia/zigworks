@@ -304,12 +304,12 @@ Read: 5 payments, 3681.40 EUR; 3 suppliers in your suppliers file; 7 past paymen
 5 things to look at before paying. Each is a question, not a mistake found.
 
 1. Bank details changed: 1230.00 EUR, once
-   Nordlys Print is to be paid 1230.00 EUR to account PL44114020040000310276543210; the last payment to them went to PL61109010140000071219812874.
-   - run-2025-11-17.csv, line 2: Nordlys Print, bill NP/2025/140, 1230.00 EUR, to account PL44114020040000310276543210
-   - paymcp's list of past payments: last paid on 2025-10-02 to account PL61109010140000071219812874; 3 payments went to that account
-   - your suppliers file, line 2: account PL61109010140000071219812874, phone +48 22 555 01 01
+   Nordlys Print is to be paid 1230.00 EUR to account 44114020040000310276543210; the last payment to them went to 61109010140000071219812874.
+   - run-2025-11-17.csv, line 2: Nordlys Print, bill NP/2025/140, 1230.00 EUR, to account 44114020040000310276543210
+   - paymcp's list of past payments: last paid on 2025-10-02 to account 61109010140000071219812874; 3 payments went to that account
+   - your suppliers file, line 2: account 61109010140000071219812874, phone +48 22 555 01 01
    Proposed: Before paying, call the supplier on a number you had before this change (your suppliers file has +48 22 555 01 01), never one from the message that announced the new account, and ask whether the account is theirs. ...
-   [account_changed:run-2025-11-17.csv:PL5260001246]
+   [account_changed:run-2025-11-17.csv:5260001246]
    ...
 $ paymcp payrun examples/payrun.ini paid examples/payrun/run-2025-11-17.csv
 Written down: 5 payments of run-2025-11-17.csv, 3681.40 EUR, as paid. The next check knows them. (paymcp paid nothing: it only keeps the list.)
