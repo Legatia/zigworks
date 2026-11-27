@@ -18,7 +18,9 @@ pub const Rules = struct {
     old_discount_days: u32 = 365,
     /// A subscription that costs nothing, older than this.
     free_days: u32 = 90,
-    /// A draft invoice older than this was never sent.
+    /// A draft invoice older than this was never sent. One the provider
+    /// will send itself (auto_advance) is given a day whatever this says:
+    /// a subscription's invoice is a draft for about an hour first.
     draft_days: u32 = 7,
     /// An invoice the provider should have charged, not tried for this long.
     unsent_days: u32 = 3,
@@ -345,7 +347,8 @@ fn invoices(c: *Ctx) !void {
     for (c.d.invoices) |inv| {
         if (inv.total <= 0) continue;
         const age_days = @divFloor(c.now - inv.created, day_s);
-        if (inv.status == .draft and age_days >= c.r.draft_days) {
+        const draft_days = if (inv.auto_advance) @max(c.r.draft_days, 1) else c.r.draft_days;
+        if (inv.status == .draft and age_days >= draft_days) {
             try c.add(.{
                 .kind = .draft_invoice,
                 .key = try c.p("draft_invoice:{s}", .{inv.id}),
@@ -776,6 +779,24 @@ test "invoices_never_sent_never_charged_and_written_off" {
     // a sum below the owner's line is left out
     const fewer = try run(a, .{ .invoices = &invs }, .{ .written_off_above = 12000 }, now_t);
     try t.expect(find(fewer, .written_off, "cus_c") == null);
+}
+
+test "a_draft_the_provider_will_send_itself_is_given_a_day" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // seen at Stripe: a subscription's first invoice is a draft for about
+    // an hour, then sent; a cancelled subscription's stays a draft
+    const invs = [_]model.Invoice{
+        .{ .id = "in_on_its_way", .customer = "cus_a", .status = .draft, .created = now_t - 600, .total = 4500, .currency = "eur", .auto_advance = true },
+        .{ .id = "in_left", .customer = "cus_b", .status = .draft, .created = now_t - 600, .total = 5800, .currency = "eur" },
+        .{ .id = "in_stuck", .customer = "cus_c", .status = .draft, .created = daysAgo(2), .total = 2900, .currency = "eur", .auto_advance = true },
+    };
+    const fs = try run(a, .{ .invoices = &invs }, .{ .draft_days = 0 }, now_t);
+    try t.expectEqual(@as(usize, 2), fs.len);
+    try t.expect(find(fs, .draft_invoice, "cus_a") == null);
+    try t.expect(find(fs, .draft_invoice, "cus_b") != null);
+    try t.expect(find(fs, .draft_invoice, "cus_c") != null);
 }
 
 test "a_price_no_longer_sold_with_the_difference_when_one_price_replaces_it" {

@@ -17,8 +17,9 @@ const usage =
     \\       paymcp version
     \\
     \\The key comes from the environment, never from the file: STRIPE_KEY, a
-    \\restricted key that can only read (rk_test_... for a sandbox). A secret
-    \\key (sk_...) is refused.
+    \\restricted key that can only read (rk_test_... for a sandbox). A live
+    \\account's secret key (sk_live_...) is refused; a sandbox's (sk_test_...)
+    \\is taken, with a note.
     \\
 ;
 
@@ -45,6 +46,8 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const key = init.environ_map.get("STRIPE_KEY") orelse "";
     if (config.keyProblem(&cfg, key)) |why| return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{why}), 1);
+    // (on stderr: stdout is the report, or MCP)
+    if (config.keyNote(key)) |note| Io.File.stderr().writeStreamingAll(io, note) catch {};
     var client = stripe.Client.init(init.gpa, io, &cfg, key) catch return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}: url isn't an address paymcp can reach\n", .{path}), 1);
     defer client.deinit();
     if (serve) {

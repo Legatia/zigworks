@@ -21,10 +21,14 @@ does) but hasn't been run there. One binary, nothing beyond the Zig
 standard library.
 
 **State: 0.1.0, written from Stripe's public documentation for API version
-`2026-11-18.endive` and tested only against `paymcp-sim`, a stand-in built
-from the same documentation.** It has never talked to Stripe, in a sandbox
-or live. Run it on a sandbox first and read the report against the
-dashboard before trusting a number. See [Limits](#limits).
+`2026-11-18.endive`, tested against `paymcp-sim` (a stand-in built from the
+same documentation) and run once against Stripe itself,** on 2026-11-27,
+in a test account holding only the made-up business below: it found what
+it was built to find there, with the amounts expected
+([Against a Stripe sandbox](#against-a-stripe-sandbox)). It has never read
+a live account, and never an account with real history in it. Run it on a
+sandbox first and read the report against the dashboard before trusting a
+number. See [Limits](#limits).
 
 ## Quick start, without an account
 
@@ -68,8 +72,9 @@ it.
 
 The first run against Stripe itself, with nothing real in it.
 `scripts/seed-sandbox.py` fills a sandbox with the same made-up business
-(needs python3 and nothing else). It has not been run against Stripe
-either: the first run is the test of both.
+(needs python3 and nothing else). Both were run this way on 2026-11-27:
+Stripe took all 57 of the script's requests, and the audit's answer is
+the one in step 4.
 
 1. In the Stripe Dashboard: the account picker, **Switch to sandbox**,
    **Create sandbox**. Give it a name of its own and turn off "Copy live
@@ -78,6 +83,8 @@ either: the first run is the test of both.
 2. In that sandbox, under Developers, API keys: copy the **secret key**
    (`sk_test_...`) for the script, and create a **restricted key**
    (`rk_test_...`) that can only read ([The key](#the-key)) for paymcp.
+   To only try it, the sandbox's secret key will do for paymcp too: it is
+   taken with a note, since all it can reach is made-up data.
 3. See what the script would send, then send it:
 
    ```
@@ -94,14 +101,15 @@ either: the first run is the test of both.
    ```
    $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp check examples/sandbox.ini
    $ STRIPE_KEY=rk_test_... ./zig-out/bin/paymcp audit examples/sandbox.ini
-   13 findings: 371.00 EUR a month and 755.00 EUR once; 1 with an amount this audit can't know.
+   15 findings: 371.00 EUR a month and 871.00 EUR once; 1 with an amount this audit can't know.
    ```
 
    `examples/sandbox.ini` sets every "how old" setting to 0, since nothing
    in a new sandbox is old, and `examples/sandbox-who.csv` finds the
-   customers by address. The script prints the thirteen findings to
-   expect. Where Stripe's answer differs, the difference is what the run
-   is for.
+   customers by address. The script prints the fifteen findings to
+   expect: the stand-in's thirteen, and two drafts that Stripe leaves
+   behind when a subscription is cancelled before its first invoice went
+   out.
 
 The script writes, so it has a key of its own, `STRIPE_SEED_KEY`, and
 takes only a sandbox key (`sk_test_...` or `rk_test_...`): a live key is
@@ -111,10 +119,11 @@ sandbox holds half the business, and the way back is a new sandbox. Delete
 the sandbox when you are done (account picker, Switch to sandbox, Manage
 sandboxes, Delete).
 
-Known to differ for a few minutes after seeding: Stripe counts meter
-events after a delay, so "Use that was never reported" may first say 0 was
-reported; and a subscription's first invoice may still be a draft, which
-the audit then lists as never sent.
+For a few minutes after seeding, Stripe has not yet counted the meter
+event, and "Use that was never reported" says 0 was reported. A
+subscription's first invoice is a draft for about an hour before Stripe
+sends it; the audit gives a draft that Stripe will send itself a day
+before calling it never sent, whatever `draft_days` says.
 
 ## What it looks for
 
@@ -126,7 +135,7 @@ From the billing account alone:
 | Free, and has been for a while | A live subscription older than `free_days` (90), not in trial, pays nothing: everything off for ever, or every price zero. |
 | A price no longer sold | A live subscription is on a price that is withdrawn (or isn't on your `current` list). The amount is the difference to the one price sold now for the same product and interval, when there is exactly one and it costs more. |
 | Collection paused | Collection is paused with no date to resume, or the date has passed. |
-| An invoice never sent | A draft invoice older than `draft_days` (7). |
+| An invoice never sent | A draft invoice older than `draft_days` (7). A draft the provider will send itself is given at least a day. |
 | An invoice never charged | An open invoice the provider should collect itself, older than `unsent_days` (3), with no payment ever tried. |
 | Invoices written off | Invoices marked uncollectible, or voided after being sent, in the last `written_off_days` (365), summed for each customer. |
 
@@ -174,9 +183,12 @@ everything else:
 | Invoices | drafts, open invoices, written-off invoices |
 | Billing meters, Billing meter events | use reported, for "Use that was never reported" (optional) |
 
-paymcp refuses to start with a secret key (`sk_...`), which can do
-everything, with a publishable key, and with a live key where the pay file
-says `mode = sandbox` (or the reverse). A permission the key lacks is said
+paymcp refuses to start with a live account's secret key (`sk_live_...`),
+which can do everything, with a publishable key, and with a live key where
+the pay file says `mode = sandbox` (or the reverse). A sandbox's secret key
+(`sk_test_...`) is taken where the file says sandbox, with a note on
+stderr: it is one of the two keys a new sandbox shows, and all it can
+reach is made-up data. A permission the key lacks is said
 in the report as something not read; the meters are the one part the audit
 goes on without.
 
@@ -188,7 +200,7 @@ key that can only read, the provider itself refuses anything else.
 ```ini
 [stripe]
 ; url = https://api.stripe.com    ; the default; http:// only on this computer (the stand-in)
-mode = sandbox                    ; sandbox: the key begins rk_test_; live: rk_live_
+mode = sandbox                    ; sandbox: the key begins rk_test_ (or sk_test_); live: rk_live_
 ; page = 100                      ; records a request, 1 to 100
 
 [billing]
@@ -283,7 +295,7 @@ over MCP against `paymcp-sim`.
 
 ## Limits
 
-- **Never run against Stripe.** The stand-in was written from the same documentation as the client, so a misreading of the documentation would pass the tests. The parts most likely to need a correction on first contact: the names of a restricted key's permissions, the meters' event summaries, and the expanded discount (`data.discounts.source.coupon`).
+- **Run against Stripe once, on a made-up business a few minutes old** (2026-11-27, a test account, the sandbox's secret key). The lists, the expanded discount and the meters' event summaries read as the documentation says. Not yet tried: a restricted key (so the names of its permissions in [The key](#the-key) are from the documentation only), a live account, an account with years of history or more than one page of anything, and what the "how old" rules say of things that really are old.
 - Amounts are at list price. A customer with a discount and too few seats shows both findings, and the seats are counted at the full price, so the two sums overlap.
 - A tiered or metered price has no single amount a month: such findings say "amount not known".
 - A subscription with two meters is skipped for "Use that was never reported": which meter your file's number belongs to isn't known.

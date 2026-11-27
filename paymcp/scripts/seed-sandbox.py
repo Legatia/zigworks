@@ -49,7 +49,7 @@ EXPECTED = """\
 With examples/sandbox.ini (every "how old" setting at 0, since nothing in a
 new sandbox is old) the audit should say:
 
-  13 findings: 371.00 EUR a month and 755.00 EUR once; 1 with an amount this audit can't know.
+  15 findings: 371.00 EUR a month and 871.00 EUR once; 1 with an amount this audit can't know.
 
    87.00 a month   Free, and has been for a while       Elm & Sons (everything off, for ever)
    68.00 a month   A higher plan than paid for          Birch Studio (pro in the product, billed for team)
@@ -62,6 +62,8 @@ new sandbox is old) the audit should say:
   480.00 once      An invoice never sent                Gorse Ltd (a draft)
   126.00 once      Use that was never reported          Fir Analytics (15300 used, 9000 reported)
   120.00 once      Invoices written off                 Ivy Partners (one uncollectible, one void)
+   58.00 once      An invoice never sent                Cedar Co (the cancelled subscription's draft)
+   58.00 once      An invoice never sent                Ivy Partners (the cancelled subscription's draft)
    29.00 once      An invoice never charged             Hazel Design
    not known       Free, and has been for a while       Larch (a price of zero)
 
@@ -69,10 +71,13 @@ Nothing about Juniper (a yearly plan, a discount that ends) or Kapok (in
 trial). Where Stripe's answer differs from this list, the difference is
 what the run is for: note it.
 
-Two things that may differ for a few minutes: Stripe counts meter events
-after a delay, so "Use that was never reported" can first say 0 was
-reported (306.00); and a subscription's first invoice may still be a
-draft, which the audit then lists as never sent.
+This is what a run on 2026-11-27 gave. The two drafts at 58.00 are not in
+paymcp-sim's business: Stripe leaves a cancelled subscription's first
+invoice a draft that it will never send.
+
+For a few minutes after seeding, Stripe has not yet counted the meter
+event, and "Use that was never reported" says 0 was reported (306.00,
+and 1051.00 once in all).
 """
 
 
@@ -302,7 +307,7 @@ def main():
         print(f"\n{s.n} requests would be sent. Nothing was sent.")
         return 0
     print(f"Done: {s.n} requests, {len(s.made)} objects made. Nothing was charged.\n")
-    print("Now, with a restricted key that can only read (README, The key):\n")
+    print("Now, with a restricted key that can only read (README, The key), or this sandbox's secret key:\n")
     print("  STRIPE_KEY=rk_test_... paymcp check examples/sandbox.ini")
     print("  STRIPE_KEY=rk_test_... paymcp audit examples/sandbox.ini\n")
     print(EXPECTED)

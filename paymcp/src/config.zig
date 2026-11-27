@@ -3,7 +3,7 @@
 //!
 //!   [stripe]
 //!   url = https://api.stripe.com    ; (the stand-in: http://127.0.0.1:PORT)
-//!   mode = sandbox                  ; sandbox: the key begins rk_test_; live: rk_live_
+//!   mode = sandbox                  ; sandbox: the key begins rk_test_ (or sk_test_); live: rk_live_
 //!   page = 100                      ; records a request, 1 to 100
 //!
 //!   [billing]
@@ -117,10 +117,16 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
 }
 
 /// Why `key` can't be used with this file, or null. A key is refused when
-/// it can do more than the audit needs to tell: a secret key does
-/// everything, and a live key is taken only where the file says live.
+/// it can do more than the audit needs to tell: a live account's secret key
+/// does everything, and a live key is taken only where the file says live.
+/// A sandbox's secret key is taken, with `keyNote` said: it is one of the
+/// two keys a new sandbox shows, and all it can reach is made-up data.
 pub fn keyProblem(c: *const Config, key: []const u8) ?[]const u8 {
     if (key.len == 0) return "STRIPE_KEY isn't set: a restricted key that can only read (README, The key)";
+    if (std.mem.startsWith(u8, key, "sk_test_")) {
+        if (c.mode == .live) return "STRIPE_KEY is a sandbox key and the file says mode = live";
+        return null;
+    }
     if (std.mem.startsWith(u8, key, "sk_")) return "STRIPE_KEY is a secret key, which can do everything. Make a restricted key that can only read (README, The key)";
     if (std.mem.startsWith(u8, key, "pk_")) return "STRIPE_KEY is a publishable key, which reads nothing. Make a restricted key that can only read (README, The key)";
     const test_key = std.mem.startsWith(u8, key, "rk_test_");
@@ -128,6 +134,13 @@ pub fn keyProblem(c: *const Config, key: []const u8) ?[]const u8 {
     if (!test_key and !live_key) return "STRIPE_KEY doesn't look like a restricted key (rk_test_... or rk_live_...)";
     if (c.mode == .sandbox and live_key) return "STRIPE_KEY is a live key and the file says mode = sandbox. To audit the live account, say mode = live";
     if (c.mode == .live and test_key) return "STRIPE_KEY is a sandbox key and the file says mode = live";
+    return null;
+}
+
+/// What is said, once, about a key that is taken but isn't the kind to
+/// keep using; or null.
+pub fn keyNote(key: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, key, "sk_test_")) return "paymcp: STRIPE_KEY is the sandbox's secret key. Fine for trying paymcp on made-up data; a live account is read only with a restricted key that can only read (README, The key).\n";
     return null;
 }
 
@@ -190,7 +203,12 @@ test "a_key_that_can_do_more_than_read_or_is_for_the_other_account_is_refused" {
     try t.expect(keyProblem(&sandbox, "rk_test_abc") == null);
     try t.expect(keyProblem(&live, "rk_live_abc") == null);
     try t.expect(std.mem.indexOf(u8, keyProblem(&sandbox, "").?, "isn't set") != null);
-    try t.expect(std.mem.indexOf(u8, keyProblem(&sandbox, "sk_test_abc").?, "can do everything") != null);
+    // a sandbox's secret key is taken, with a note; never for a live file
+    try t.expect(keyProblem(&sandbox, "sk_test_abc") == null);
+    try t.expect(std.mem.indexOf(u8, keyNote("sk_test_abc").?, "sandbox's secret key") != null);
+    try t.expect(keyNote("rk_test_abc") == null);
+    try t.expect(std.mem.indexOf(u8, keyProblem(&live, "sk_test_abc").?, "mode = live") != null);
+    try t.expect(std.mem.indexOf(u8, keyProblem(&sandbox, "sk_live_abc").?, "can do everything") != null);
     try t.expect(std.mem.indexOf(u8, keyProblem(&live, "sk_live_abc").?, "can do everything") != null);
     try t.expect(keyProblem(&sandbox, "pk_test_abc") != null);
     try t.expect(std.mem.indexOf(u8, keyProblem(&sandbox, "rk_live_abc").?, "mode = live") != null);

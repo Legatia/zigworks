@@ -57,7 +57,8 @@ export STRIPE_KEY=$KEY
 
 check "version" '"$B" version | grep -q "^paymcp "'
 check "no key, no start" '! env -u STRIPE_KEY "$B" check "$T/pay.ini" 2>"$T/err" && grep -q "STRIPE_KEY isn.t set" "$T/err"'
-check "a secret key is refused before anything is sent" '! STRIPE_KEY=sk_test_abc "$B" audit "$T/pay.ini" 2>"$T/err" && grep -q "is a secret key, which can do everything" "$T/err"'
+check "a live account's secret key is refused before anything is sent" '! STRIPE_KEY=sk_live_abc "$B" audit "$T/pay.ini" 2>"$T/err" && grep -q "is a secret key, which can do everything" "$T/err"'
+check "a sandbox's secret key is taken, with a note" '! STRIPE_KEY=sk_test_abc "$B" check "$T/pay.ini" 2>"$T/err" && grep -q "is the sandbox.s secret key" "$T/err" && grep -q "the billing provider refused the key (401)" "$T/err"'
 check "a live key is refused where the file says sandbox" '! STRIPE_KEY=rk_live_abc "$B" audit "$T/pay.ini" 2>"$T/err" && grep -q "is a live key and the file says mode = sandbox" "$T/err"'
 check "a key the provider refuses is named" '! STRIPE_KEY=rk_test_other "$B" check "$T/pay.ini" 2>"$T/err" && grep -q "the billing provider refused the key (401)" "$T/err"'
 printf '[stripe]\nurl = http://example.com\n' >"$T/clear.ini"
