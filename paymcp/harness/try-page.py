@@ -106,7 +106,8 @@ def main():
             sys.exit(__doc__)
         sim_port = free_port()
         key = "rk_test_not_a_real_key"
-        procs.append(subprocess.Popen([args[2], str(sim_port), key, "--disputes"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        # (--with-stdin: the stand-in ends with this program, however this one ends)
+        procs.append(subprocess.Popen([args[2], str(sim_port), key, "--disputes", "--with-stdin"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
         tmp = tempfile.mkdtemp(prefix="paymcp-page-")
         examples = os.path.join(HERE, "..", "examples")
         shutil.copy(os.path.join(examples, "who.csv"), tmp)
