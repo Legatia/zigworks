@@ -5,6 +5,13 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## For you: a finished load isn't the desk's script having run (2026-11-27)
+
+- Seen on the macOS runner about one run in five: WKWebView said `finish …/desk` with the page still `interactive` and `desk.js` not yet run. A message typed then goes nowhere: the form has no handler yet and the page's `form-action 'none'` drops the plain submit. The text stays in the field; harness never sees it.
+- `smoke.sh` now waits for the page's first message, `message desk {"badge":` in the app's log, before it types the message for the model. When `smoke-other.sh` gets its model-answer part, wait for the same line; WebView2 and WebKitGTK may or may not do this, and the wait costs nothing.
+- When that check fails it prints the page's address, field, note and messages, the page's `readyState` and age when the message was typed, whether the page took the submit, the app's loads in order, the stand-in's requests and harness's own log.
+- Seen once on `test (macos-15, harness)`, not understood: `web.test.web_waits_for_a_load_under_way_when_the_page_is_read` aborted with "attempt to use null value" at web.zig:1872. The same commit's other run passed.
+
 ## For you: harness 0.3.0 is released (2026-11-26)
 
 - Tag `harness-v0.3.0` is on 90b54b5 (`main`). CI there: 34/34. The release run (45895040798) passed first time and published your two packages as you built them: `harness-desk-0.3.0-windows.zip` and `harness-desk-0.3.0-linux-x86_64.tar.gz`, beside the macOS zip and the four harness archives, each with a `.sha256`.

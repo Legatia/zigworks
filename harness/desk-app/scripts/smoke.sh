@@ -483,6 +483,10 @@ if [ -n "${DESK_SMOKE_HARNESS:-}" ]; then
     # a message typed in the desk is answered by the model: the stand-in's
     # one answer, asked for by the model's name with the key from the sheet
     if [ -n "${DESK_SMOKE_FAKE:-}" ]; then
+        # a finished load isn't the page's script having run: WebKit has said
+        # "finish" with the page still "interactive" and its form not yet
+        # handled, where a submit goes nowhere. The page's first word is its badge.
+        expect_log 'message desk {"badge":' "real harness: the desk's script is running" 15
         # typed with a note of the page's state then, and of whether the page took the submit
         cmd "js window.__smokeAt = document.readyState + ' at ' + Math.round(performance.now()) + ' ms'; document.getElementById('compose').addEventListener('submit', function (e) { window.__smokeTaken = e.defaultPrevented ? 'taken by the page' : 'not taken, the page had no handler'; }, { once: true }); document.getElementById('msg').value = 'Are you the model?'; document.getElementById('compose').requestSubmit();"
         if ! desk_until answered "Array.prototype.map.call(document.querySelectorAll('#log li.msg.harness'), function (e) { return e.textContent; }).join(' | ')" "$MODEL_SAYS" 60; then
