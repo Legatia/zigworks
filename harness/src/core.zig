@@ -22937,7 +22937,9 @@ test "a_scheduled_run_waits_for_its_definitions_place" {
     defer f.deinit();
     try addDefinition(&f, "researcher", "---\nname: researcher\ndescription: R.\nparallel: 1\n---\nR.\n");
     try t.expectEqualStrings("Settings reloaded.", try setTasks(&f, "[a]\nevery = 5m\nagent = researcher\ndo = Task a.\n[b]\nevery = 5m\nagent = researcher\ndo = Task b.\n"));
-    try f.e.script(1, comptime "{\"delay_ms\":800," ++ model.textReply("first done")[1..]);
+    // long enough that five ticks fit inside it on a slow runner too (at
+    // 800 ms the first run had ended by the check there, once in a while)
+    try f.e.script(1, comptime "{\"delay_ms\":2500," ++ model.textReply("first done")[1..]);
     try f.e.script(2, model.textReply("second done"));
     f.core.tick();
     try waitFile(&f.e, "requests/001.json");
