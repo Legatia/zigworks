@@ -214,6 +214,58 @@ check("paymcp ends when its input does", m.close() == 0)
 sys.exit(1 if failed else 0)
 EOF
 python3 -I "$T/mcp.py" "$B" "$T/pay.ini" || fail=1
+# the Money page's files as harness would serve them, and its calls
+# answered by a paymcp behind them (harness/try-page.py)
+cat >"$T/page.py" <<'EOF'
+import json, subprocess, sys, time, urllib.request, urllib.error
+
+binary, sim, port = sys.argv[1], sys.argv[2], sys.argv[3]
+p = subprocess.Popen([sys.executable, "-I", "harness/try-page.py", binary, "--sim", sim, port], stdout=subprocess.PIPE)
+base = "http://127.0.0.1:" + port
+failed = False
+n = 0
+
+def check(name, ok, detail=""):
+    global n, failed
+    n += 1
+    print(("ok" if ok else "not ok") + f" {n} - page: {name}" + ("" if ok else f" ({str(detail)[:600]})"))
+    failed = failed or not ok
+
+def get(path):
+    with urllib.request.urlopen(base + path, timeout=30) as r:
+        return r.status, r.read().decode(), r.headers
+
+def act(tool, args):
+    req = urllib.request.Request(base + "/api/act", json.dumps({"tool": tool, "input": args}).encode(), {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            job = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+    return 200, json.loads(get("/api/act/%d?wait=20" % job["id"])[1])["output"]
+
+try:
+    line = p.stdout.readline().decode()
+    check("it says where the page is, and that there is no gate", "http://127.0.0.1:" + port in line and "no gate here" in line, line)
+    status, html, headers = get("/")
+    check("the page and its files, with nothing from anywhere else", status == 200 and '<script src="app.js">' in html and "onclick" not in html and "default-src 'none'" in headers.get("Content-Security-Policy", "") and get("/app.js")[0] == 200 and get("/style.css")[0] == 200, html[:300])
+    app = open("harness/apps/money/app.js", encoding="utf-8").read()
+    check("the page's script writes what it reads as text, never as markup", "innerHTML" not in app and "eval(" not in app and "document.write" not in app)
+    status, out = act("billing/billing_audit", {"format": "json", "limit": 20})
+    page = json.loads(out) if status == 200 else {}
+    check("the page's first call: a page of findings as data", status == 200 and page.get("total") == 14 and len(page["findings"]) == 14 and len(out.encode()) < 16384, out)
+    status, out = act("billing/billing_decide", {"key": page["findings"][0]["key"], "decision": "intended", "reason": "a gift"})
+    check("a decision from the page is written down", status == 200 and out.startswith("Written down: free:sub_elm"), out)
+    status, out = act("billing/billing_audit", {"format": "json"})
+    after = json.loads(out) if status == 200 else {}
+    check("and the list leaves it out, saying so", after.get("total") == 13 and after.get("hidden") == 1 and after.get("hidden_sums") == "87.00 EUR a month", out)
+    status, out = act("billing/billing_refund", {})
+    check("a tool the app's manifest doesn't list is refused", status == 403 and "not in the app's acts" in out, out)
+finally:
+    p.kill()
+sys.exit(1 if failed else 0)
+EOF
+python3 -I "$T/page.py" "$B" "$S" "$(free_port)" || fail=1
 check "the key is in nothing paymcp wrote" '! grep -rq "$KEY" "$T/a" "$T/a.json" "$T/c" "$T/n" "$T/m" "$T/err" "$T/r" "$T/pay.record.jsonl"'
 
 if [ $fail = 0 ]; then echo "smoke: all ok"; else
