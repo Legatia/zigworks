@@ -56,7 +56,17 @@ pub const Form = struct {
     api: Api = .openai,
     /// "Provider and key…": ask for the key again.
     replace: bool = false,
+    /// "Private model" ("Provider and key…" only): the model of
+    /// `[provider local]` that answers private conversations; "": none.
+    private_model: []const u8 = "",
+    private_url: []const u8 = "",
+    private_api: Api = .openai,
 };
+
+/// The section the screen's private model is a model of (the README's
+/// example name), and what `[model] private_model` starts with for it.
+pub const private_section = "local";
+const private_prefix = private_section ++ ":";
 
 /// What `harness config get` printed for the values in use.
 pub const InUse = struct {
@@ -74,7 +84,25 @@ pub const InUse = struct {
     section_key: []const u8 = "",
     /// `provider NAME.auth` of the provider in use ("": its format's own).
     auth: []const u8 = "",
+    /// `model.private_model` ("": none), and `provider local.api`, `.url`
+    /// and `.auth` ("" each: no such section).
+    private_model: []const u8 = "",
+    private_api: []const u8 = "",
+    private_url: []const u8 = "",
+    private_auth: []const u8 = "",
 };
+
+/// Whether the private model is the screen's to show and write: there is
+/// none or it is a model of `[provider local]`, that section isn't there
+/// or takes no key (`auth = none`), and it isn't the provider in use.
+/// Anything else is config.ini's own, shown as it is and left alone.
+pub fn privateOwned(before: ?InUse) bool {
+    const u = before orelse return true;
+    if (std.mem.eql(u8, u.provider, private_section)) return false;
+    if (u.private_model.len > 0 and !std.mem.startsWith(u8, u.private_model, private_prefix)) return false;
+    const there = u.private_api.len > 0 or u.private_url.len > 0 or u.private_auth.len > 0;
+    return !there or std.mem.eql(u8, u.private_auth, "none");
+}
 
 /// What [Continue] does about the key: nothing (`keep`), one was typed
 /// (`given`), or none, for a server that takes none (Other only).
@@ -96,13 +124,18 @@ pub fn trimKey(key: []const u8) []const u8 {
 /// section of one's own: Other, with its format and address.
 pub fn formOf(u: InUse) Form {
     const name = if (u.provider.len == 0) "omnigate" else u.provider;
-    if (presetOf(name)) |p| return .{ .provider = p, .model = u.model, .url = if (p == .omnigate) u.url else "" };
-    return .{
+    var f: Form = if (presetOf(name)) |p| .{ .provider = p, .model = u.model, .url = if (p == .omnigate) u.url else "" } else .{
         .provider = .other,
         .model = u.model,
         .url = u.section_url,
         .api = if (std.mem.eql(u8, u.api, "anthropic")) .anthropic else .openai,
     };
+    if (privateOwned(u)) {
+        if (u.private_model.len > 0) f.private_model = u.private_model[private_prefix.len..];
+        f.private_url = u.private_url;
+        if (std.mem.eql(u8, u.private_api, "anthropic")) f.private_api = .anthropic;
+    }
+    return f;
 }
 
 /// The `[provider NAME]` Other is written to: the one in use when it is of
@@ -132,6 +165,15 @@ pub fn problem(f: Form) ?[]const u8 {
         // as harness reads it (model.validUrl): lower case
         if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return "Address must start with http:// or https://.";
         for (u) |c| if (std.ascii.isControl(c) or c == ' ') return "Address has a character that can't be used.";
+    }
+    const pm = trim(f.private_model);
+    if (pm.len > 0) {
+        if (pm[0] == '-') return "Private model: Model can't start with a dash.";
+        for (pm) |c| if (std.ascii.isControl(c)) return "Private model: Model has a character that can't be used.";
+        const u = trim(f.private_url);
+        if (u.len == 0) return "Private model: Address is empty.";
+        if (!std.mem.startsWith(u8, u, "http://") and !std.mem.startsWith(u8, u, "https://")) return "Private model: Address must start with http:// or https://.";
+        for (u) |c| if (std.ascii.isControl(c) or c == ' ') return "Private model: Address has a character that can't be used.";
     }
     return null;
 }
@@ -198,6 +240,9 @@ pub fn initArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8) ![]c
 /// owner left them. `before`: the values in use ("Provider and key…").
 /// For Other, `key` sets how the key is sent: `none` writes `auth = none`;
 /// a key `given` where `none` was in use writes the format's own way back.
+/// The private model, where it is the screen's (`privateOwned`): its
+/// `[provider local]` (no key: `auth = none`) and `private_model`; emptied
+/// where one was set, `private_model` alone is cleared.
 pub fn configArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, f: Form, before: ?InUse, key: KeyChoice) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     try out.appendSlice(a, &.{ binary, "config", "set" });
@@ -222,6 +267,19 @@ pub fn configArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, f:
     if (!same) {
         const helper = entry(f.provider).helper orelse model;
         try out.appendSlice(a, &.{ "model.memory_model", helper, "model.worker_model", helper });
+    }
+    if (privateOwned(before)) {
+        const pm = trim(f.private_model);
+        if (pm.len > 0) {
+            try out.appendSlice(a, &.{
+                "provider " ++ private_section ++ ".api",  @tagName(f.private_api),
+                "provider " ++ private_section ++ ".url",  trim(f.private_url),
+                "provider " ++ private_section ++ ".auth", "none",
+                "model.private_model",                     try std.fmt.allocPrint(a, private_prefix ++ "{s}", .{pm}),
+            });
+        } else if (before != null and before.?.private_model.len > 0) {
+            try out.appendSlice(a, &.{ "model.private_model", "" });
+        }
     }
     try out.appendSlice(a, &.{ "--home", home });
     return out.toOwnedSlice(a);
@@ -251,9 +309,12 @@ pub fn readArgv(a: std.mem.Allocator, binary: []const u8, home: []const u8, key:
     return a.dupe([]const u8, &.{ binary, "config", "get", key, "--home", home });
 }
 
+/// How many settings "Provider and key…" reads after `model.provider`.
+pub const read_count = 11;
+
 /// What "Provider and key…" reads with `harness config get`, after
 /// `model.provider` said `provider`: in `inUse`'s order.
-pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![7][]const u8 {
+pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![read_count][]const u8 {
     return .{
         "model.model",
         "model.url",
@@ -262,11 +323,15 @@ pub fn readKeys(a: std.mem.Allocator, provider: []const u8) ![7][]const u8 {
         try std.fmt.allocPrint(a, "provider {s}.url", .{provider}),
         try std.fmt.allocPrint(a, "provider {s}.key", .{provider}),
         try std.fmt.allocPrint(a, "provider {s}.auth", .{provider}),
+        "model.private_model",
+        "provider " ++ private_section ++ ".api",
+        "provider " ++ private_section ++ ".url",
+        "provider " ++ private_section ++ ".auth",
     };
 }
 
 /// The values in use from `readKeys`' answers.
-pub fn inUse(provider: []const u8, values: [7][]const u8) InUse {
+pub fn inUse(provider: []const u8, values: [read_count][]const u8) InUse {
     return .{
         .provider = provider,
         .model = values[0],
@@ -276,6 +341,10 @@ pub fn inUse(provider: []const u8, values: [7][]const u8) InUse {
         .section_url = values[4],
         .section_key = values[5],
         .auth = values[6],
+        .private_model = values[7],
+        .private_api = values[8],
+        .private_url = values[9],
+        .private_auth = values[10],
     };
 }
 
@@ -440,8 +509,8 @@ test "provider_and_key_reads_these_settings" {
     var arena: std.heap.ArenaAllocator = .init(t.allocator);
     defer arena.deinit();
     const keys = try readKeys(arena.allocator(), "local");
-    try expectArgv(&.{ "model.model", "model.url", "model.key", "provider local.api", "provider local.url", "provider local.key", "provider local.auth" }, &keys);
-    const u = inUse("local", .{ "llama3.1:8b", "", "omnigate", "openai", "http://127.0.0.1:11434/v1", "", "none" });
+    try expectArgv(&.{ "model.model", "model.url", "model.key", "provider local.api", "provider local.url", "provider local.key", "provider local.auth" }, keys[0..7]);
+    const u = inUse("local", .{ "llama3.1:8b", "", "omnigate", "openai", "http://127.0.0.1:11434/v1", "", "none", "", "openai", "http://127.0.0.1:11434/v1", "none" });
     try t.expectEqualStrings("none", u.auth);
     try t.expectEqualStrings("local", u.provider);
     try t.expectEqualStrings("llama3.1:8b", u.model);
@@ -449,6 +518,94 @@ test "provider_and_key_reads_these_settings" {
     try t.expectEqualStrings("openai", u.api);
     try t.expectEqualStrings("http://127.0.0.1:11434/v1", u.section_url);
     try t.expectEqualStrings("", u.section_key);
+}
+
+test "the_private_model_is_read_with_the_values_in_use" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const keys = try readKeys(arena.allocator(), "anthropic");
+    try t.expectEqual(@as(usize, read_count), keys.len);
+    try expectArgv(&.{ "model.private_model", "provider local.api", "provider local.url", "provider local.auth" }, keys[7..]);
+    const u = inUse("anthropic", .{ "claude-opus-4-8", "", "", "", "", "", "", "local:llama3.1:8b", "anthropic", "http://127.0.0.1:11434/v1", "none" });
+    try t.expectEqualStrings("local:llama3.1:8b", u.private_model);
+    try t.expectEqualStrings("anthropic", u.private_api);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", u.private_url);
+    try t.expectEqualStrings("none", u.private_auth);
+    // the form for them: the model without the section's name
+    const f = formOf(u);
+    try t.expectEqualStrings("llama3.1:8b", f.private_model);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", f.private_url);
+    try t.expectEqual(Api.anthropic, f.private_api);
+    // none set: empty fields, the usual format
+    const none = formOf(.{ .provider = "anthropic", .model = "m" });
+    try t.expectEqualStrings("", none.private_model);
+    try t.expectEqual(Api.openai, none.private_api);
+}
+
+test "the_screen_owns_the_private_model_only_as_a_keyless_local_section" {
+    // nothing there yet, or what the screen (or the README's example) wrote
+    try t.expect(privateOwned(null));
+    try t.expect(privateOwned(.{ .provider = "anthropic" }));
+    try t.expect(privateOwned(.{ .provider = "anthropic", .private_model = "local:llama3.1:8b", .private_api = "openai", .private_url = "http://127.0.0.1:11434/v1", .private_auth = "none" }));
+    // another provider's model, [provider local] in use for the usual model,
+    // or a [provider local] that takes a key: config.ini's
+    try t.expect(!privateOwned(.{ .provider = "anthropic", .private_model = "openrouter:x/y" }));
+    try t.expect(!privateOwned(.{ .provider = "local", .private_api = "openai", .private_url = "http://127.0.0.1:11434/v1", .private_auth = "none" }));
+    try t.expect(!privateOwned(.{ .provider = "anthropic", .private_api = "openai", .private_url = "https://llm.example.com/v1", .private_auth = "" }));
+    try t.expect(!privateOwned(.{ .provider = "anthropic", .private_model = "local:m", .private_api = "openai", .private_url = "https://llm.example.com/v1", .private_auth = "bearer" }));
+    // and its form shows none of it
+    try t.expectEqualStrings("", formOf(.{ .provider = "anthropic", .private_model = "openrouter:x/y" }).private_model);
+}
+
+test "the_private_model_is_written_with_its_section_in_the_same_call" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const before: InUse = .{ .provider = "anthropic", .model = "claude-opus-4-8" };
+    const f: Form = .{ .provider = .anthropic, .model = "claude-opus-4-8", .private_model = " llama3.1:8b ", .private_url = " http://127.0.0.1:11434/v1 ", .private_api = .openai };
+    try expectArgv(&.{
+        "/b/harness",         "config",                "set",
+        "model.provider",     "anthropic",             "model.model",
+        "claude-opus-4-8",    "provider local.api",    "openai",
+        "provider local.url", "http://127.0.0.1:11434/v1", "provider local.auth",
+        "none",               "model.private_model",   "local:llama3.1:8b",
+        "--home",             "/h",
+    }, try configArgv(a, "/b/harness", "/h", f, before, .keep));
+    // emptied where the screen had shown one: cleared, the section left
+    var had = before;
+    had.private_model = "local:llama3.1:8b";
+    had.private_api = "openai";
+    had.private_url = "http://127.0.0.1:11434/v1";
+    had.private_auth = "none";
+    const cleared = try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, had, .keep);
+    try expectArgv(&.{ "/b/harness", "config", "set", "model.provider", "anthropic", "model.model", "claude-opus-4-8", "model.private_model", "", "--home", "/h" }, cleared);
+    // none before and none now: nothing about it
+    const plain = try configArgv(a, "/b/harness", "/h", .{ .provider = .anthropic, .model = "claude-opus-4-8" }, before, .keep);
+    for (plain) |w| try t.expect(std.mem.indexOf(u8, w, "private") == null and std.mem.indexOf(u8, w, "local") == null);
+    // config.ini's own (another provider's model): never written, whatever the form says
+    var theirs = before;
+    theirs.private_model = "openrouter:x/y";
+    const kept = try configArgv(a, "/b/harness", "/h", f, theirs, .keep);
+    for (kept) |w| try t.expect(std.mem.indexOf(u8, w, "private") == null and std.mem.indexOf(u8, w, "local") == null);
+}
+
+test "a_private_model_needs_an_address" {
+    const ok: Form = .{ .provider = .anthropic, .model = "m", .private_model = "llama3.1:8b", .private_url = "http://127.0.0.1:11434/v1" };
+    try t.expect(problem(ok) == null);
+    var f = ok;
+    f.private_url = " ";
+    try t.expectEqualStrings("Private model: Address is empty.", problem(f).?);
+    f.private_url = "127.0.0.1:11434";
+    try t.expectEqualStrings("Private model: Address must start with http:// or https://.", problem(f).?);
+    f.private_url = "http://127.0.0.1:11434/v 1";
+    try t.expectEqualStrings("Private model: Address has a character that can't be used.", problem(f).?);
+    f = ok;
+    f.private_model = "-x";
+    try t.expectEqualStrings("Private model: Model can't start with a dash.", problem(f).?);
+    f.private_model = "a\nb";
+    try t.expectEqualStrings("Private model: Model has a character that can't be used.", problem(f).?);
+    // no model: the address isn't looked at
+    try t.expect(problem(.{ .provider = .anthropic, .model = "m", .private_url = "nonsense" }) == null);
 }
 
 test "harness_sits_beside_the_apps_program" {

@@ -128,7 +128,11 @@ claude mcp add --transport http harness http://127.0.0.1:8766/mcp \
   A name that is not among the client's tools: error -32602.
 - An unknown method: -32601. A batch (an array): -32600. A body that is
   not JSON: -32700. A `MCP-Protocol-Version` header naming another
-  version than the two: 400.
+  version than the two: 400, except on `initialize` (the version is
+  agreed in its body, and the MCP Python SDK, so Hermes, sends its own
+  newest as that request's header; found with Hermes 0.21.3 on
+  2026-11-27, which 0.4.0 refused) and on notifications and responses,
+  which are answered 202 as always.
 - The token is checked before the body is looked at: `Authorization:
   Bearer TOKEN`, else 401. A refused request's body is read off and thrown
   away (up to 4 MiB, so the client gets its answer), never parsed. The

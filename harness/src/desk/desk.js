@@ -442,6 +442,9 @@ $("compose").addEventListener("submit", async (e) => {
     }
   }
 });
+// off in the page as served: before this script ran, the form would have
+// gone to the server and the text been lost
+$("sendBtn").disabled = false;
 
 // ---- the voice: speaking replies, and the microphone ----
 

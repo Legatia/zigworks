@@ -14,6 +14,11 @@ pub const View = struct {
     form: setup.Form = .{},
     /// Its steps are running: Continue waits.
     busy: bool = false,
+    /// "Provider and key": whether the private model is the screen's to
+    /// edit (setup.privateOwned); when it isn't, `private_in_use`
+    /// (`[model] private_model` as config.ini has it) is shown as it is.
+    private_owned: bool = true,
+    private_in_use: []const u8 = "",
 };
 
 /// The page for `screen`, with `note` under it; the setup page shows
@@ -41,7 +46,8 @@ pub fn html(a: std.mem.Allocator, screen: Screen, note: []const u8, home: []cons
 
 /// "Set up" (or "Provider and key"): Provider, Model, Address (omnigate and
 /// Other), Format (Other), [Continue]. The key isn't asked for here: the
-/// app asks for it in a field of its own, outside the page.
+/// app asks for it in a field of its own, outside the page. "Provider and
+/// key" also has the private model: a server that takes no key.
 fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, home: []const u8, view: View) ![]u8 {
     const f = view.form;
     const e = setup.entry(f.provider);
@@ -76,6 +82,7 @@ fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, ho
     });
     if (view.mode == .change) {
         try out.print(a, "<div class=\"row check\"><input id=\"replace\" type=\"checkbox\"{s}><label for=\"replace\">Replace the key</label></div>\n", .{if (f.replace) " checked" else ""});
+        try privateRows(a, out, view);
     }
     try out.appendSlice(a, "<p class=\"note\" id=\"note\" role=\"alert\">");
     try escape(out, a, note);
@@ -95,6 +102,44 @@ fn setupPage(a: std.mem.Allocator, out: *std.ArrayList(u8), note: []const u8, ho
     try out.appendSlice(a, setup_script);
     try out.appendSlice(a, "</script>\n</body>\n</html>\n");
     return out.toOwnedSlice(a);
+}
+
+/// "Private model": the model of a server of one's own that answers private
+/// conversations. What it is sits behind the "i"; what crosses the network
+/// unencrypted is said on the page. One that config.ini set another way is
+/// shown and not edited.
+fn privateRows(a: std.mem.Allocator, out: *std.ArrayList(u8), view: View) !void {
+    const f = view.form;
+    try out.appendSlice(a, "<div class=\"group\"><h2 id=\"private-title\">Private model</h2>" ++
+        "<button class=\"i\" id=\"i-private\" type=\"button\" aria-label=\"About Private model\" aria-expanded=\"false\">i</button></div>\n" ++
+        "<div class=\"bubble wide\" id=\"bubble-private\" hidden>Answers the conversations set to private with <code>/private on</code>; " ++
+        "no other model is sent them. A server of your own that takes no key, like Ollama at <code>http://127.0.0.1:11434/v1</code>. " ++
+        "With no model here, private conversations go to the model above. A provider that takes a key is set in config.ini.</div>\n");
+    if (!view.private_owned) {
+        try out.appendSlice(a, "<p class=\"fixed\">");
+        if (view.private_in_use.len > 0) {
+            try out.appendSlice(a, "<code>");
+            try escape(out, a, view.private_in_use);
+            try out.appendSlice(a, "</code> Set in config.ini.</p>\n");
+        } else try out.appendSlice(a, "None. Set in config.ini.</p>\n");
+        return;
+    }
+    try out.appendSlice(a, "<div class=\"row\"><label for=\"pmodel\">Model</label><input id=\"pmodel\" value=\"");
+    try escape(out, a, f.private_model);
+    try out.appendSlice(a, "\" placeholder=\"None\" spellcheck=\"false\" aria-describedby=\"private-title\"></div>\n" ++
+        "<div class=\"row\"><label for=\"purl\">Address</label><input id=\"purl\" value=\"");
+    try escape(out, a, f.private_url);
+    try out.appendSlice(a, "\" spellcheck=\"false\" inputmode=\"url\" aria-describedby=\"private-title\"></div>\n");
+    // a risk to see before Continue: on the page
+    try out.print(a, "<p class=\"warn\" id=\"warn-private\"{s}>" ++
+        "http:// is not encrypted: what is said in a private conversation can be read on the network on its way to this address.</p>\n", .{
+        if (std.mem.trim(u8, f.private_model, " \t\r\n").len > 0 and setup.plainRemote(f.private_url)) "" else " hidden",
+    });
+    try out.print(a, "<div class=\"row\"><label for=\"papi\">Format</label><select id=\"papi\"><option value=\"openai\"{s}>OpenAI Chat Completions</option>" ++
+        "<option value=\"anthropic\"{s}>Anthropic Messages</option></select></div>\n", .{
+        if (f.private_api == .openai) " selected" else "",
+        if (f.private_api == .anthropic) " selected" else "",
+    });
 }
 
 /// The form's own behaviour: the provider switches the model to its usual
@@ -136,11 +181,21 @@ const setup_script =
     \\    if (!addressed[p]) { $("bubble-address").hidden = true; $("i-address").setAttribute("aria-expanded", "false"); }
     \\    warn();
     \\  });
-    \\  $("i-address").addEventListener("click", function () {
-    \\    var b = $("bubble-address");
-    \\    b.hidden = !b.hidden;
-    \\    this.setAttribute("aria-expanded", b.hidden ? "false" : "true");
-    \\  });
+    \\  function info(name) {
+    \\    var i = $("i-" + name), b = $("bubble-" + name);
+    \\    if (i) i.addEventListener("click", function () {
+    \\      b.hidden = !b.hidden;
+    \\      i.setAttribute("aria-expanded", b.hidden ? "false" : "true");
+    \\    });
+    \\  }
+    \\  info("address");
+    \\  info("private");
+    \\  var pmodel = $("pmodel"), purl = $("purl"), papi = $("papi");
+    \\  function pwarn() { $("warn-private").hidden = !(pmodel.value.trim() !== "" && plainRemote(purl.value)); }
+    \\  if (purl) {
+    \\    purl.addEventListener("input", pwarn);
+    \\    pmodel.addEventListener("input", pwarn);
+    \\  }
     \\  var cancel = $("cancel");
     \\  if (cancel) cancel.addEventListener("click", function () { post({cancel: true}); });
     \\  $("setup").addEventListener("submit", function (ev) {
@@ -150,7 +205,8 @@ const setup_script =
     \\    b.disabled = true;
     \\    b.textContent = "Working…";
     \\    var replace = $("replace");
-    \\    post({setup: {provider: provider.value, model: model.value, url: url.value, api: api.value, replace: !!(replace && replace.checked)}});
+    \\    post({setup: {provider: provider.value, model: model.value, url: url.value, api: api.value, replace: !!(replace && replace.checked),
+    \\      private_model: pmodel ? pmodel.value : "", private_url: purl ? purl.value : "", private_api: papi ? papi.value : "openai"}});
     \\  });
     \\  if (!model.value) model.focus(); else $("continue").focus();
     \\})();
@@ -207,6 +263,10 @@ const head =
     \\.note:empty { display: none; }
     \\form .note { color: #FF5C7A; }
     \\.home { font-size: 13px; }
+    \\.group { display: flex; align-items: center; gap: 10px; margin-top: 8px; padding-top: 14px; border-top: 1px solid #24263A; }
+    \\h2 { margin: 0; font-size: 15px; font-weight: 600; }
+    \\.bubble.wide { margin-left: 0; }
+    \\.fixed { font-size: 13px; }
     \\</style>
     \\</head>
     \\<body>
@@ -331,6 +391,49 @@ test "setup_page_has_the_fields_and_labels" {
     try t.expect(has(change, "id=\"replace\" type=\"checkbox\">"));
     const ticked = try html(a, .setup, "", "/h", .{ .mode = .change, .form = .{ .provider = .openai, .model = "gpt-5", .replace = true } });
     try t.expect(has(ticked, "id=\"replace\" type=\"checkbox\" checked>"));
+}
+
+test "provider_and_key_has_the_private_model" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page = try html(a, .setup, "", "/h", .{ .mode = .change, .form = .{ .provider = .anthropic, .model = "m", .private_model = "llama3.1:8b", .private_url = "http://127.0.0.1:11434/v1", .private_api = .anthropic } });
+    try t.expect(has(page, "<h2 id=\"private-title\">Private model"));
+    try t.expect(has(page, "<label for=\"pmodel\">Model</label><input id=\"pmodel\" value=\"llama3.1:8b\""));
+    try t.expect(has(page, "<label for=\"purl\">Address</label><input id=\"purl\" value=\"http://127.0.0.1:11434/v1\""));
+    try t.expect(has(page, "<label for=\"papi\">Format</label><select id=\"papi\"><option value=\"openai\">OpenAI Chat Completions</option><option value=\"anthropic\" selected>Anthropic Messages</option>"));
+    // what it is: behind the "i"
+    try t.expect(has(page, "<button class=\"i\" id=\"i-private\" type=\"button\" aria-label=\"About Private model\" aria-expanded=\"false\">i</button>"));
+    try t.expect(has(page, "<div class=\"bubble wide\" id=\"bubble-private\" hidden>"));
+    try t.expect(has(page, "<code>/private on</code>"));
+    // it goes with the form
+    try t.expect(has(page, "private_model: pmodel ? pmodel.value : \"\""));
+    try t.expect(has(page, "private_url: purl ? purl.value : \"\""));
+    try t.expect(has(page, "private_api: papi ? papi.value : \"openai\""));
+    // this computer: no warning shown
+    const line = "http:// is not encrypted: what is said in a private conversation can be read on the network on its way to this address.";
+    try t.expect(has(page, "<p class=\"warn\" id=\"warn-private\" hidden>" ++ line ++ "</p>"));
+    const far = try html(a, .setup, "", "/h", .{ .mode = .change, .form = .{ .model = "m", .private_model = "x", .private_url = "http://192.168.1.20:11434/v1" } });
+    try t.expect(has(far, "<p class=\"warn\" id=\"warn-private\">" ++ line ++ "</p>"));
+    try t.expect(has(far, "purl.addEventListener(\"input\", pwarn)"));
+    // not at the first setup
+    const first = try html(a, .setup, "", "/h", .{ .form = .{ .model = "m" } });
+    try t.expect(!has(first, "id=\"pmodel\""));
+    try t.expect(!has(first, "<h2"));
+}
+
+test "a_private_model_of_config_inis_own_is_shown_and_not_edited" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page = try html(a, .setup, "", "/h", .{ .mode = .change, .form = .{ .model = "m" }, .private_owned = false, .private_in_use = "openrouter:x/<y>" });
+    try t.expect(has(page, "<h2 id=\"private-title\">Private model"));
+    try t.expect(has(page, "<p class=\"fixed\"><code>openrouter:x/&lt;y&gt;</code> Set in config.ini.</p>"));
+    try t.expect(!has(page, "id=\"pmodel\""));
+    try t.expect(!has(page, "id=\"purl\""));
+    // none set, and [provider local] is config.ini's
+    const none = try html(a, .setup, "", "/h", .{ .mode = .change, .form = .{ .model = "m" }, .private_owned = false });
+    try t.expect(has(none, "<p class=\"fixed\">None. Set in config.ini.</p>"));
 }
 
 test "form_values_are_escaped" {
