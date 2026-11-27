@@ -24,6 +24,9 @@
 //!   team = team_monthly
 //!   pro = price_1Qx...
 //!
+//!   [letters]
+//!   from = Ola at Fernhill          ; who a drafted message to a customer is from
+//!
 //! The key is never in the file: STRIPE_KEY in the environment.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,6 +44,8 @@ pub const Config = struct {
     /// paymcp's own record of readings and decisions; "": none is kept.
     record_path: []const u8 = "",
     record_off: bool = false,
+    /// Who a drafted message to a customer is from; "": a place left to fill in.
+    letter_from: []const u8 = "",
     rules: audit.Rules = .{},
 };
 
@@ -127,10 +132,14 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 }
                 c.rules.current = list.items;
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[billing] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "letters")) {
+            if (eql(e.key, "from")) {
+                c.letter_from = e.value;
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[letters] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing] and [plans]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans] and [letters]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;

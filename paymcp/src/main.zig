@@ -19,6 +19,7 @@ const usage =
     \\       paymcp decide PAY.ini KEY intended|asked|open [REASON]
     \\                                             a person's decision about one finding, into paymcp's record
     \\       paymcp record PAY.ini                 the record: what is open, dismissed, and no longer found
+    \\       paymcp draft PAY.ini KEY              the draft of a message to the customer about one finding
     \\       paymcp version
     \\
     \\The key comes from the environment, never from the file: STRIPE_KEY, a
@@ -29,7 +30,7 @@ const usage =
     \\
 ;
 
-const Cmd = enum { serve, check, audit, decide, record };
+const Cmd = enum { serve, check, audit, decide, record, draft };
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -47,6 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (eql(word, "check")) break :blk if (args.len == 3) .check else return fail(io, usage, 2);
         if (eql(word, "record")) break :blk if (args.len == 3) .record else return fail(io, usage, 2);
         if (eql(word, "decide")) break :blk if (args.len >= 5) .decide else return fail(io, usage, 2);
+        if (eql(word, "draft")) break :blk if (args.len == 4) .draft else return fail(io, usage, 2);
         if (eql(word, "audit")) {
             if (args.len < 3) return fail(io, usage, 2);
             for (args[3..]) |flag| {
@@ -104,6 +106,15 @@ pub fn main(init: std.process.Init) !u8 {
     if (cmd == .check) {
         try out(io, try std.fmt.allocPrint(a, "{s}{d} requests, every one a GET. The key works and nothing was changed.\n", .{ try report.readText(a, r, &cfg), r.requests }));
         return 0;
+    }
+    if (cmd == .draft) {
+        // (a reading for a draft is not one for the record: the audit is)
+        const wanted = std.mem.trim(u8, args[3], " \t[]");
+        for (r.findings) |f| if (eql(f.key, wanted)) {
+            try out(io, try report.letterText(a, f, &cfg));
+            return 0;
+        };
+        return fail(io, try std.fmt.allocPrint(a, "paymcp: no finding has the key {s} now: paymcp audit lists the keys there are\n", .{wanted}), 1);
     }
     var kept = try record.keep(a, io, cfg.record_path, job.forRecord(r));
     const book: ?*const record.Book = if (kept.book) |*b| b else null;

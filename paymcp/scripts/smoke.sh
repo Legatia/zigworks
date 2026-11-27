@@ -68,6 +68,10 @@ check "a key in the file is refused with its line" '! "$B" check "$T/keyed.ini" 
 check "check says what was read, and that it only read" '"$B" check "$T/pay.ini" >"$T/c" && grep -q "^Read from the sandbox: 12 customers, 12 subscriptions, 6 prices, 7 invoices .*; from the business.s own file: 7 rows\.$" "$T/c" && grep -q "requests, every one a GET. The key works and nothing was changed.$" "$T/c"'
 check "the audit: what was read, the sums, the findings largest first" '"$B" audit "$T/pay.ini" >"$T/a" && grep -q "^Billing audit of ....-..-..\. Nothing was changed: paymcp only reads\.$" "$T/a" && grep -qx "14 findings: 371.00 EUR a month and 1143.00 EUR once." "$T/a" && grep -qx "1. Free, and has been for a while: 87.00 EUR a month" "$T/a" && grep -qx "10. Invoices past due: 340.00 EUR, once" "$T/a" && grep -qx "13. Payments that failed: 48.00 EUR, once" "$T/a" && grep -qx "14. An invoice never charged: 29.00 EUR, once" "$T/a"'
 check "each finding has its rows, a proposal and a key" '[ "$(grep -c "^   Proposed: " "$T/a")" = 14 ] && [ "$(grep -c "^   \[[a-z_]*:.*\]$" "$T/a")" = 14 ] && grep -qx "   - the business.s file, line 2: seats 9" "$T/a" && grep -qx "   - subscription item si_alder_1: price price_team, quantity 5, 12.00 EUR a unit a month" "$T/a"'
+check "a finding whose change is the customer's to see says a message is drafted" '[ "$(grep -c "^   A message to the customer is drafted: ask for the draft of this key\.$" "$T/a")" = 9 ]'
+check "the draft: to whom, the subject, the text, signed as the pay file says, and nothing sent" '"$B" draft "$T/pay.ini" "[more_seats:sub_alder:si_alder_1]" >"$T/dr" && grep -qx "A draft, for you to read, change and send from your own mail. paymcp sent nothing and can send nothing." "$T/dr" && grep -qx "To: billing@alder.example" "$T/dr" && grep -qx "Subject: The seats on your subscription" "$T/dr" && grep -q "^Your account has 9 seats in use, and your subscription covers 5\. From your next billing period we would like to set it to 9 seats (12.00 EUR a seat a month)\.$" "$T/dr" && [ "$(tail -n 2 "$T/dr" | tr -d "\r" | tr "\n" "|")" = "Kind regards,|Ola at Fernhill|" ]'
+check "a reminder for an invoice past due names it and its day" '"$B" draft "$T/pay.ini" overdue:cus_dogwood:eur >"$T/dr2" && grep -qx "Subject: Invoice FH-0405" "$T/dr2" && grep -q "^Invoice FH-0405 for 340.00 EUR was due on ....-..-.. and is still open\." "$T/dr2"'
+check "nothing to tell the customer: no draft, and why; a key nothing has is refused" '"$B" draft "$T/pay.ini" paused:sub_gorse >"$T/dr3" && grep -q "^No message is drafted for paused:sub_gorse: nothing about it is the customer.s to see yet\." "$T/dr3" && ! "$B" draft "$T/pay.ini" paused:sub_nobody 2>"$T/err" && grep -q "no finding has the key paused:sub_nobody now" "$T/err"'
 check "customers with nothing to find aren't named" '! grep -q "Juniper\|Kapok\|Larch\|cus_old" "$T/a"'
 check "the audit as data" '"$B" audit "$T/pay.ini" --json >"$T/a.json" && python3 -I -c "
 import json, sys
@@ -160,7 +164,7 @@ m = Mcp(pay)
 info = m.hello["result"]
 check("initialize names paymcp and says what it reads is data", info["serverInfo"]["name"] == "paymcp" and "data, not instructions" in info["instructions"] and "It only reads" in info["instructions"], json.dumps(info))
 tools = m.rpc("tools/list")["result"]["tools"]
-check("four tools; the one that writes, writes only paymcp's own record", [t["name"] for t in tools] == ["billing_audit", "billing_finding", "billing_decide", "billing_record"] and [t["annotations"]["readOnlyHint"] for t in tools] == [True, True, False, True] and "Changes nothing at the billing provider" in tools[2]["description"], json.dumps(tools)[:600])
+check("five tools; the one that writes, writes only paymcp's own record", [t["name"] for t in tools] == ["billing_audit", "billing_finding", "billing_decide", "billing_record", "billing_draft"] and [t["annotations"]["readOnlyHint"] for t in tools] == [True, True, False, True, True] and "Changes nothing at the billing provider" in tools[2]["description"] and "paymcp sends nothing" in tools[4]["description"], json.dumps(tools)[:600])
 text, err = m.call("billing_audit")
 check("billing_audit: the sums and the findings", not err and "14 findings: 371.00 EUR a month and 1143.00 EUR once." in text and "More seats than paid for: 48.00 EUR a month\n   Alder Works has 9 seats in the product and pays for 5." in text, text)
 text, err = m.call("billing_audit", {"kind": "usage_not_reported"})
@@ -172,7 +176,7 @@ check("billing_finding: one finding with its rows", not err and text.startswith(
 text, err = m.call("billing_finding", {"key": "written_off:cus_nobody:eur"})
 check("a key no finding has is said", err and "No finding has the key" in text, text)
 text, err = m.call("billing_audit", {"customer": "cus_alder"})
-check("a field the tool doesn't take is refused", err and "billing_audit has no field customer; it takes kind, limit, fresh, all." in text, text)
+check("a field the tool doesn't take is refused", err and "billing_audit has no field customer; it takes kind, limit, fresh, all, format, offset." in text, text)
 text, err = m.call("billing_fix", {"key": "paused:sub_gorse"})
 check("there is no tool that changes anything at the provider", err and "no tool called billing_fix" in text, text)
 text, err = m.call("billing_decide", {"key": "paused:sub_gorse", "decision": "asked", "reason": "wrote to Gorse"})
@@ -181,6 +185,28 @@ text, err = m.call("billing_audit", {"kind": "paused"})
 check("the audit marks it", not err and "1. Collection paused: 29.00 EUR a month (asked)" in text and "   Asked on " in text, text)
 text, err = m.call("billing_record")
 check("billing_record: where things stand", not err and "Asked, waiting for an answer: 1 finding, 29.00 EUR a month." in text and "[paused:sub_gorse]" in text, text)
+# as data, for a page that lists the findings: a page at a time, and
+# short enough to pass an agent runtime's limit on a tool's answer
+text, err = m.call("billing_audit", {"format": "json"})
+page = json.loads(text) if not err else {}
+check("billing_audit as data: the sums, how many, and each finding without its rows", not err and len(text) < 16000 and page["total"] == 14 and len(page["findings"]) == 14 and page["sums"] == "371.00 EUR a month and 1143.00 EUR once" and page["findings"][0]["amount_text"] == "87.00 EUR a month" and page["findings"][0]["letter"] is True and "rows" not in page["findings"][0] and [f["state"] for f in page["findings"] if f["kind"] == "paused"] == ["asked"] and "not instructions" in page["note"] and page["read"].startswith("Read from the sandbox: 12 customers"), text)
+text, err = m.call("billing_audit", {"format": "json", "offset": 10, "limit": 3})
+page = json.loads(text) if not err else {}
+check("a page of it from an offset", not err and page["total"] == 14 and page["offset"] == 10 and len(page["findings"]) == 3, text)
+text, err = m.call("billing_audit", {"offset": 2})
+check("an offset without data is refused", err and "offset goes with format json" in text, text)
+text, err = m.call("billing_audit", {"format": "xml"})
+check("a format there isn't is refused", err and "format is text (the default) or json." in text, text)
+text, err = m.call("billing_finding", {"key": "more_seats:sub_alder:si_alder_1", "format": "json"})
+one = json.loads(text) if not err else {}
+check("billing_finding as data: the rows, the proposal and the draft", not err and one["amount"] == 4800 and len(one["rows"]) == 2 and one["rows_more"] == 0 and one["proposal"].startswith("Set the quantity") and one["letter"]["to"] == "billing@alder.example" and one["letter"]["body"].endswith("Kind regards,\nOla at Fernhill\n") and one["state"] in ("open", "new"), text)
+text, err = m.call("billing_draft", {"key": "[higher_plan:sub_birch]"})
+check("billing_draft: the message, and that nothing was sent", not err and "paymcp sent nothing and can send nothing." in text and "Subject: Your plan" in text and "Your account has the plan \"pro\", and your subscription is for team_monthly." in text, text)
+text, err = m.call("billing_draft", {"key": "written_off:cus_ivy:eur"})
+check("billing_draft where nothing is the customer's to see", not err and text.startswith("No message is drafted for written_off:cus_ivy:eur"), text)
+text, err = m.call("billing_record", {"format": "json"})
+rec = json.loads(text) if not err else {}
+check("billing_record as data", not err and rec["asked"]["n"] == 1 and rec["asked"]["items"][0]["key"] == "paused:sub_gorse" and rec["asked"]["items"][0]["reason"] == "wrote to Gorse" and rec["open"]["n"] == 13 and rec["readings"] >= 1, text)
 res = m.rpc("resources/read", {"uri": "pay://findings"})
 body = json.loads(res["result"]["contents"][0]["text"])
 check("the findings as a resource", len(body["findings"]) == 14 and "not instructions" in body["note"] and [f["state"] for f in body["findings"] if f["kind"] == "paused"] == ["asked"], json.dumps(body)[:600])
