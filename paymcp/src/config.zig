@@ -43,13 +43,25 @@
 //!   out_of_line = 3                 ; an amount this many times the largest paid to that supplier
 //!   currency = eur                  ; of a file with no currency column
 //!
-//! The key is never in the file: STRIPE_KEY in the environment.
+//!   [bills]                         ; the bill watch: what cloud services and AI models cost
+//!   read = anthropic, openai, aws   ; which are read (the default: all three; one with no key is said)
+//!   days = 35                       ; how far back (14 to 90)
+//!   jump = 3                        ; a day this many times the usual for its weekday (0: not looked for)
+//!   jump_above = 500                ; ...and this much above it, in the currency's smallest unit
+//!   doubled_above = 1000            ; a line whose week cost twice the week before, by this much (0: not)
+//!   budget = 50000                  ; the month's budget for everything read (0: none)
+//!   currency = usd                  ; of the budget
+//!
+//! The keys are never in the file: STRIPE_KEY in the environment; for the
+//! bill watch ANTHROPIC_ADMIN_KEY, OPENAI_ADMIN_KEY, AWS_ACCESS_KEY_ID and
+//! AWS_SECRET_ACCESS_KEY.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const ini = @import("ini.zig");
 const audit = @import("audit.zig");
 const payrun = @import("payrun.zig");
+const bills = @import("bills.zig");
 
 pub const Mode = enum { sandbox, live };
 
@@ -77,6 +89,14 @@ pub const Config = struct {
     payrun_suppliers: []const u8 = "",
     payrun_history: []const u8 = "",
     payrun: payrun.Rules = .{},
+    /// The bill watch: the pay file has a [bills] section; which providers
+    /// are read, where they are (the stand-in: on this computer), the rules.
+    bills_on: bool = false,
+    bills_read: []const []const u8 = &.{ "anthropic", "openai", "aws" },
+    bills: bills.Rules = .{},
+    anthropic_url: []const u8 = "https://api.anthropic.com",
+    openai_url: []const u8 = "https://api.openai.com",
+    aws_url: []const u8 = "https://ce.us-east-1.amazonaws.com",
     rules: audit.Rules = .{},
 };
 
@@ -112,6 +132,17 @@ pub fn load(a: Allocator, io: Io, path: []const u8, diag: *Diag) !Config {
 fn bad(diag: *Diag, line: usize, what: []const u8) error{BadConfig} {
     diag.* = .{ .line = line, .what = what };
     return error.BadConfig;
+}
+
+/// An address a key may be sent to: https, or this computer (a stand-in).
+fn safeUrl(v: []const u8) bool {
+    return std.mem.startsWith(u8, v, "https://") or std.mem.startsWith(u8, v, "http://127.0.0.1") or std.mem.startsWith(u8, v, "http://localhost");
+}
+
+fn amount(a: Allocator, diag: *Diag, e: ini.Entry) !i64 {
+    const n = std.fmt.parseInt(i64, e.value, 10) catch -1;
+    if (n < 0) return bad(diag, e.line, try std.fmt.allocPrint(a, "{s} takes a whole number, zero or more, in the currency's smallest unit", .{e.key}));
+    return n;
 }
 
 fn days(a: Allocator, diag: *Diag, e: ini.Entry) !u32 {
@@ -186,6 +217,38 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
                 if (e.value.len != 3) return bad(diag, e.line, "currency is three letters, as eur");
                 c.payrun.currency = try std.ascii.allocLowerString(a, e.value);
             } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[payrun] has no setting {s}", .{e.key}));
+        } else if (eql(e.section, "bills")) {
+            c.bills_on = true;
+            if (eql(e.key, "read")) {
+                var list: std.ArrayList([]const u8) = .empty;
+                var it = std.mem.splitScalar(u8, e.value, ',');
+                while (it.next()) |raw| {
+                    const v = std.mem.trim(u8, raw, " \t");
+                    if (v.len == 0) continue;
+                    if (!eql(v, "anthropic") and !eql(v, "openai") and !eql(v, "aws")) return bad(diag, e.line, "read names anthropic, openai and aws, with commas between");
+                    try list.append(a, v);
+                }
+                if (list.items.len == 0) return bad(diag, e.line, "read names anthropic, openai and aws, with commas between");
+                c.bills_read = list.items;
+            } else if (eql(e.key, "days")) {
+                c.bills.days = try days(a, diag, e);
+                if (c.bills.days < 14 or c.bills.days > 90) return bad(diag, e.line, "days is 14 to 90");
+            } else if (eql(e.key, "jump")) {
+                c.bills.jump = std.fmt.parseInt(u32, e.value, 10) catch return bad(diag, e.line, "jump takes a whole number: how many times the usual (0: not looked for)");
+                if (c.bills.jump == 1) return bad(diag, e.line, "jump is 2 or more, or 0: once the usual is every day");
+            } else if (eql(e.key, "jump_above")) {
+                c.bills.jump_above = try amount(a, diag, e);
+            } else if (eql(e.key, "doubled_above")) {
+                c.bills.doubled_above = try amount(a, diag, e);
+            } else if (eql(e.key, "budget")) {
+                c.bills.budget = try amount(a, diag, e);
+            } else if (eql(e.key, "currency")) {
+                if (e.value.len != 3) return bad(diag, e.line, "currency is three letters, as usd");
+                c.bills.currency = try std.ascii.allocLowerString(a, e.value);
+            } else if (eql(e.key, "anthropic_url") or eql(e.key, "openai_url") or eql(e.key, "aws_url")) {
+                if (!safeUrl(e.value)) return bad(diag, e.line, "an address is https://..., or http:// on this computer only (the stand-in): a key isn't sent in the clear");
+                if (eql(e.key, "anthropic_url")) c.anthropic_url = e.value else if (eql(e.key, "openai_url")) c.openai_url = e.value else c.aws_url = e.value;
+            } else return bad(diag, e.line, try std.fmt.allocPrint(a, "[bills] has no setting {s}", .{e.key}));
         } else if (eql(e.section, "changes")) {
             if (eql(e.key, "allow")) {
                 if (!eql(e.value, "yes") and !eql(e.value, "no")) return bad(diag, e.line, "allow is yes or no");
@@ -209,7 +272,7 @@ pub fn parse(a: Allocator, text: []const u8, diag: *Diag) !Config {
         } else if (eql(e.section, "plans")) {
             if (e.value.len == 0) return bad(diag, e.line, "a plan needs the price it means: NAME = a price's id or lookup key");
             try plans.append(a, .{ .name = e.key, .price = e.value });
-        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters], [changes] and [payrun]", .{e.section}));
+        } else return bad(diag, e.line, try std.fmt.allocPrint(a, "no section [{s}]: the file has [stripe], [billing], [plans], [disputes], [letters], [changes], [payrun] and [bills]", .{e.section}));
     }
     c.rules.plans = plans.items;
     return c;

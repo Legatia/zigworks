@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const sock = @import("sock.zig");
 const model = @import("model.zig");
+const sim_cloud = @import("sim_cloud.zig");
 
 pub const Options = struct {
     port: u16 = 0,
@@ -28,6 +29,10 @@ pub const Options = struct {
     disputes: enum { none, some, denied } = .none,
     /// A second key, which may change things; "": nothing can.
     write_key: []const u8 = "",
+    /// The bill watch's providers (sim_cloud.zig): the admin key the
+    /// stand-ins for Anthropic and OpenAI take, and the secret AWS's
+    /// requests are signed with; "": they aren't served.
+    cloud_key: []const u8 = "",
 };
 
 pub const customer_count = 12;
@@ -365,16 +370,24 @@ fn reported(customer: []const u8) f64 {
 
 // ---- HTTP ----
 
-const Req = struct {
+pub const Req = struct {
     method: []const u8,
     path: []const u8,
     query: []const u8,
     auth: []const u8 = "",
     version: []const u8 = "",
     body: []const u8 = "",
+    /// Every header: its name in lower case, and its value.
+    headers: []const [2][]const u8 = &.{},
+
+    /// A header's value by its name in lower case; "": not sent.
+    pub fn header(r: Req, name: []const u8) []const u8 {
+        for (r.headers) |h| if (std.mem.eql(u8, h[0], name)) return h[1];
+        return "";
+    }
 };
 
-const Res = struct { status: u16, body: []const u8 = "" };
+pub const Res = struct { status: u16, body: []const u8 = "" };
 
 fn serve(s: *Sim, conn: sock.Handle) void {
     defer sock.closeHandle(conn);
@@ -407,12 +420,14 @@ fn readRequest(a: Allocator, r: *Io.Reader) !?Req {
     const qm = std.mem.indexOfScalar(u8, target, '?');
     var req: Req = .{ .method = method, .path = target[0 .. qm orelse target.len], .query = if (qm) |i| target[i + 1 ..] else "" };
     var length: usize = 0;
+    var headers: std.ArrayList([2][]const u8) = .empty;
     while (true) {
         const h = std.mem.trimEnd(u8, (try r.takeDelimiter('\n')) orelse return error.BadRequest, "\r");
         if (h.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, h, ':') orelse continue;
         const name = std.mem.trim(u8, h[0..colon], " ");
         const value = try a.dupe(u8, std.mem.trim(u8, h[colon + 1 ..], " \t"));
+        try headers.append(a, .{ try std.ascii.allocLowerString(a, name), value });
         if (std.ascii.eqlIgnoreCase(name, "content-length")) length = std.fmt.parseInt(usize, value, 10) catch 0;
         if (std.ascii.eqlIgnoreCase(name, "authorization")) req.auth = value;
         if (std.ascii.eqlIgnoreCase(name, "stripe-version")) req.version = value;
@@ -423,6 +438,7 @@ fn readRequest(a: Allocator, r: *Io.Reader) !?Req {
         try r.readSliceAll(body);
         req.body = body;
     }
+    req.headers = headers.items;
     return req;
 }
 
@@ -433,6 +449,7 @@ fn writeResponse(w: *Io.Writer, res: Res) !void {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         429 => "Too Many Requests",
         else => "Status",
     };
@@ -447,7 +464,7 @@ fn err(a: Allocator, status: u16, kind: []const u8, code: []const u8, message: [
 }
 
 /// The value of `key` in a query string, percent-decoded ("" when absent).
-fn param(a: Allocator, query: []const u8, key: []const u8) ![]const u8 {
+pub fn param(a: Allocator, query: []const u8, key: []const u8) ![]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |kv| {
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
@@ -485,6 +502,8 @@ fn decode(a: Allocator, v: []const u8) ![]const u8 {
 }
 
 fn handle(s: *Sim, a: Allocator, req: Req) !Res {
+    // the bill watch's providers, each with its own key and its own errors
+    if (s.opts.cloud_key.len > 0 and sim_cloud.handles(req)) return sim_cloud.handle(a, s.opts.cloud_key, s.opts.now, req);
     if (!std.mem.startsWith(u8, req.auth, "Bearer ")) return err(a, 401, "invalid_request_error", "", "Invalid API Key provided.");
     const writes = s.opts.write_key.len > 0 and std.mem.eql(u8, req.auth[7..], s.opts.write_key);
     if (!writes and !std.mem.eql(u8, req.auth[7..], s.opts.key))

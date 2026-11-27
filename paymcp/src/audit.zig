@@ -95,8 +95,24 @@ pub const Kind = enum {
     shared_account,
     batch_changed,
     paid_twice,
+    // ...with the Polish readers (ksef.zig, whitelist.zig)
+    account_unregistered,
+    invoice_account,
+    invoice_amount,
+    // ...and with a ledger read (ledger.zig)
+    details_changed,
+    // the bill watch (bills.zig)
+    cost_jump,
+    cost_doubled,
+    over_budget,
 
-    /// The kinds of the payment-run check: not the billing account's.
+    /// The bill watch's kinds.
+    pub fn bills(k: Kind) bool {
+        return @intFromEnum(k) >= @intFromEnum(Kind.cost_jump);
+    }
+
+    /// The kinds that are not the billing account's: the payment-run
+    /// check's and the bill watch's.
     pub fn payrun(k: Kind) bool {
         return @intFromEnum(k) >= @intFromEnum(Kind.account_changed);
     }
@@ -126,6 +142,13 @@ pub const Kind = enum {
             .shared_account => "Two suppliers, one account",
             .batch_changed => "The file is not what was checked",
             .paid_twice => "Paid twice",
+            .account_unregistered => "An account the tax office's list doesn't have",
+            .invoice_account => "The invoice names another account",
+            .invoice_amount => "The invoice is for another amount",
+            .details_changed => "Bank details changed in the books",
+            .cost_jump => "A day's bill far above the usual",
+            .cost_doubled => "A cost that doubled",
+            .over_budget => "On the way past the month's budget",
         };
     }
 };

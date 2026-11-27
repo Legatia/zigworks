@@ -14,6 +14,8 @@ const job = @import("job.zig");
 const dispute = @import("dispute.zig");
 const change = @import("change.zig");
 const payrun_cmd = @import("payrun_cmd.zig");
+const bills_cmd = @import("bills_cmd.zig");
+const cloud = @import("cloud.zig");
 
 const usage =
     \\usage: paymcp PAY.ini                        serve MCP on stdin and stdout (what an agent starts)
@@ -32,17 +34,31 @@ const usage =
     \\       paymcp payrun PAY.ini history FILE.csv  give paymcp past payments, and search them for payments made twice
     \\       paymcp payrun PAY.ini lookback          search the past payments again
     \\       paymcp payrun PAY.ini draft KEY         the draft of a message to the supplier about a payment made twice
+    \\       paymcp bills PAY.ini                  the bill watch: what cloud services and AI models cost, and what moved
     \\       paymcp version
     \\
     \\The key comes from the environment, never from the file: STRIPE_KEY, a
     \\restricted key that can only read (rk_test_... for a sandbox). A live
     \\account's secret key (sk_live_...) is refused; a sandbox's (sk_test_...)
     \\is taken, with a note. decide, record and payrun need no key: they read
-    \\and write only files on this computer.
+    \\and write only files on this computer. The bill watch has keys of its
+    \\own: ANTHROPIC_ADMIN_KEY, OPENAI_ADMIN_KEY, and for AWS
+    \\AWS_ACCESS_KEY_ID with AWS_SECRET_ACCESS_KEY.
     \\
 ;
 
-const Cmd = enum { serve, check, audit, decide, record, draft, evidence, change, stage, payrun };
+const Cmd = enum { serve, check, audit, decide, record, draft, evidence, change, stage, payrun, bills };
+
+/// The bill watch's keys, from the environment.
+fn cloudKeys(env: *const std.process.Environ.Map) cloud.Keys {
+    return .{
+        .anthropic = env.get("ANTHROPIC_ADMIN_KEY") orelse "",
+        .openai = env.get("OPENAI_ADMIN_KEY") orelse "",
+        .aws_id = env.get("AWS_ACCESS_KEY_ID") orelse "",
+        .aws_secret = env.get("AWS_SECRET_ACCESS_KEY") orelse "",
+        .aws_token = env.get("AWS_SESSION_TOKEN") orelse "",
+    };
+}
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
@@ -60,6 +76,7 @@ pub fn main(init: std.process.Init) !u8 {
     const cmd: Cmd = blk: {
         if (eql(word, "check")) break :blk if (args.len == 3) .check else return fail(io, usage, 2);
         if (eql(word, "record")) break :blk if (args.len == 3) .record else return fail(io, usage, 2);
+        if (eql(word, "bills")) break :blk if (args.len == 3) .bills else return fail(io, usage, 2);
         if (eql(word, "decide")) break :blk if (args.len >= 5) .decide else return fail(io, usage, 2);
         if (eql(word, "draft")) break :blk if (args.len == 4) .draft else return fail(io, usage, 2);
         if (eql(word, "evidence")) break :blk if (args.len == 4) .evidence else return fail(io, usage, 2);
@@ -100,6 +117,12 @@ pub fn main(init: std.process.Init) !u8 {
         try out(io, got.text);
         return 0;
     }
+    if (cmd == .bills) {
+        const got = try bills_cmd.run(init.gpa, a, io, &cfg, cloudKeys(init.environ_map), now, 1000);
+        if (!got.ok) return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{got.text}), 1);
+        try out(io, got.text);
+        return 0;
+    }
     if (cmd == .decide or cmd == .record) {
         if (cfg.record_path.len == 0) return fail(io, try std.fmt.allocPrint(a, "paymcp: {s} says record = none: no record is kept, so there is nothing to read or to write a decision into\n", .{path}), 1);
         var kept = try record.open(a, io, cfg.record_path);
@@ -122,11 +145,11 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     const key = init.environ_map.get("STRIPE_KEY") orelse "";
-    if (cmd == .serve and key.len == 0 and cfg.payrun_on) {
-        // a pay file for the payment-run check only: no account is read
+    if (cmd == .serve and key.len == 0 and (cfg.payrun_on or cfg.bills_on)) {
+        // a pay file for the payment-run check or the bill watch only: no account is read
         var none = stripe.Client.init(init.gpa, io, &cfg, "") catch return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}: url isn't an address paymcp can reach\n", .{path}), 1);
         defer none.deinit();
-        try server.runWith(init.gpa, io, &cfg, &none, false);
+        try server.runWith(init.gpa, io, &cfg, &none, false, cloudKeys(init.environ_map));
         return 0;
     }
     if (config.keyProblem(&cfg, key)) |why| return fail(io, try std.fmt.allocPrint(a, "paymcp: {s}\n", .{why}), 1);
@@ -145,7 +168,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (cmd == .serve) {
-        try server.run(init.gpa, io, &cfg, &client);
+        try server.runWith(init.gpa, io, &cfg, &client, true, cloudKeys(init.environ_map));
         return 0;
     }
     var why: []const u8 = "";
@@ -233,6 +256,9 @@ test {
     _ = @import("change.zig");
     _ = @import("payrun.zig");
     _ = @import("payrun_cmd.zig");
+    _ = @import("bills.zig");
+    _ = @import("cloud.zig");
+    _ = @import("bills_cmd.zig");
     _ = @import("server.zig");
     _ = @import("jv.zig");
     _ = @import("ini.zig");

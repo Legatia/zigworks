@@ -4,7 +4,7 @@ const sim = @import("sim.zig");
 const model = @import("model.zig");
 
 const usage =
-    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes] [--write-key KEY2] [--with-stdin]
+    \\usage: paymcp-sim PORT KEY [--day YYYY-MM-DD] [--no-meters] [--disputes | --no-disputes] [--write-key KEY2] [--cloud KEY3] [--with-stdin]
     \\
     \\A made-up software business (twelve customers, their subscriptions,
     \\prices and invoices) behind a stand-in for the billing provider's API on
@@ -17,6 +17,10 @@ const usage =
     \\With --write-key, requests sent with KEY2 may also change things (end a
     \\discount, set a quantity or a price, resume collection, finalise or send
     \\an invoice, keep evidence for a dispute); KEY still only reads.
+    \\With --cloud it also stands in for what the bill watch reads: the cost
+    \\reports of Anthropic and OpenAI (KEY3 is the admin key both take) and
+    \\AWS's Cost Explorer (requests signed for the access key
+    \\AKIASIMSIMSIMSIMSIM0 with KEY3 as its secret).
     \\With --with-stdin it ends when its standard input ends (for a program
     \\that starts it and should take it along when it goes).
     \\examples/who.csv is the business's own file that goes with it.
@@ -42,6 +46,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, args[i], "--write-key") and i + 1 < args.len) {
             i += 1;
             opts.write_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--cloud") and i + 1 < args.len) {
+            i += 1;
+            opts.cloud_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--disputes")) {
             opts.disputes = .some;
         } else if (std.mem.eql(u8, args[i], "--no-disputes")) {
