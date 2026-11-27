@@ -57,11 +57,10 @@ on. Update it when something lands.
   first, no key copied) and `harness skill add|list|show|update|rm`
   (folders, GitHub repos, SKILL.md links). Plan
   `docs/superpowers/plans/2026-11-24-hermes-import.md`.
-- **`utc_offset` doesn't follow daylight saving** (found by the Hermes
-  import, 2026-11-24): harness keeps one fixed offset for every time it
-  says or schedules; a 07:00 task moves an hour against the wall clock
-  twice a year until `utc_offset` is changed by hand. The import converts
-  a job's time at its zone's offset on the import day and says so.
+- **`utc_offset` didn't follow daylight saving** (found by the Hermes
+  import, 2026-11-24). **Built:** `[chat] utc_offset = auto` (the starting
+  file's value) is the computer's zone at each use; a fixed `+HH:MM` is
+  still one offset all year.
 - **Private conversations on a local model** (from the fifteen-features
   list).
 
@@ -163,8 +162,10 @@ real carcloud (unit tests with harness-fake's Tesla stand-in).
 - **The female avatar** is skipped for now.
 - **Exact lip-sync timing:** mouth shapes are estimated from the text and
   stretched to the voice; word-level timing is a later add-on.
-- **An urgent alert's [I'm on it] can't be pressed on the desk;** answering
-  its item (or Telegram) acknowledges it.
+- **An urgent alert's [I'm on it] on the desk. Built** for the desk as the
+  only channel: the alert's message carries the button there. With
+  Telegram set up it is pressed in Telegram, as every message's buttons
+  are.
 - **The fit's results** reach the page in the shape the desk expects
   (`head`, `eyes`, `eyemask`, `face.width`, `warnings`, `closed`), to be
   aligned with the avatar module when it lands.
