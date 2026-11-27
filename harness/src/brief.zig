@@ -231,7 +231,7 @@ pub const Written = struct {
 };
 
 const brief_instructions =
-    \\Write the owner's brief from the new items below. Group by topic. One short line per item worth reading, in plain words, ending with its link in parentheses. Leave out items that repeat another. No introduction and no closing remarks.
+    \\Write the owner's brief from the new items below. Group by topic. One short line per item worth reading, in plain words, ending with its link in parentheses. Leave out items that repeat another. No introduction and no closing remarks. Plain text as typed: no Markdown marks (no ** or #).
 ;
 
 /// The brief's text: no model call when nothing is new.

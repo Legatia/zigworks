@@ -1891,6 +1891,14 @@ const gate_line =
     \\
 ;
 
+/// Harness's own line on how an answer is shown. Every way out (the desk,
+/// Telegram, the terminal) shows the text as typed, so Markdown marks come
+/// out as marks: "**Triggers:** none", seen with a real model.
+pub const plain_line =
+    \\Your answers are shown as plain text, exactly as typed: write no Markdown (no ** or # marks, no backticks, no tables). A short list of lines starting with - is fine.
+    \\
+;
+
 /// The same for a delegated run.
 const delegated_gate_line =
     \\Every tool call passes a gate and may be refused. If a call is refused, say so instead of trying another way around it.
@@ -1948,6 +1956,8 @@ pub fn systemParts(arena: std.mem.Allocator, r: *const Run, recalled: memory.Rec
     // own lines, which a persona never changes
     if (!r.helper) try out.appendSlice(arena, r.persona);
     try out.appendSlice(arena, if (r.helper) delegated_gate_line else gate_line);
+    // (a helper's answer goes to the run that asked, not to a person)
+    if (!r.helper) try out.appendSlice(arena, plain_line);
     if (r.allows(.delegate)) try out.appendSlice(arena, delegate_guide);
     if (r.allows(.send)) try out.appendSlice(arena, if (who_mod.isMember(r.who.by)) member_send_guide else send_guide);
     if (r.scheduled) try out.appendSlice(arena, "This is a scheduled run: the owner is not watching and cannot approve anything.\n");
@@ -9146,6 +9156,8 @@ test "the_persona_comes_after_the_body_and_before_harness_lines" {
     const body = std.mem.indexOf(u8, s, "You are a personal agent").?;
     const persona_at = std.mem.indexOf(u8, s, "PERSONA: dry and brief.").?;
     const gate_at = std.mem.indexOf(u8, s, "Every tool call passes a gate").?;
+    // harness's line on how an answer is shown comes with the gate's
+    try t.expect(std.mem.indexOf(u8, s, "Your answers are shown as plain text, exactly as typed: write no Markdown").? > gate_at);
     const send_at = std.mem.indexOf(u8, s, "The owner sees only what you post with send").?;
     const standing = std.mem.indexOf(u8, s, "Standing instructions from the owner").?;
     try t.expect(body < persona_at and persona_at < gate_at and gate_at < send_at and send_at < standing);
