@@ -110,7 +110,9 @@ def main():
         tmp = tempfile.mkdtemp(prefix="paymcp-page-")
         examples = os.path.join(HERE, "..", "examples")
         shutil.copy(os.path.join(examples, "who.csv"), tmp)
+        shutil.copytree(os.path.join(examples, "payrun"), os.path.join(tmp, "payrun"))
         text = open(os.path.join(examples, "sim.ini"), encoding="utf-8").read().replace("8743", str(sim_port))
+        text += "\n[payrun]\nsuppliers = payrun/suppliers.csv\n"
         pay = os.path.join(tmp, "pay.ini")
         open(pay, "w", encoding="utf-8").write(text)
         env["STRIPE_KEY"] = key
@@ -159,6 +161,8 @@ def main():
                 if out is None:
                     return self.send(404, '{"error":"no such act"}')
                 return self.send(200, json.dumps({"id": int(path[len("/api/act/"):]), "state": "done", "output": out}))
+            if path == "/api/info":
+                return self.send(200, json.dumps({"name": "money"}))
             name = "index.html" if path == "/" else path.lstrip("/")
             full = os.path.join(APP, name)
             ext = os.path.splitext(name)[1]

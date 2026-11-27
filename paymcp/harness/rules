@@ -15,5 +15,7 @@ allow mcp billing/billing_finding *
 allow mcp billing/billing_record *
 allow mcp billing/billing_draft *
 allow mcp billing/billing_decide *
+allow mcp billing/payrun_check *
+allow mcp billing/payrun_lookback *
 
 [all]

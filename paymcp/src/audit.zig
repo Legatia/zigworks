@@ -889,6 +889,10 @@ fn whoRows(c: *Ctx) !void {
     }
 }
 
+fn sameInterval(x: model.Price, y: model.Price) bool {
+    return x.recurring and y.recurring and x.interval == y.interval and x.interval_count == y.interval_count;
+}
+
 fn seatsAndPlan(c: *Ctx, row: who.Row, cu: model.Customer, sub: model.Subscription, src: []const u8, plan_price: ?model.Price) !void {
     // the item the seats are billed on: the plan's own price if the
     // subscription has it, else its only fixed-quantity item
@@ -931,8 +935,9 @@ fn seatsAndPlan(c: *Ctx, row: who.Row, cu: model.Customer, sub: model.Subscripti
                         .{ .source = try c.p("subscription item {s}", .{it.id}), .value = try c.p("price {s}, {s} a unit a month, quantity {d}", .{ it.price.id, try c.money(old_m.?, sub.currency), qty }) },
                     }),
                     .proposal = "Move the subscription to the plan the customer has, from the next period, and tell them first. Or put the product back to the plan they pay for.",
-                    .change = .{ .set_price = .{ .item = it.id, .to = pp.id, .was = it.price.id } },
-                    .does = try c.p("Move subscription item {s} from {s} to {s}, keeping its quantity: the next invoice is at the new price. Nothing is charged for the time already invoiced.", .{ it.id, it.price.label(), pp.label() }),
+                    // (from a yearly price to a monthly one is a new billing period: a person's to do)
+                    .change = if (sameInterval(pp, it.price)) .{ .set_price = .{ .item = it.id, .to = pp.id, .was = it.price.id } } else null,
+                    .does = if (sameInterval(pp, it.price)) try c.p("Move subscription item {s} from {s} to {s}, keeping its quantity: the next invoice is at the new price. Nothing is charged for the time already invoiced.", .{ it.id, it.price.label(), pp.label() }) else "",
                     .letter = try c.letter(cu.id, "Your plan", "Your account has the plan \"{s}\", and your subscription is for {s}. From your next billing period we would like to bill the plan you have: {s} instead of {s} a unit a month.\n\nIf you would rather go back to {s}, reply to this message and we will change the account instead.", .{ row.plan, it.price.label(), try c.money(new_m.?, sub.currency), try c.money(old_m.?, sub.currency), it.price.label() }),
                 });
                 // the seats are judged on the plan they should be on, once

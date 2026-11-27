@@ -313,6 +313,49 @@
       });
   }
 
+  // The payment-run check, where the pay file has it: the tools answer
+  // in sentences, shown as they are. A decision about one of its findings
+  // is made in the chat, or with "paymcp decide".
+  var payrun = document.getElementById("payrun");
+  var payrunOut = document.getElementById("payrun-out");
+  var batch = document.getElementById("batch");
+  function payrunAsk(tool, input, busy) {
+    payrunOut.textContent = busy;
+    act(tool, input, function () {
+      payrunOut.textContent = "harness is asking you whether this may run: answer in the bar above this page.";
+    })
+      .then(function (text) {
+        payrunOut.textContent = text;
+      })
+      .catch(function (e) {
+        payrunOut.textContent = e.message;
+      });
+  }
+  document.getElementById("check").addEventListener("click", function () {
+    var name = batch.value.trim();
+    if (!name) {
+      payrunOut.textContent = "Give the batch file's name first.";
+      batch.focus();
+      return;
+    }
+    payrunAsk("payrun_check", { file: name }, "Reading the batch…");
+  });
+  document.getElementById("lookback").addEventListener("click", function () {
+    payrunAsk("payrun_lookback", {}, "Searching the past payments…");
+  });
+  // (the section is shown only where the pay file has a [payrun] part:
+  // harness answers "no such tool" for a server without it)
+  fetch("api/info")
+    .then(answer)
+    .then(function () {
+      return act("payrun_lookback", {});
+    })
+    .then(function (text) {
+      payrun.hidden = false;
+      payrunOut.textContent = text;
+    })
+    .catch(function () {});
+
   more.addEventListener("click", function () {
     more.disabled = true;
     page(shown, false)

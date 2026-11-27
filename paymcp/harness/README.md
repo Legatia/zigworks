@@ -24,6 +24,12 @@ customer where there is one, and your decision: **It is meant to be so**
 again**. Below it, the record: what you asked about, what you dismissed
 and why, and what a later reading no longer found.
 
+- **Payments going out.** Where the pay file has a `[payrun]` section,
+  the page has a box for the payment-run check: give a batch file's name
+  (a file in the pay file's folder) and read what to look at before
+  paying; or search past payments for ones made twice. The answer is the
+  tool's own text. A decision about one of its findings is made in the
+  chat or with `paymcp decide`.
 - The page holds no key and reaches nothing but harness. Each thing it
   reads or writes is a call of one of paymcp's tools through harness's
   gate, as `app:money`, and is in harness's log.

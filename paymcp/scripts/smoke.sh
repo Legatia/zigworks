@@ -347,6 +347,8 @@ try:
     check("a dispute opens to its evidence draft and a note to the customer", "What only you have" in (one.get("evidence") or "") and (one.get("letter") or {}).get("subject") == "A question from your bank about a payment to us" and one.get("can_do") is None, out)
     status, out = act("billing/billing_change", {"key": "paused:sub_gorse", "amount": 2900})
     check("the page can't ask for a change: the tool is not in its manifest", status == 403, out)
+    status, out = act("billing/payrun_check", {"file": "payrun/run-2025-11-17.csv"})
+    check("the page checks a payment run, in the tool's own sentences", status == 200 and "1. Bank details changed: 1230.00 EUR, once" in out and "asked no bank" in out, out)
     status, out = act("billing/billing_refund", {})
     check("a tool the app's manifest doesn't list is refused", status == 403 and "not in the app's acts" in out, out)
 finally:
