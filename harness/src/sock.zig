@@ -175,6 +175,15 @@ pub fn readableNow(h: Handle) bool {
     return sys.poll(h, .in, 0) catch true;
 }
 
+/// Whether the other side closed the connection: its end (or its reset)
+/// is what comes next. Bytes it wrote that wait to be read are no end.
+pub fn ended(h: Handle) bool {
+    if (!(sys.poll(h, .in, 0) catch return true)) return false;
+    var one: [1]u8 = undefined;
+    const n = sys.peek(h, &one) catch |e| return e != error.WouldBlock;
+    return n == 0;
+}
+
 /// Stops both directions of a connection: whoever waits on it wakes up.
 pub fn shutdown(h: Handle) void {
     sys.shutdown(h);
@@ -444,6 +453,18 @@ const unix = struct {
         }
     }
 
+    /// What `recv` would give, left where it is.
+    fn peek(fd: Handle, dest: []u8) Err!usize {
+        const flags: u32 = posix.MSG.PEEK | posix.MSG.DONTWAIT;
+        while (true) {
+            const rc = if (is_linux) linux.recvfrom(fd, dest.ptr, dest.len, flags, null, null) else c.recv(fd, dest.ptr, dest.len, flags);
+            return result(rc) catch |e| switch (e) {
+                error.Interrupted => continue,
+                else => |other| return other,
+            };
+        }
+    }
+
     fn send(fd: Handle, bytes: []const u8) Err!usize {
         while (true) {
             const rc = if (is_linux) linux.sendto(fd, bytes.ptr, bytes.len, send_flags, null, 0) else c.send(fd, bytes.ptr, bytes.len, send_flags);
@@ -665,6 +686,13 @@ const winsock = struct {
         return @intCast(rc);
     }
 
+    /// What `recv` would give, left where it is (MSG_PEEK).
+    fn peek(s: Handle, dest: []u8) Error!usize {
+        const rc = ws.recv(s, dest.ptr, @intCast(@min(dest.len, std.math.maxInt(i32))), 2);
+        if (rc < 0) return lastError();
+        return @intCast(rc);
+    }
+
     fn send(s: Handle, bytes: []const u8) Error!usize {
         const rc = ws.send(s, bytes.ptr, @intCast(@min(bytes.len, std.math.maxInt(i32))), 0);
         if (rc < 0) return lastError();
@@ -740,6 +768,30 @@ test "a_listener_waits_for_a_connection_only_so_long" {
     closeHandle(here);
     var stop: std.atomic.Value(bool) = .init(true);
     try std.testing.expectEqual(null, try l.acceptWithin(std.testing.io, 5000, &stop));
+}
+
+test "ended_tells_a_close_from_more_bytes" {
+    const io = std.testing.io;
+    const l = try Listener.open(0);
+    defer l.close();
+    const there = try connect(io, "127.0.0.1", l.port, 1000);
+    const here = try l.accept();
+    defer closeHandle(here);
+    try std.testing.expect(!ended(here));
+    // more bytes are no end, before they are read or after
+    try std.testing.expectEqual(1, try sys.send(there, "x"));
+    var waited: u32 = 0;
+    while (!readableNow(here) and waited < 2000) : (waited += 5) io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try std.testing.expect(readableNow(here));
+    try std.testing.expect(!ended(here));
+    var one: [1]u8 = undefined;
+    try std.testing.expectEqual(1, try sys.recv(here, &one));
+    try std.testing.expect(!ended(here));
+    // the other side closes
+    closeHandle(there);
+    waited = 0;
+    while (!ended(here) and waited < 2000) : (waited += 5) io.sleep(.fromMilliseconds(5), .awake) catch {};
+    try std.testing.expect(ended(here));
 }
 
 test "no_socket_is_inherited_by_what_harness_starts_windows" {

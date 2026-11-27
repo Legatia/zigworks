@@ -17671,6 +17671,7 @@ const t = std.testing;
 test {
     _ = @import("speech.zig");
     _ = @import("voiceagent.zig");
+    _ = @import("mcpserve.zig");
 }
 
 const Recorder = struct {
