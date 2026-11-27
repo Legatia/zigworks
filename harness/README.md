@@ -58,10 +58,11 @@ OpenRouter, OpenCode Zen, OpenAI or any gateway that speaks the Anthropic
 Messages or OpenAI Chat Completions format (see
 [Models and providers](#models-and-providers)).
 
-**State: 0.3.0, tested on macOS by its own tests: 1189 unit tests (20 of
-them don't run on macOS: Windows or Linux only), among them the browser
+**State: 0.4.0, tested on macOS by its own tests: 1716 unit tests (25 of
+them don't run on macOS: Windows or Linux only, or asking for the
+network), among them the browser
 and login tests against headless Chrome and local pages, and an
-end-to-end script of 109 checks that drives the real binary against
+end-to-end script of 183 checks that drives the real binary against
 stand-ins for omnigate and the other model providers, Telegram (voice
 notes and their files too), a transcription service, feeds, search, three
 MCP servers run as programs (one a shop, ordered from on a tap), and MCP
@@ -83,8 +84,8 @@ Medication reminders, bedtime, habits, the evening message and the
 butler's manner are tested by unit tests with a fake clock, a written log
 and the stand-ins only: no real household or week of habits yet. Away
 mode, trips and the doorbell are tested against stand-ins only (no real
-doorbell, trip, airline or flight-status server yet). An earlier build
-of 0.3.0 also passed its tests in CI on Linux and Windows. Emergencies
+doorbell, trip, airline or flight-status server yet). 0.4.0 also passed
+its tests in CI on Linux and Windows. Emergencies
 (escalation to the household, the leak's fallback, the smoke routine)
 are tested against stand-ins only: no real household, alarm or valve
 yet. Warming the car is tested against a stand-in of carcloud with a
@@ -95,9 +96,12 @@ Credential Manager and process-cleanup checks of HANDOFF-windows-audit.md
 were run by hand. With environments, apps, clones and safe state files
 added, Windows 11 and Linux (WSL, bubblewrap 0.9, OpenSSH 9.6) pass their
 unit tests and the end-to-end script; on macOS 15.7 the sandbox
-(sandbox-exec) and APFS clone tests run with the rest. Nothing has run
-yet against a real omnigate or model provider, Telegram bot,
-transcription service, MCP server, authorization server, website, Home
+(sandbox-exec) and APFS clone tests run with the rest. One day's use on
+Windows 11, in `harness chat` and the desk app, was with a real model
+(Anthropic's). Nothing has run
+yet against a real omnigate, Telegram bot,
+transcription service, MCP server, other agent at the proxy (Claude Code,
+Codex, Hermes), authorization server, website, Home
 Assistant, Smartcar or mail server; mail (the butler's address and your
 mailbox) is tested against a stand-in of mailmcp, and mailmcp against
 its own stand-in IMAP and SMTP server.** See [Limits](#limits).
@@ -4228,7 +4232,7 @@ only while `harness run` holds the folder and has ticked in the last 90 s;
   below it; a site needs a dot (except `localhost`), but harness doesn't
   know the public suffix list, so set the site no wider than needed.
 
-Not in 0.3.0: the Agent Client Protocol server, desktop use (headdesk), a
+Not in 0.4.0: the Agent Client Protocol server, desktop use (headdesk), a
 sandbox per command, email, WhatsApp, Slack and voice as conversations
 (voice notes in Telegram and Home Assistant's voice satellites are in;
 spoken replies in Telegram are not), a reply in the room after you allow
@@ -4338,7 +4342,7 @@ zig build                     # zig-out/harness-desk.app, for this Mac
 zig build test --summary all  # unit tests
 zig build smoke               # the app in a window against a stand-in harness (test/fake_harness.py);
                               # DESK_SMOKE_HARNESS=PATH sets up a real harness once more
-scripts/package-macos.sh 0.3.0 harness-desk-0.3.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
+scripts/package-macos.sh 0.4.0 harness-desk-0.4.0-macos.zip   # both kinds of Mac, with harness and the fit files, signed ad hoc
 ```
 
 The package needs the fit files: `harness/scripts/pack-desk-assets.sh`
@@ -4414,7 +4418,7 @@ and SHA-256 in the script, which downloads and checks it):
     zig build test                             # the decisions: no window needed
     zig build app -Dwebview2=../../webview2    # zig-out/harness-desk/
     zig build smoke -Dwebview2=../../webview2  # in a window, against a stand-in harness (Git Bash, python)
-    scripts/package-windows.sh 0.3.0 harness-desk-0.3.0-windows.zip ../../webview2   # with harness.exe and the fit files
+    scripts/package-windows.sh 0.4.0 harness-desk-0.4.0-windows.zip ../../webview2   # with harness.exe and the fit files
 
 `DESK_SMOKE_HARNESS=PATH\harness.exe` adds the setup once more against
 that real harness (a data folder and a file store of the smoke's own, a
@@ -4484,7 +4488,7 @@ desktop's to choose.
     zig build test     # the decisions: no window needed
     zig build app      # zig-out/harness-desk/harness-desk
     zig build smoke    # in a window (under xvfb-run where there is no display), against a stand-in harness
-    scripts/package-linux.sh 0.3.0 harness-desk-0.3.0-linux-x86_64.tar.gz   # with harness and the fit files
+    scripts/package-linux.sh 0.4.0 harness-desk-0.4.0-linux-x86_64.tar.gz   # with harness and the fit files
 
 `DESK_SMOKE_HARNESS=PATH/harness` and `DESK_ASSETS=none` as on Windows.
 
