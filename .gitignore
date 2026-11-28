@@ -1,2 +1,6 @@
 zig-out/
 .zig-cache/
+
+# paymcp writes its record beside the pay file
+*.record.jsonl
+*.payments.jsonl

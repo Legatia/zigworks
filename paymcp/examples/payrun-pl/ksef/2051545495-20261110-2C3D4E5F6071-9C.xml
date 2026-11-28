@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A made-up invoice in the layout of KSeF's FA(3), for trying paymcp. Not a real document. -->
+<Faktura xmlns="http://crd.gov.pl/wzor/2025/06/25/13775/">
+	<Naglowek>
+		<KodFormularza kodSystemowy="FA (3)" wersjaSchemy="1-0E">FA</KodFormularza>
+		<WariantFormularza>3</WariantFormularza>
+		<DataWytworzeniaFa>2026-11-10T09:30:47Z</DataWytworzeniaFa>
+		<SystemInfo>paymcp example</SystemInfo>
+	</Naglowek>
+	<Podmiot1>
+		<DaneIdentyfikacyjne>
+			<NIP>2051545495</NIP>
+			<Nazwa>Hurtownia Quillon S.A.</Nazwa>
+		</DaneIdentyfikacyjne>
+		<Adres>
+			<KodKraju>PL</KodKraju>
+			<AdresL1>ul. Przykladowa 1</AdresL1>
+			<AdresL2>00-001 Warszawa</AdresL2>
+		</Adres>
+	</Podmiot1>
+	<Podmiot2>
+		<DaneIdentyfikacyjne>
+			<NIP>1111111111</NIP>
+			<Nazwa>Fernhill sp. z o.o.</Nazwa>
+		</DaneIdentyfikacyjne>
+	</Podmiot2>
+	<Fa>
+		<KodWaluty>PLN</KodWaluty>
+		<P_1>2026-11-10</P_1>
+		<P_2>FV/88/2026</P_2>
+		<P_13_1>4000</P_13_1>
+		<P_14_1>920</P_14_1>
+		<P_15>4920</P_15>
+		<RodzajFaktury>VAT</RodzajFaktury>
+		<Platnosc>
+			<TerminPlatnosci>
+				<Termin>2026-12-01</Termin>
+			</TerminPlatnosci>
+			<FormaPlatnosci>6</FormaPlatnosci>
+			<RachunekBankowy>
+				<NrRB>83102010260000040270001111</NrRB>
+			</RachunekBankowy>
+		</Platnosc>
+	</Fa>
+</Faktura>

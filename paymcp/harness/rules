@@ -1,0 +1,30 @@
+# Add these lines to the rules file in your harness data folder.
+
+# The weekly reading: it may read, and never decides.
+[schedule:billing-audit]
+allow mcp billing/billing_audit *
+allow mcp billing/billing_finding *
+allow mcp billing/billing_record *
+allow mcp billing/billing_draft *
+allow mcp billing/dispute_evidence *
+
+# The Money page: it may read, and write the decision you press.
+[app:money]
+allow mcp billing/billing_audit *
+allow mcp billing/billing_finding *
+allow mcp billing/billing_record *
+allow mcp billing/billing_draft *
+allow mcp billing/billing_decide *
+allow mcp billing/payrun_check *
+allow mcp billing/payrun_lookback *
+allow mcp billing/payrun_books *
+allow mcp billing/bills_watch *
+
+# The daily readings of the books and of the bills: they may read, and never decide.
+[schedule:books]
+allow mcp billing/payrun_books *
+
+[schedule:bill-watch]
+allow mcp billing/bills_watch *
+
+[all]
