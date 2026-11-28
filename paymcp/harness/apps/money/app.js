@@ -270,11 +270,13 @@
     data("billing_record")
       .then(function (r) {
         record.textContent = "";
-        if (!r.first) {
+        if (!r.first && !r.decided) {
           recordState.textContent = "The record is empty: the first reading starts it.";
           return;
         }
-        recordState.textContent = r.readings + (r.readings === 1 ? " reading" : " readings") + " since " + r.first + ", the last on " + r.last + ". Kept on this computer, in " + r.path + ".";
+        recordState.textContent = r.first
+          ? r.readings + (r.readings === 1 ? " reading" : " readings") + " since " + r.first + ", the last on " + r.last + ". Kept on this computer, in " + r.path + "."
+          : "No reading of a billing account yet. Kept on this computer, in " + r.path + ".";
         part("Asked, waiting for an answer", r.asked, true, true);
         part("Dismissed as intended", r.intended, true, true);
         part("No longer found", r.gone, false, false);
@@ -314,34 +316,96 @@
   }
 
   // The payment-run check, where the pay file has it: the tools answer
-  // in sentences, shown as they are. A decision about one of its findings
-  // is made in the chat, or with "paymcp decide".
+  // in sentences, shown as they are. Under an answer that lists findings
+  // (each ends with its key in brackets) is a row to write your decision
+  // about one of them into the record.
   var payrun = document.getElementById("payrun");
   var payrunOut = document.getElementById("payrun-out");
   var batch = document.getElementById("batch");
-  function askInto(out, tool, input, busy) {
+  // The keys of the findings an answer lists: each on a line of its own, in brackets.
+  function keysIn(text) {
+    var keys = [];
+    var re = /^\s+\[([^\]\n]+)\]\s*$/gm;
+    var m;
+    while ((m = re.exec(text))) if (keys.indexOf(m[1]) < 0) keys.push(m[1]);
+    return keys;
+  }
+  // Your decision about one of them, written by billing_decide as for any
+  // finding. The answer above is not read again by itself (a reading can
+  // cost money): its own line says what was written.
+  function decideRow(box, text) {
+    box.textContent = "";
+    var keys = keysIn(text);
+    if (!keys.length) return;
+    var pick = document.createElement("select");
+    keys.forEach(function (k) {
+      var o = el("option", null, k);
+      o.value = k;
+      pick.append(o);
+    });
+    var why = document.createElement("input");
+    why.type = "text";
+    why.maxLength = 500;
+    why.placeholder = "Why it is meant to be so, or who you asked";
+    var said = el("p", "meta");
+    function decide(decision, needs) {
+      return function () {
+        var reason = why.value.trim();
+        if (needs && !reason) {
+          said.textContent = needs;
+          why.focus();
+          return;
+        }
+        said.textContent = "Writing it down…";
+        act("billing_decide", { key: pick.value, decision: decision, reason: reason }, function () {
+          said.textContent = "harness is asking you: answer in the bar above this page.";
+        })
+          .then(function (answerText) {
+            said.textContent = answerText.trim() + " Read again to see the list as it is now.";
+            loadRecord();
+          })
+          .catch(function (e) {
+            said.textContent = "Not written: " + e.message;
+          });
+      };
+    }
+    function button(label, decision, needs) {
+      var b = el("button", null, label);
+      b.type = "button";
+      b.addEventListener("click", decide(decision, needs));
+      return b;
+    }
+    var row = el("div", "row");
+    row.append(pick, why, button("It is meant to be so", "intended", "Say why it is meant to be so: the reason is kept with the decision."), button("I asked someone", "asked", "Say who was asked."), button("Open again", "open", null));
+    box.append(el("p", "meta", "Your answer about one of these, kept in the record:"), row, said);
+  }
+  function askInto(out, box, tool, input, busy) {
     out.textContent = busy;
+    box.textContent = "";
     act(tool, input, function () {
       out.textContent = "harness is asking you whether this may run: answer in the bar above this page.";
     })
       .then(function (text) {
         out.textContent = text;
+        decideRow(box, text);
       })
       .catch(function (e) {
         out.textContent = e.message;
       });
   }
+  var payrunDecide = document.getElementById("payrun-decide");
   function payrunAsk(tool, input, busy) {
-    askInto(payrunOut, tool, input, busy);
+    askInto(payrunOut, payrunDecide, tool, input, busy);
   }
   // The books and the bill watch: read only when asked for (a reading of
   // AWS's costs is charged for), and shown as the tools say it.
   var othersOut = document.getElementById("others-out");
+  var othersDecide = document.getElementById("others-decide");
   document.getElementById("books").addEventListener("click", function () {
-    askInto(othersOut, "payrun_books", {}, "Reading the books…");
+    askInto(othersOut, othersDecide, "payrun_books", {}, "Reading the books…");
   });
   document.getElementById("bills").addEventListener("click", function () {
-    askInto(othersOut, "bills_watch", {}, "Reading what was spent…");
+    askInto(othersOut, othersDecide, "bills_watch", {}, "Reading what was spent…");
   });
   document.getElementById("check").addEventListener("click", function () {
     var name = batch.value.trim();
@@ -365,6 +429,7 @@
     .then(function (text) {
       payrun.hidden = false;
       payrunOut.textContent = text;
+      decideRow(payrunDecide, text);
     })
     .catch(function () {});
 

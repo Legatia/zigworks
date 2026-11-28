@@ -99,6 +99,7 @@ pub const Kind = enum {
     account_unregistered,
     invoice_account,
     invoice_amount,
+    invoice_paid,
     // ...and with a ledger read (ledger.zig)
     details_changed,
     // the bill watch (bills.zig)
@@ -145,6 +146,7 @@ pub const Kind = enum {
             .account_unregistered => "An account the tax office's list doesn't have",
             .invoice_account => "The invoice names another account",
             .invoice_amount => "The invoice is for another amount",
+            .invoice_paid => "The invoice says it is paid",
             .details_changed => "Bank details changed in the books",
             .cost_jump => "A day's bill far above the usual",
             .cost_doubled => "A cost that doubled",

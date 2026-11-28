@@ -87,6 +87,21 @@ pub fn payrunKind(kind: []const u8) bool {
     return k.payrun();
 }
 
+/// Whether the record's lists leave an entry out: a finding of a payment
+/// run, of the books or of the bill watch that nobody decided about. Those
+/// are of their run and are never called open or gone here; what a person
+/// said about one is listed as any decision is.
+fn unlisted(e: Entry) bool {
+    return payrunKind(e.kind) and (e.decision == .open or e.gone != null);
+}
+
+/// Whether anything a person decided is in the book.
+fn anyDecided(b: *const Book) bool {
+    var it = b.entries.iterator();
+    while (it.next()) |kv| if (kv.value_ptr.decision != .open) return true;
+    return false;
+}
+
 fn apply(a: Allocator, b: *Book, v: jv.Value) !bool {
     const at = jv.int(jv.get(v, "at")) orelse return false;
     const event = jv.str(jv.get(v, "event")) orelse return false;
@@ -422,11 +437,15 @@ fn listLine(a: Allocator, o: *std.ArrayList(u8), key: []const u8, e: Entry, at: 
 /// found, what was dismissed and why.
 pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     var o: std.ArrayList(u8) = .empty;
-    const first = b.first orelse {
+    if (b.first) |first| {
+        try o.print(a, "paymcp's record {s}: {d} reading{s} since {s}, the last on {s}.\n\n", .{ path, b.readings, plural(b.readings), try model.day(a, first), try model.day(a, b.last.?) });
+    } else if (anyDecided(b)) {
+        // (a pay file for payment runs or bills only: no billing account is read)
+        try o.print(a, "paymcp's record {s}: no reading of a billing account; what was decided about payment runs and bills is below.\n\n", .{path});
+    } else {
         try o.print(a, "paymcp's record {s} is empty: the first audit starts it.\n", .{path});
         return o.items;
-    };
-    try o.print(a, "paymcp's record {s}: {d} reading{s} since {s}, the last on {s}.\n\n", .{ path, b.readings, plural(b.readings), try model.day(a, first), try model.day(a, b.last.?) });
+    }
     var open_t: Tally = .{};
     var asked_t: Tally = .{};
     var intended_t: Tally = .{};
@@ -434,7 +453,7 @@ pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
-        if (payrunKind(e.kind)) continue;
+        if (unlisted(e)) continue;
         if (e.gone != null) {
             if (e.decision != .intended) try gone_t.put(a, e);
         } else switch (e.decision) {
@@ -460,7 +479,7 @@ pub fn text(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
         var it2 = b.entries.iterator();
         while (it2.next()) |kv| {
             const e = kv.value_ptr.*;
-            if (payrunKind(e.kind)) continue;
+            if (unlisted(e)) continue;
             const here = switch (p.what) {
                 'a' => e.gone == null and e.decision == .asked,
                 'i' => e.gone == null and e.decision == .intended,
@@ -487,7 +506,7 @@ pub fn json(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
     var it = b.entries.iterator();
     while (it.next()) |kv| {
         const e = kv.value_ptr.*;
-        if (payrunKind(e.kind)) continue;
+        if (unlisted(e)) continue;
         const part: usize = if (e.gone != null) (if (e.decision == .intended) continue else 3) else switch (e.decision) {
             .open => 0,
             .asked => 1,
@@ -516,6 +535,7 @@ pub fn json(a: Allocator, b: *const Book, path: []const u8) ![]const u8 {
         .path = path,
         .readings = b.readings,
         .first = if (b.first) |x| @as(?[]const u8, try model.day(a, x)) else null,
+        .decided = anyDecided(b),
         .last = if (b.last) |x| @as(?[]const u8, try model.day(a, x)) else null,
         .open = parts[0],
         .asked = parts[1],
@@ -651,4 +671,30 @@ test "a_persons_decision_is_kept_with_its_reason" {
     _ = try note(a, &b, .{ .findings = &.{bigger}, .now = day0 + 3 * week });
     const late = try decide(a, &b, "paused:sub_g", .open, "", day0 + 3 * week);
     try t.expect(std.mem.indexOf(u8, late.refused, "is no longer found (since 2026-12-14)") != null);
+}
+
+test "what_a_person_said_about_a_payment_run_is_in_the_record_too" {
+    var arena: std.heap.ArenaAllocator = .init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var b: Book = .{};
+    // a payment run's findings: written down, none of them a reading of the billing account
+    _ = try note(a, &b, .{ .findings = &.{
+        fnd(.account_changed, "account_changed:run.csv:5260001246", "Nordlys Print", 123000, .once),
+        fnd(.new_supplier, "new_supplier:run.csv:quillon", "Quillon Supplies", 51240, .once),
+    }, .now = day0, .payrun = true });
+    // nobody decided anything: the record has nothing to list
+    try t.expect(std.mem.indexOf(u8, try text(a, &b, "pay.record.jsonl"), "is empty") != null);
+    _ = try decide(a, &b, "account_changed:run.csv:5260001246", .intended, "called Anna on the old number", day0 + 60);
+    const said = try text(a, &b, "pay.record.jsonl");
+    try t.expect(std.mem.indexOf(u8, said, "no reading of a billing account; what was decided about payment runs and bills is below.") != null);
+    try t.expect(std.mem.indexOf(u8, said, "Dismissed as intended: 1 finding, 1230.00 EUR once.") != null);
+    try t.expect(std.mem.indexOf(u8, said, "Bank details changed: 1230.00 EUR, once  Nordlys Print: \"called Anna on the old number\"  [account_changed:run.csv:5260001246]") != null);
+    // the one nobody decided about is of its run: not called open here
+    try t.expect(std.mem.indexOf(u8, said, "Open now: 0 findings.") != null);
+    try t.expect(std.mem.indexOf(u8, said, "Quillon") == null);
+    const data = jv.parse(a, try json(a, &b, "pay.record.jsonl")).?;
+    try t.expectEqual(@as(?i64, 1), jv.int(jv.at(data, &.{ "intended", "n" })));
+    try t.expectEqual(@as(?bool, true), jv.boolean(jv.get(data, "decided")));
+    try t.expectEqual(@as(?i64, 0), jv.int(jv.at(data, &.{ "open", "n" })));
 }

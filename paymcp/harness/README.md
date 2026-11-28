@@ -28,13 +28,15 @@ and why, and what a later reading no longer found.
   the page has a box for the payment-run check: give a batch file's name
   (a file in the pay file's folder) and read what to look at before
   paying; or search past payments for ones made twice. The answer is the
-  tool's own text. A decision about one of its findings is made in the
-  chat or with `paymcp decide`.
+  tool's own text. Under an answer that lists findings is a row for
+  your decision about one of them: pick its key, say why, press. It is
+  written into the same record.
 - **The books, and the bills that grow.** Under "Other readings" are two
   buttons: the payment-run check from your accounting program (the pay
   file's `[ledger]`), and the bill watch (`[bills]`). Each reads only
-  when you press it, and shows the tool's own text; where the section or
-  the key is missing, the text says so.
+  when you press it, and shows the tool's own text, with the same row
+  for your decision under it; where the section or the key is missing,
+  the text says so.
 - The page holds no key and reaches nothing but harness. Each thing it
   reads or writes is a call of one of paymcp's tools through harness's
   gate, as `app:money`, and is in harness's log.

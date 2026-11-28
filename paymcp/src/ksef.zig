@@ -39,8 +39,9 @@ pub const Invoice = struct {
     factor_accounts: []const []const u8 = &.{},
     /// The invoices a correction corrects, by their numbers.
     corrects: []const []const u8 = &.{},
-    /// The invoice says it was paid when it was issued.
+    /// The invoice says it was paid when it was issued, and on which day ("": not said).
     paid: bool = false,
+    paid_on: []const u8 = "",
 
     pub fn correction(i: Invoice) bool {
         return std.mem.startsWith(u8, i.kind, "KOR");
@@ -216,6 +217,8 @@ pub fn parse(a: Allocator, text: []const u8, file: []const u8, diag: *Diag) !Inv
             inv.kind = l.text;
         } else if (std.mem.eql(u8, p, "Fa/Platnosc/Zaplacono")) {
             inv.paid = std.mem.eql(u8, l.text, "1");
+        } else if (std.mem.eql(u8, p, "Fa/Platnosc/DataZaplaty")) {
+            inv.paid_on = l.text;
         } else if (std.mem.eql(u8, p, "Fa/Platnosc/RachunekBankowy/NrRB")) {
             try accounts.append(a, try nrb(a, l.text));
         } else if (std.mem.eql(u8, p, "Fa/Platnosc/RachunekBankowyFaktora/NrRB")) {
@@ -321,6 +324,23 @@ pub fn compare(a: Allocator, list: []const payrun.Row, invoices: []const Invoice
                 .proposal = "The invoice file is what the supplier issued through the tax office's system. An account that differs from it was changed on the way: in your supplier record, in the batch, or by a message asking you to pay elsewhere. Call the supplier on a number you had before, and pay to the invoice's account unless they confirm the other. If they did ask for it (a new bank, a factor), say so (decide ... intended).",
             });
         }
+
+        // an invoice marked as paid when it was issued (cash, a card), about to be paid again
+        if (inv.paid) try out.append(a, .{
+            .kind = .invoice_paid,
+            .key = try std.fmt.allocPrint(a, "invoice_paid:{s}:{s}:{s}", .{ batch, r.id, bill }),
+            .customer = r.id,
+            .name = r.supplier,
+            .amount = r.amount,
+            .currency = r.currency,
+            .per = .once,
+            .what = try std.fmt.allocPrint(a, "{s} is to be paid {s} for invoice {s}; the invoice says it was paid already{s}.", .{ r.supplier, try model.money(a, r.amount, r.currency), inv.number, if (inv.paid_on.len > 0) try std.fmt.allocPrint(a, ", on {s}", .{inv.paid_on}) else "" }),
+            .rows = try a.dupe(audit.Row, &.{
+                .{ .source = src, .value = row_text },
+                .{ .source = inv.file, .value = try std.fmt.allocPrint(a, "{s}; marked as paid{s}", .{ inv_text, if (inv.paid_on.len > 0) try std.fmt.allocPrint(a, " on {s}", .{inv.paid_on}) else "" }) },
+            }),
+            .proposal = "Look for that payment before paying again: an invoice paid by card or in cash when it was issued is marked so by the seller. If it was not paid and the mark is the seller's mistake, say so (decide ... intended).",
+        });
 
         // the amount against the invoice's sum, less its corrections
         if (std.mem.eql(u8, r.currency, inv.currency)) {
@@ -437,5 +457,12 @@ test "a_batch_beside_its_invoices" {
         over = f;
     };
     try t.expectEqual(@as(i64, 23050), over.?.amount);
+    // an invoice the seller marked as paid when issuing it
+    const cash = try parse(a, "<Faktura><Podmiot1><DaneIdentyfikacyjne><NIP>3245174504</NIP><Nazwa>Nordlys Print</Nazwa></DaneIdentyfikacyjne></Podmiot1><Fa><KodWaluty>PLN</KodWaluty><P_1>2026-11-03</P_1><P_2>NP/2026/140</P_2><P_15>1230.50</P_15><RodzajFaktury>VAT</RodzajFaktury><Platnosc><Zaplacono>1</Zaplacono><DataZaplaty>2026-11-03</DataZaplaty><FormaPlatnosci>2</FormaPlatnosci></Platnosc></Fa></Faktura>", "paid.xml", &d);
+    try t.expect(cash.paid);
+    const again = try compare(a, list[0..1], &.{cash}, "run.csv");
+    try t.expectEqual(@as(usize, 1), again.findings.len);
+    try t.expect(again.findings[0].kind == .invoice_paid);
+    try t.expectEqualStrings("Nordlys Print is to be paid 1230.50 PLN for invoice NP/2026/140; the invoice says it was paid already, on 2026-11-03.", again.findings[0].what);
     try t.expect(std.mem.indexOf(u8, over.?.what, "the invoice is for 1230.50 PLN and its corrections bring it to 1000.00 PLN") != null);
 }

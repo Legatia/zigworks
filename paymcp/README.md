@@ -57,8 +57,9 @@ dashboard before trusting a number. The payment-run check has read
 made-up files only: no business's own export yet. What 0.5.0 adds (the
 bill watch, the readers for Poland, the books) was written from each
 service's documentation as read on 2026-11-27 and has met stand-ins only:
-no real account of Anthropic, OpenAI, AWS or Xero, and no question to
-the tax office's list from paymcp itself. See [Limits](#limits).
+no real account of Anthropic, OpenAI, AWS or Xero. The one exception is
+the tax office's list: paymcp asked the Ministry's own test service on
+2026-11-28 and read its answers. See [Limits](#limits).
 
 ## Quick start, without an account
 
@@ -376,6 +377,7 @@ whitelist = yes        ; ask the tax office's list of VAT payers about each acco
 |---|---|
 | The invoice names another account | The batch pays to an account that is not on the supplier's invoice as issued through KSeF (a factor's account on the invoice counts as on it). |
 | The invoice is for another amount | The batch pays more than the invoice's sum, less the corrections to it that are among the files. Paying less is not asked about. |
+| The invoice says it is paid | The seller marked the invoice as paid when issuing it (a card, cash), and the batch pays it. |
 | An account the tax office's list doesn't have | The list answers that the account is not registered to the supplier's tax number on the day of the check. |
 
 - **KSeF invoices** are read as files: the structured invoices (the FA(2)
@@ -787,7 +789,8 @@ record through the command line and over MCP against `paymcp-sim`. And
 for what 0.5.0 adds: the bill watch's rules and its three providers
 (pages, a missing key, a refused key, AWS's signature against the
 example in AWS's documentation and checked by the stand-in), a KSeF
-invoice read and a batch set beside its invoices and corrections, the
+invoice read and a batch set beside its invoices and corrections (and
+an invoice marked as paid), the
 question to the list of VAT payers (registered, not, refused, the day's
 limit), and the books read twice with bank details that changed.
 `paymcp-sim` stands in for all of them: `--cloud KEY`, `--books SECRET`,
@@ -807,7 +810,7 @@ and the list of VAT payers always.
 - Not looked for yet: payments taken twice or refunded twice, early fraud warnings, taxes, trials that never convert, coupons past their redeem-by date.
 - Without changes turned on it proposes and does not fix: changing a subscription, sending an invoice or reminding a customer is done in the dashboard, or from your own mail, by a person.
 - The payment-run check has read made-up files only. Real exports name their columns in many ways and languages: where a heading isn't one it knows, rename it; nothing is guessed. It matches a supplier by tax number or by name as written, so one supplier under two spellings is two. It knows only the payments it was given.
-- **The bill watch, the readers for Poland and the books have met stand-ins only.** Each was written from the service's documentation as read on 2026-11-27. Not known until tried on a real account: whether OpenAI's cost figures are in dollars as taken here (its reference shows `0.06` `usd` and doesn't say), how late a day's figures settle at each provider, what the list of VAT payers answers for a supplier's collective (virtual) account, and how Xero names things in an organisation that isn't its demo. The reader of KSeF files does take all 27 example invoices the Ministry publishes for FA(3).
+- **The bill watch, the reader of KSeF files and the books have met stand-ins only; the list of VAT payers has met the Ministry's test service.** On 2026-11-28 paymcp asked `wykazpodatnikowvat-test.mf.gov.pl` about the Ministry's published test numbers: two accounts not registered (each with its confirmation number), a tax number it calls invalid (WL-115) and an account it calls invalid (WL-111) came back and were read as written here. A "registered" answer was not seen: the test data pairs no account with a taxpayer. The production list was not asked. Each of the others was written from the service's documentation as read on 2026-11-27. Not known until tried on a real account: whether OpenAI's cost figures are in dollars as taken here (its reference shows `0.06` `usd` and doesn't say), how late a day's figures settle at each provider, what the list of VAT payers answers for a supplier's collective (virtual) account, and how Xero names things in an organisation that isn't its demo. The reader of KSeF files does take all 27 example invoices the Ministry publishes for FA(3).
 - The bill watch has no rule for a service that costs and shows no use: the cost reports don't say what was used. It knows lines (models, services), not keys or projects.
 - The books: one accounting program, one way in, and that way closes to new apps on 1 December 2026 ([The books](#the-books)). QuickBooks is not read: it gives only the last four digits of a supplier's account.
 - KSeF invoices are read from files you put there. An invoice that isn't in the folder isn't known; a payment with no bill number, or a supplier matched by neither tax number nor name, is set beside nothing.
