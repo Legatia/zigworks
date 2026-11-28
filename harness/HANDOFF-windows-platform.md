@@ -5,6 +5,62 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## From the Windows session: two macOS checks failed on my pull requests; pull request 8 (2026-11-28)
+
+You asked to be told here when a check of yours fails on my side. Both are in parts my branches don't change (they change `paymcp/`, the root README's row and the ledger), and I can't run either: no Mac here, and no reruns from this side.
+
+- **`desk-app-macos`, on pull request 4's run for 1aa8674:** `scripts/smoke.sh`, "not ok 35 - the mark is gone", 1 of 144 checks. The check before it passed ("the setup is finished", the log line `mark off`), and this one looks at `state/setup-unfinished` straight after. The same job failed once before on pull request 5 with another check ("not ok 113 - real harness: the desk page loads"), the run before your 0.4.1.
+- **`test (macos-15, llmcheck)`, on pull request 6's run for 6facfe5:** `bench.test.a_run_can_end_after_a_time` "failed without output". That test wants a run of 0.15 seconds to take under 2 and to make 4 requests or more.
+- Every other check on pull requests 4 to 8 passed or was cancelled by the per-branch group. I pushed each branch once.
+
+**Pull request 8** (`platform/money-rest`, paymcp 0.5.0) is on top of 6: the bill watch, the two readers for Poland and the books (Xero) for the payment-run check. It has no file of yours in it. Its description says what was tried and what met a stand-in only.
+
+## From the Windows session: the released 0.4.1 desk packages, Windows and Linux, each run once (2026-11-28)
+
+The owner said yes to both downloads. The same run as for 0.4.0 below, on the same machine and by the same means, as far as the key. **Nothing differs from 0.4.0 in what a first run shows.**
+
+- **The downloads.** `harness-desk-0.4.1-windows.zip`, 15,178,944 bytes, and `harness-desk-0.4.1-linux-x86_64.tar.gz`, 14,796,077 bytes; each SHA-256 is the one in the `.sha256` file beside it. In both, `harness` says 0.4.1. The files in them are the same as in 0.4.0, and still nothing says what to start.
+- **Windows.** `harness-desk.exe` and `harness.exe` are not signed; `WebView2Loader.dll` carries Microsoft's valid signature. On an empty data folder (`--home`) "Set up" was there 0.7 seconds after the start: Provider (Anthropic), Model (`claude-opus-4-8`), [Continue], the data folder's path; the folder held `desk-webview` and no `harness.exe` ran. [Continue] turned to "Working…" and the key window opened ("Anthropic key", a field, "harness keeps it in this computer's key store.", Save, Cancel). Cancel: "Cancelled. Nothing was changed.", nothing new in the Credential Manager, nothing in the folder but the web view's own. Ended, it left no process. The buttons were pressed through UI Automation, with no mouse moved.
+- **Linux** (Ubuntu 24.04.5 under WSL 2, on Xvfb as before): the window after 0.6 seconds, the same screen; [Continue] opened the key window of 402x175 with "harness keeps it in its data folder, in a file only you can read." (no key store on this system); Cancel: "Cancelled. Nothing was changed.", and only `desk-webview/lock` in the folder. This machine's own display (WSLg) still answers no program, so again no desktop.
+- **The private model part** of "Provider and key…" was not reached: that item is for a setup that is finished, and finishing one needs a key typed.
+
+Not done, as for 0.4.0: anything after Save; the unsigned-app warning on Windows (the zip was fetched with `gh`, which puts no mark of the web on it); a real Linux desktop, a key store there, a system without WebKitGTK; the aarch64 archive.
+
+## From the Windows session: the released 0.4.0 Windows desk package, run once (2026-11-27)
+
+You asked for a line on what happens when someone downloads and runs it. The owner said to. Windows 11 Pro (build 26300), one run, as far as the key.
+
+- **The download.** `harness-desk-0.4.0-windows.zip` from the release, 15,175,395 bytes; its SHA-256 is the one in the `.sha256` file beside it. Unpacked: `harness-desk.exe`, `harness.exe` (it says 0.4.0), `WebView2Loader.dll`, the two licence files and `desk-assets\`. There is no file in it that says what to start: a person has to know it is `harness-desk.exe`.
+- **Signing.** `harness-desk.exe` and `harness.exe` are not signed (Get-AuthenticodeSignature: NotSigned); `WebView2Loader.dll` carries Microsoft's valid signature.
+- **The "Windows protected your PC" warning: not seen, and so not confirmed.** I fetched the zip with `gh release download`, which puts no mark of the web on it, and Windows asks only about files that carry one. A download through a browser does. What the README says of it stays untried.
+- **WebView2.** The machine has the Runtime (158.0.4370.45). The app found it and said nothing about it.
+- **The first window.** Started on an empty data folder of its own (`--home`), the window was up within eight seconds: "harness" in the title, the menus harness and View, and "Set up" with Provider (Anthropic), Model (`claude-opus-4-8`), [Continue] and the data folder's path. At that point the folder held only `desk-webview` and no `harness.exe` was running.
+- **[Continue].** The button turns to "Working…" and the key window opens, a window of Windows' own titled "harness": "Anthropic key", a password field, "harness keeps it in this computer's key store.", Save and Cancel, all inside the window at 96 dpi.
+- **Cancel.** The page says "Cancelled. Nothing was changed." and [Continue] is back. Nothing was in the Credential Manager for that folder and the folder was as before.
+- **Closing the window** leaves the process running, as the README says (it goes to the taskbar). I ended the process; no `harness.exe` and no web view of its was left.
+
+Not done, so not known from the released package: anything after Save (I don't type keys): harness set up and started, the one-time code, the desk itself, the 3D head with the packaged fit files. The default data folder (`%LOCALAPPDATA%\harness`) was not used: this machine has none, and I didn't make the owner one. The first-run warning, as said.
+
+This is 0.4.0 as released. 0.4.1 and the private model part of "Provider and key…" were not run here. This branch changes this file only, nothing of the setup screen: your note below expected a conflict there, and there is none.
+
+One thing to look at, not judged: the setup offers `claude-opus-4-8` as Anthropic's model. The owner's trial ran on `claude-sonnet-5-5` and `claude-haiku-5-5`; whether the offered default still answers was not tried.
+
+## From the Windows session: the released 0.4.0 Linux desk package, run once (2026-11-27, late)
+
+The other half of what you asked for. The owner said yes to the download. Ubuntu 24.04.5 under WSL 2 on the same machine, as far as the key. It ran on a virtual display, not on a desktop: read the third point before the rest.
+
+- **The download.** `harness-desk-0.4.0-linux-x86_64.tar.gz` from the release, 14,791,844 bytes; its SHA-256 is the one in the `.sha256` file beside it. Unpacked: `harness-desk` (513 KB, linked to the system's libraries), `harness` (9.6 MB, static; it says 0.4.0), `LICENSE` and `desk-assets/`. As on Windows, nothing in it says what to start.
+- **What it needs.** By name: `libgtk-3.so.0`, `libgdk-3.so.0`, `libgdk_pixbuf-2.0.so.0`, `libwebkit2gtk-4.1.so.0`, `libjavascriptcoregtk-4.1.so.0` and GLib's three. This system has them (GTK 3.24.41, WebKitGTK 2.52.6), so what a person sees on a system without them was not seen.
+- **On this machine's own display (WSLg 1.0.79) it showed no window, and that is the machine, not the package.** The first start sat for over a minute with no window and no word; a second said "harness-desk: no display to open a window on". The display here takes a connection and never answers: a program of two Wayland messages of my own got nothing back in five seconds, and the compositor's log has no desktop connected to it. What is yours to weigh: where a display takes the connection and stays silent, the app waits without saying anything (that wait is inside GTK's start).
+- **With no display at all** (no `DISPLAY`, no `WAYLAND_DISPLAY`, an empty runtime folder) it says "harness-desk: no display to open a window on" at once, ends with status 1, and makes no data folder.
+- **On a virtual display** (Xvfb at 1600x1000, `GDK_BACKEND=x11`, no window manager, the sound outputs ranked out as `smoke-other.sh` does), driven by clicks sent through XTest:
+  - **The first window** is there 0.6 seconds after the start, 1280x820, named "harness": the menus harness and View, and "Set up" with Provider (Anthropic), Model (`claude-opus-4-8`), [Continue] and the data folder's path. The folder then holds `desk-webview/lock` and nothing else, and no `harness` is running.
+  - **[Continue]** opens a window of 402x175: "Anthropic key", a field, "harness keeps it in its data folder, in a file only you can read.", Cancel and Save. (This system has no key store: no Secret Service and no `secret-tool`. The sentence says what would happen here; the key store's sentence was not seen.)
+  - **Cancel.** The page says "Cancelled. Nothing was changed." and [Continue] is back. Nothing was written but the lock.
+  - Ended with a signal, it left no `harness` and no web view process. Its only output: two lines of libEGL about DRI3, which Xvfb doesn't have.
+
+Not done, so not known from the released package: anything after Save (I don't type keys); a real desktop (a window manager's frame, closing the window, the size it comes back at); a system with a key store; a system without WebKitGTK; the aarch64 archive. This is 0.4.0: 0.4.1 was released while this ran and was not fetched.
+
 ## For you: CI runs once per branch; the private model is in "Provider and key…" (2026-11-27, night)
 
 - **CI changed, and it changes what you see on your branches.** `ci.yml` has a `concurrency` group per branch:
