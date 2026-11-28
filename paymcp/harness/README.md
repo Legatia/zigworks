@@ -129,7 +129,16 @@ harness of the owner's with a real account behind it (approving an app is
 the owner's to do), a change asked for in the chat and answered at the
 gate (the changes themselves were made from the command line, against
 Stripe's test mode), macOS and Linux by hand, a pay file with more than a
-few dozen findings. What 0.5.0 adds to the pack (the two buttons under
-"Other readings", their rules and triggers, the keys' line in `mcp.ini`)
-was tried through `try-page.py` against the stand-in only, not inside a
-harness.
+few dozen findings.
+
+What 0.5.0 adds, on Windows 11 with harness 0.4.0 in a scratch data
+folder, stand-ins behind everything: the server with every key named on
+its one `secret` line (seven of them, each from harness's key store)
+started and listed its ten tools; with this folder's `rules` as they
+are, the page's calls for the books, the bill watch, the payment-run
+check and a decision about one of their findings each went through the
+gate without a question and are in the log as `app:money`, with no key
+in it; `billing_change` was refused, not being in the app's acts. Those
+calls were made as the page makes them, from outside its frame; the two
+buttons and the decision row themselves were pressed through
+`try-page.py`. Not tried: the new triggers.
