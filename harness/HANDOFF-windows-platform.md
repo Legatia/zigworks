@@ -15,6 +15,17 @@ You asked to be told here when a check of yours fails on my side. Both are in pa
 
 **Pull request 8** (`platform/money-rest`, paymcp 0.5.0) is on top of 6: the bill watch, the two readers for Poland and the books (Xero) for the payment-run check. It has no file of yours in it. Its description says what was tried and what met a stand-in only.
 
+## From the Windows session: the released 0.4.1 desk packages, Windows and Linux, each run once (2026-11-28)
+
+The owner said yes to both downloads. The same run as for 0.4.0 below, on the same machine and by the same means, as far as the key. **Nothing differs from 0.4.0 in what a first run shows.**
+
+- **The downloads.** `harness-desk-0.4.1-windows.zip`, 15,178,944 bytes, and `harness-desk-0.4.1-linux-x86_64.tar.gz`, 14,796,077 bytes; each SHA-256 is the one in the `.sha256` file beside it. In both, `harness` says 0.4.1. The files in them are the same as in 0.4.0, and still nothing says what to start.
+- **Windows.** `harness-desk.exe` and `harness.exe` are not signed; `WebView2Loader.dll` carries Microsoft's valid signature. On an empty data folder (`--home`) "Set up" was there 0.7 seconds after the start: Provider (Anthropic), Model (`claude-opus-4-8`), [Continue], the data folder's path; the folder held `desk-webview` and no `harness.exe` ran. [Continue] turned to "Working…" and the key window opened ("Anthropic key", a field, "harness keeps it in this computer's key store.", Save, Cancel). Cancel: "Cancelled. Nothing was changed.", nothing new in the Credential Manager, nothing in the folder but the web view's own. Ended, it left no process. The buttons were pressed through UI Automation, with no mouse moved.
+- **Linux** (Ubuntu 24.04.5 under WSL 2, on Xvfb as before): the window after 0.6 seconds, the same screen; [Continue] opened the key window of 402x175 with "harness keeps it in its data folder, in a file only you can read." (no key store on this system); Cancel: "Cancelled. Nothing was changed.", and only `desk-webview/lock` in the folder. This machine's own display (WSLg) still answers no program, so again no desktop.
+- **The private model part** of "Provider and key…" was not reached: that item is for a setup that is finished, and finishing one needs a key typed.
+
+Not done, as for 0.4.0: anything after Save; the unsigned-app warning on Windows (the zip was fetched with `gh`, which puts no mark of the web on it); a real Linux desktop, a key store there, a system without WebKitGTK; the aarch64 archive.
+
 ## From the Windows session: the released 0.4.0 Windows desk package, run once (2026-11-27)
 
 You asked for a line on what happens when someone downloads and runs it. The owner said to. Windows 11 Pro (build 26300), one run, as far as the key.
