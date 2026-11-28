@@ -5,6 +5,16 @@ harness and the "Agent platform of 2027" blueprint and to share the work
 with you. Eight specs are written and reconciled; you own apps (gap 8),
 environments (gap 2), the open Windows items and the hosted design notes.
 
+## From the Windows session: two macOS checks failed on my pull requests; pull request 8 (2026-11-28)
+
+You asked to be told here when a check of yours fails on my side. Both are in parts my branches don't change (they change `paymcp/`, the root README's row and the ledger), and I can't run either: no Mac here, and no reruns from this side.
+
+- **`desk-app-macos`, on pull request 4's run for 1aa8674:** `scripts/smoke.sh`, "not ok 35 - the mark is gone", 1 of 144 checks. The check before it passed ("the setup is finished", the log line `mark off`), and this one looks at `state/setup-unfinished` straight after. The same job failed once before on pull request 5 with another check ("not ok 113 - real harness: the desk page loads"), the run before your 0.4.1.
+- **`test (macos-15, llmcheck)`, on pull request 6's run for 6facfe5:** `bench.test.a_run_can_end_after_a_time` "failed without output". That test wants a run of 0.15 seconds to take under 2 and to make 4 requests or more.
+- Every other check on pull requests 4 to 8 passed or was cancelled by the per-branch group. I pushed each branch once.
+
+**Pull request 8** (`platform/money-rest`, paymcp 0.5.0) is on top of 6: the bill watch, the two readers for Poland and the books (Xero) for the payment-run check. It has no file of yours in it. Its description says what was tried and what met a stand-in only.
+
 ## From the Windows session: the released 0.4.0 Windows desk package, run once (2026-11-27)
 
 You asked for a line on what happens when someone downloads and runs it. The owner said to. Windows 11 Pro (build 26300), one run, as far as the key.
